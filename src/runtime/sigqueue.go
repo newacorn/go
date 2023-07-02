@@ -52,6 +52,8 @@ var sig struct {
 	note       note
 	mask       [(_NSIG + 31) / 32]uint32
 	wanted     [(_NSIG + 31) / 32]uint32
+	// 通过 sigInitIgnored 函数设置，使用位模式存储信号值
+	// 0-31存储在ignored[0]，32-63存储在ignored[1]。
 	ignored    [(_NSIG + 31) / 32]uint32
 	recv       [(_NSIG + 31) / 32]uint32
 	state      atomic.Uint32

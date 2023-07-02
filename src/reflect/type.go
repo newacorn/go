@@ -283,6 +283,15 @@ const Ptr = Pointer
 type tflag uint8
 
 const (
+	// func(){}: map[string]bool{"tflagExtraStar":false, "tflagNamed":false, "tflagRegularMemory":false, "tflagUncommon":false}
+	// namePointer: map[string]bool{"tflagExtraStar":true, "tflagNamed":true, "tflagRegularMemory":true, "tflagUncommon":true}
+	// [2]int: map[string]bool{"tflagExtraStar":false, "tflagNamed":false, "tflagRegularMemory":true, "tflagUncommon":false}
+	// *[2]int: map[string]bool{"tflagExtraStar":false, "tflagNamed":false, "tflagRegularMemory":true, "tflagUncommon":false}
+	// abc: map[string]bool{"tflagExtraStar":true, "tflagNamed":true, "tflagRegularMemory":false, "tflagUncommon":true}
+	// int: map[string]bool{"tflagExtraStar":true, "tflagNamed":true, "tflagRegularMemory":true, "tflagUncommon":true}
+	// Integer: map[string]bool{"tflagExtraStar":true, "tflagNamed":true, "tflagRegularMemory":true, "tflagUncommon":true}
+	// *Integer: map[string]bool{"tflagExtraStar":false, "tflagNamed":false, "tflagRegularMemory":true, "tflagUncommon":true}
+	// unsafe.Pointer: map[string]bool{"tflagExtraStar":true, "tflagNamed":true, "tflagRegularMemory":true, "tflagUncommon":true}
 	// tflagUncommon means that there is a pointer, *uncommonType,
 	// just beyond the outer type structure.
 	//
@@ -294,33 +303,58 @@ const (
 	//		u uncommonType
 	//	}
 	//	u := &(*tUncommon)(unsafe.Pointer(t)).u
+	// 未命名类型未置此位，但是如果未命名类型含有方法此位会被置。
+	// tflagUncommon:[abc:true func(){}:false namePointer:true unsafe.Pointer:true
+	// [2]int:false *[2]int:false int:true Integer:true *Integer:true]
 	tflagUncommon tflag = 1 << 0
 
 	// tflagExtraStar means the name in the str field has an
 	// extraneous '*' prefix. This is because for most types T in
 	// a program, the type *T also exists and reusing the str data
 	// saves binary size.
+	// 未命名类型未置此位
+	// tflagExtraStar:[abc:true func(){}:false namePointer:true unsafe.Pointer:true
+	// [2]int:false *[2]int:false int:true Integer:true *Integer:false]
 	tflagExtraStar tflag = 1 << 1
 
 	// tflagNamed means the type has a name.
+	// 未命名类型没有置此位
+	// tflagNamed:[abc:true func(){}:false namePointer:true unsafe.Pointer:true
+	// [2]int:false *[2]int:false int:true Integer:true *Integer:false]
 	tflagNamed tflag = 1 << 2
 
 	// tflagRegularMemory means that equal and hash functions can treat
 	// this type as a single region of t.size bytes.
+	// 浮点数、复数和string类型没有被置位
+	// tflagRegularMemory:[abc:false func(){}:false namePointer:true unsafe.Pointer:true
+	// [2]int:true *[2]int:true int:true Integer:true *Integer:true]
 	tflagRegularMemory tflag = 1 << 3
 )
 
+// rtype 与 runtime._type 类型在内存布局方面是等价的，只不过因为无法使用其他包中的
+// 未导出的类型定义，所以需要再reflect包中重新定义一下。
 // rtype is the common implementation of most values.
 // It is embedded in other struct types.
 //
 // rtype must be kept in sync with ../runtime/type.go:/^type._type.
 type rtype struct {
 	size       uintptr
+	// 表示数据类型前多少字节包含地址。比如 string类型为8
+	// unsafe.Pointer 的值也为8
 	ptrdata    uintptr // number of bytes in the type that can contain pointers
 	hash       uint32  // hash of type; avoids computation in hash tables
+	// tflagRegularMemory 对于浮点数、复数和string类型没有被置位，这些类型都不能
+	// 直接通过内存来比较相等性。
+	// tflagUncommon
+	// tflagExtraStar 此类型可以有一个对应的指针类型
+	// tflagNamed
 	tflag      tflag   // extra type information flags
 	align      uint8   // alignment of variable with this type
 	fieldAlign uint8   // alignment of struct field with this type
+	// 低五位用来表示数据类型所属的种类，第六位在源码中定义为
+	// kindDirectIface ，表示这个类型赋值给接口时，data字段
+	// 是值本身，而不是被赋值的值的地址。
+	// 比如 unsafe.Pointer 的 kind 值为 26|32 = 58
 	kind       uint8   // enumeration for C
 	// function for comparing objects of this type
 	// (ptr to object A, ptr to object B) -> ==?
@@ -363,6 +397,7 @@ const (
 type arrayType struct {
 	rtype
 	elem  *rtype // array element type
+	// 与数组元素相同的slice元数据类型
 	slice *rtype // slice type
 	len   uintptr
 }
@@ -371,6 +406,8 @@ type arrayType struct {
 type chanType struct {
 	rtype
 	elem *rtype  // channel element type
+	// dir 表示方向， send(2)或recv(1)或者 即send又recv(3)
+	// 操作时 dir 会被转换为 reflect.ChanDir 类型
 	dir  uintptr // channel direction (ChanDir)
 }
 
@@ -387,7 +424,10 @@ type chanType struct {
 //	}
 type funcType struct {
 	rtype
+	// inCount 表示输入参数的个数
 	inCount  uint16
+	// outCount 表示返回值的个数
+	// outCount 的最高位被用来表示 是否为变参函数
 	outCount uint16 // top bit is set if last input parameter is ...
 }
 
@@ -409,12 +449,21 @@ type mapType struct {
 	rtype
 	key    *rtype // map key type
 	elem   *rtype // map element (value) type
+	// 内部 bucket 的类型
 	bucket *rtype // internal bucket structure
 	// function for hashing keys (ptr to key, seed) -> hash
+	// 对key进行哈希运算的哈希函数
 	hasher     func(unsafe.Pointer, uintptr) uintptr
+	// keysize key slot 大小
 	keysize    uint8  // size of key slot
+	// valuesize value slot 大小
 	valuesize  uint8  // size of value slot
+	// bucket 大小
 	bucketsize uint16 // size of bucket
+	// flags 最低位：表示key是以间接方式存储的，因为当key大小超过128位后，就会存储地址而不是直接存储置
+	// 第二位：表示value是以间接方式存储的，与key一样，value类型大于128字节后就会存储地址。
+	// 第三位：表示map在覆盖时key是否需要再复制一次（覆盖），否则在key已经存在的情况下不会对key进行赋值
+	// 第四位：表示hash函数可能会触发panic
 	flags      uint32
 }
 
@@ -434,6 +483,7 @@ type sliceType struct {
 type structField struct {
 	name   name    // name is always non-empty
 	typ    *rtype  // type of field
+	//
 	offset uintptr // byte offset of field
 }
 
@@ -1153,6 +1203,7 @@ func (t *interfaceType) MethodByName(name string) (m Method, ok bool) {
 // A StructField describes a single field in a struct.
 type StructField struct {
 	// Name is the field name.
+	// 始终非空，因为字段必须有名称。
 	Name string
 
 	// PkgPath is the package path that qualifies a lower case (unexported)
@@ -1433,6 +1484,7 @@ func (t *structType) FieldByName(name string) (f StructField, present bool) {
 	return t.FieldByNameFunc(func(s string) bool { return s == name })
 }
 
+// TypeOf 只提取interface{}接口值中的_type字段，即动态类型的类型元数据。
 // TypeOf returns the reflection Type that represents the dynamic type of i.
 // If i is a nil interface value, TypeOf returns nil.
 func TypeOf(i any) Type {
@@ -3038,13 +3090,17 @@ func appendVarint(x []byte, v uintptr) []byte {
 	x = append(x, byte(v))
 	return x
 }
-
+// toType 从这个函数可以看出， *rtype 也是 *runtime._type 肯定实现了 Type
+// 接口。
 // toType converts from a *rtype to a Type that can be returned
 // to the client of package reflect. In gc, the only concern is that
 // a nil *rtype must be replaced by a nil Type, but in gccgo this
 // function takes care of ensuring that multiple *rtype for the same
 // type are coalesced into a single Type.
 func toType(t *rtype) Type {
+	// 只有动态类型和动态值都为nil才是零值接口。
+	// 避免返回一个 data字段为nil，而tab字段不为nil的接口值，
+	// 使上层逻辑无法通过判断接口是否为nil来判断函数返回值是否有效。
 	if t == nil {
 		return nil
 	}

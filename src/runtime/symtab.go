@@ -449,6 +449,9 @@ type moduledata struct {
 	noptrbss, enoptrbss   uintptr
 	covctrs, ecovctrs     uintptr
 	end, gcdata, gcbss    uintptr
+	// 类型元数据在二进制文件中是存放在一起的，单独占据一段空间， types 字段和 etypes 字段就是这段空间
+	// 的起始地址和结束地址。
+	// [types,etypes)
 	types, etypes         uintptr
 	rodata                uintptr
 	gofunc                uintptr // go.func.*

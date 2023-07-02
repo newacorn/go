@@ -168,6 +168,7 @@ TEXT runtime·rt0_go(SB),NOSPLIT|TOPFRAME,$0
 	// create istack out of the given (operating system) stack.
 	// _cgo_init may update stackguard.
 	MOVQ	$runtime·g0(SB), DI
+	// 65432
 	LEAQ	(-64*1024+104)(SP), BX
 	MOVQ	BX, g_stackguard0(DI)
 	MOVQ	BX, g_stackguard1(DI)
@@ -196,6 +197,8 @@ notintel:
 
 nocpuinfo:
 	// if there is an _cgo_init, call it.
+	// 如果代码中导入了C，_cgo_init便不会是nil
+	// 全局变量_cgo_init的值为 x_cgo_init函数指针
 	MOVQ	_cgo_init(SB), AX
 	TESTQ	AX, AX
 	JZ	needtls
@@ -218,10 +221,17 @@ nocpuinfo:
 	MOVQ	DI, CX // arg 1
 #endif
 	CALL	AX
+	// x_cgo_init 修改了 statck.lo 变为 {lo: 140702045437008, hi: 140702053821552}
+	// 之前：{lo: 140702053756120, hi:140702053821552}
 
 	// update stackguard after _cgo_init
 	MOVQ	$runtime·g0(SB), CX
 	MOVQ	(g_stack+stack_lo)(CX), AX
+	// g.stackgurard0，现在不再是stack_lo
+	// 而是比它大，预留了const__StackGuard
+    // 大小的保险值。
+    // const__StackGuard 的值为928 在mac os平台下
+    // 通过寄存器AX前后值计算到
 	ADDQ	$const__StackGuard, AX
 	MOVQ	AX, g_stackguard0(CX)
 	MOVQ	AX, g_stackguard1(CX)
@@ -255,12 +265,15 @@ needtls:
 	CALL	runtime·wintls(SB)
 #endif
 
+    // runtime·m0+m_tls(SB)从m0地址开始偏移到tls字段处
+    // 将地址结果存入到DI
 	LEAQ	runtime·m0+m_tls(SB), DI
 	CALL	runtime·settls(SB)
 
 	// store through it, to make sure it works
 	get_tls(BX)
 	MOVQ	$0x123, g(BX)
+	// Rax = 0x00000001002412e0
 	MOVQ	runtime·m0+m_tls(SB), AX
 	CMPQ	AX, $0x123
 	JEQ 2(PC)
@@ -268,7 +281,9 @@ needtls:
 ok:
 	// set the per-goroutine and per-mach "registers"
 	get_tls(BX)
+	// Rbx = 0x0000000009800800
 	LEAQ	runtime·g0(SB), CX
+	// 将g0的地址存储到TLS所表示的地址处
 	MOVQ	CX, g(BX)
 	LEAQ	runtime·m0(SB), AX
 
@@ -282,6 +297,7 @@ ok:
 	// Check GOAMD64 reqirements
 	// We need to do this after setting up TLS, so that
 	// we can report an error if there is a failure. See issue 49586.
+	// 验证CPU特性
 #ifdef NEED_FEATURES_CX
 	MOVL	$0, AX
 	CPUID
@@ -338,23 +354,42 @@ ok:
 	JNE	bad_cpu
 #endif
 
+    // 验证unsafe包和atomic包内函数的正确性
 	CALL	runtime·check(SB)
 
 	MOVL	24(SP), AX		// copy argc
 	MOVL	AX, 0(SP)
 	MOVQ	32(SP), AX		// copy argv
 	MOVQ	AX, 8(SP)
+	// runtime.args 暂存命令行参数以待后续解析。部分系统会在这里获取
+	// 与硬件相关的一些参数，例如物理页大小
 	CALL	runtime·args(SB)
+	// runtime.osinit 所有系统都会在这里获取CPU核心数，如果上一步没有成功过获取
+	// 物理页面大小，则不会系统会再次获取。Linux系统会在这里获取 Huge 物理页大小
 	CALL	runtime·osinit(SB)
+	// 初始化调度系统
 	CALL	runtime·schedinit(SB)
 
 	// create a new goroutine to start program
+	// 创建的第一个goroutine所执行的函数
 	MOVQ	$runtime·mainPC(SB), AX		// entry
 	PUSHQ	AX
+	// 调用 runtime.newproc 创建第一个goroutine
 	CALL	runtime·newproc(SB)
 	POPQ	AX
 
 	// start this M
+	// 调用 runtime.mstart()函数，当前线程进入调度循环。一般情况下线程调用
+	// mstart函数进入调度循环后不会再返回。
+	// 创建一个线程，运行goroutine。
+	// 未使用CGO时，栈大小：
+	// runtime.stack {lo: 140702053756408, hi: 140702053821840} // 65432 6KB左右
+	// stackguard0: 140702053756408, // 等于lo
+	// stackguard1: 140702053756408,
+	// 使用CGO时，栈大小：
+	// stack: runtime.stack {lo: 140702045437008, hi: 140702053821552}, // 8384544 8MB左右
+	// stackguard0: 140702045437936, //比lo大928
+	// stackguard1: 140702045437936,
 	CALL	runtime·mstart(SB)
 
 	CALL	runtime·abort(SB)	// mstart should never return
@@ -406,21 +441,38 @@ TEXT runtime·gogo(SB), NOSPLIT, $0-8
 	MOVQ	0(DX), CX		// make sure g != nil
 	JMP	gogo<>(SB)
 
+// 函数有一个 *gobuf 类型的参数，buf.g 是要恢复运行的 goroutine，
+// gogo() 函数利用 gobuf 中保存的状态来还原对应的寄存器，再跳转到
+// buf.pc 地址处去执行指令。
 TEXT gogo<>(SB), NOSPLIT, $0
 	get_tls(CX)
+	// 存储 DX 到 (TLS)
 	MOVQ	DX, g(CX)
+	// 将 g 存储到 R14 寄存器
 	MOVQ	DX, R14		// set the g register
+	// BX 为 gobuf 参数
 	MOVQ	gobuf_sp(BX), SP	// restore SP
 	MOVQ	gobuf_ret(BX), AX
 	MOVQ	gobuf_ctxt(BX), DX
 	MOVQ	gobuf_bp(BX), BP
+	// 情况 gobuf
 	MOVQ	$0, gobuf_sp(BX)	// clear to help garbage collector
 	MOVQ	$0, gobuf_ret(BX)
+	// 清零ctxt，只有goroutine函数初次运行时可能不为0
 	MOVQ	$0, gobuf_ctxt(BX)
 	MOVQ	$0, gobuf_bp(BX)
+	// 执行PC
 	MOVQ	gobuf_pc(BX), BX
 	JMP	BX
 
+// mcall 函数和 systemstack() 函数很像，也就是切换到系统栈去执行某个 Function Value
+// ,但是也有些不同，mcall() 函数不能再 g0栈上调用，而且也不会再切换回来。
+//
+// 函数会把当前g的状态保存到g.sched，然后切换至g0栈，用当前g的指针作为参数调用fn()函数
+// 。这个流程非常适合 gorotuine 将自己挂起，fn()函数中执行调度逻辑对g进行后续处理。需
+// 要注意该函数预期 fn() 函数不会返回，也就是说 fn() 函数中的调度逻辑需要选择下一个可执行
+// 的 g，并完成切换。
+//
 // func mcall(fn func(*g))
 // Switch to m->g0's stack, call fn(g).
 // Fn must never return. It should gogo(&g->sched)
@@ -429,25 +481,34 @@ TEXT runtime·mcall<ABIInternal>(SB), NOSPLIT, $0-8
 	MOVQ	AX, DX	// DX = fn
 
 	// save state in g->sched
+	// mcall被调用的下一条语句
 	MOVQ	0(SP), BX	// caller's PC
 	MOVQ	BX, (g_sched+gobuf_pc)(R14)
+	// args to calle 区间的末端地址
 	LEAQ	fn+0(FP), BX	// caller's SP
 	MOVQ	BX, (g_sched+gobuf_sp)(R14)
+	// 调用者的BP
 	MOVQ	BP, (g_sched+gobuf_bp)(R14)
 
 	// switch to m->g0 & its stack, call fn
 	MOVQ	g_m(R14), BX
 	MOVQ	m_g0(BX), SI	// SI = g.m.g0
+	// mcall 不能在 g0上调用
 	CMPQ	SI, R14	// if g == m->g0 call badmcall
 	JNE	goodm
 	JMP	runtime·badmcall(SB)
 goodm:
+    // AX = g
 	MOVQ	R14, AX		// AX (and arg 0) = g
+	// R14 = g0
 	MOVQ	SI, R14		// g = g.m.g0
 	get_tls(CX)		// Set G in TLS
+	// (TLS) = g0
 	MOVQ	R14, g(CX)
+	// 恢复g0.sched的SP
 	MOVQ	(g_sched+gobuf_sp)(R14), SP	// sp = g0.sched.sp
 	PUSHQ	AX	// open up space for fn's arg spill slot
+	// 传递用户g作为fn的参数
 	MOVQ	0(DX), R12
 	CALL	R12		// fn(g)
 	POPQ	AX
@@ -462,6 +523,16 @@ goodm:
 TEXT runtime·systemstack_switch(SB), NOSPLIT, $0-0
 	RET
 
+// 临时切换至当前 M 的 g0 栈，完成某些操作后再切换回原来 goroutine 栈。该函数主要用于执行
+// runtime 中一下会出发栈增长的函数，因为 gorotuine 的栈是被 runtime 管理的，所以 runtime
+// 中这些逻辑就不能在普通 goroutine 上执行，以免陷入递归。g0 的栈是由操作系统分配的，可以
+// 认为空间足够大，被runtime用来执行自身逻辑非常安全。
+//
+// 栈帧大小为0，参数：为要在 g0 栈上执行的函数
+// 从g0切换回g的时候，并没有将g0的状态保存到g0.sched中，也就是说每次从g0
+// 切换至其他的 gorotuine 后，g0栈上的内容就被抛弃了，下次切换至g0还是从
+// 头开始。
+//
 // func systemstack(fn func())
 TEXT runtime·systemstack(SB), NOSPLIT, $0-8
 	MOVQ	fn+0(FP), DI	// DI = fn
@@ -469,46 +540,64 @@ TEXT runtime·systemstack(SB), NOSPLIT, $0-8
 	MOVQ	g(CX), AX	// AX = g
 	MOVQ	g_m(AX), BX	// BX = m
 
-	CMPQ	AX, m_gsignal(BX)
-	JEQ	noswitch
+	CMPQ	AX, m_gsignal(BX) // g == gsingnal?
+	JEQ	noswitch // 如果相等，说明当前在 gsingal 栈上，不用切换因为 gsignal 栈也是系统栈。
 
 	MOVQ	m_g0(BX), DX	// DX = g0
-	CMPQ	AX, DX
-	JEQ	noswitch
+	CMPQ	AX, DX // g == g0 ?
+	JEQ	noswitch // 如果相等，说明已经在 g0 栈上了不用切换。
 
-	CMPQ	AX, m_curg(BX)
-	JNE	bad
+	CMPQ	AX, m_curg(BX) // g(CX) == m.curg？
+	JNE	bad // 出错：g 不是 gsignal，不是 g0，也不是curg
 
 	// switch stacks
 	// save our state in g->sched. Pretend to
 	// be systemstack_switch if the G stack is scanned.
+	// 保存在调用 runtime.systemstack 之前的寄存器信息到 g.sched
+	// pc 为 runtime.systemstack_switch的第一条指令地址
+	// sp 为 调用 runtime.systemstack 之前SP的值
+	// ret 为 0
+	// BP 为寄存器BP的值
 	CALL	gosave_systemstack_switch<>(SB)
 
 	// switch to g0
+	// 将g0存储到(TLS)
 	MOVQ	DX, g(CX)
+	// 将g0地址设置到R14寄存器
 	MOVQ	DX, R14 // set the g register
+	// 恢复g0的SP
 	MOVQ	(g_sched+gobuf_sp)(DX), BX
 	MOVQ	BX, SP
 
 	// call target function
+	// DX 是闭包对象的地址，双指针
 	MOVQ	DI, DX
 	MOVQ	0(DI), DI
+	// DI 为函数指针（函数第一条指令的地址）
 	CALL	DI
 
 	// switch back to g
 	get_tls(CX)
 	MOVQ	g(CX), AX
+	// 通过g0.m获取用户g，即curg
 	MOVQ	g_m(AX), BX
 	MOVQ	m_curg(BX), AX
+	// 将用户g保存到 (TLS) 上
 	MOVQ	AX, g(CX)
+	// 恢复SP
 	MOVQ	(g_sched+gobuf_sp)(AX), SP
+	// g.sched.sp = 0
 	MOVQ	$0, (g_sched+gobuf_sp)(AX)
+	// 返回，将调用 runtime.systemstack之后推入的return address弹出
+	// 并执行，即 runtime.systemstack()的下一条语句。
+	//
 	RET
 
 noswitch:
 	// already on m stack; tail call the function
 	// Using a tail call here cleans up tracebacks since we won't stop
 	// at an intermediate systemstack.
+	// 已经在g0栈或gsignal栈，直接执行目标函数的第一条指令
 	MOVQ	DI, DX
 	MOVQ	0(DI), DI
 	JMP	DI
@@ -780,6 +869,10 @@ TEXT gosave_systemstack_switch<>(SB),NOSPLIT,$0
 	MOVQ	$0, (g_sched+gobuf_ret)(R14)
 	MOVQ	BP, (g_sched+gobuf_bp)(R14)
 	// Assert ctxt is zero. See func save.
+	// 断言ctxt是0，只有初创尚未运行时不为0
+	// 因为在创建goroutine时go关键字后面的Function Value
+	// 可能是个闭包，所以依靠ctx来传递闭包对象。一旦使用gogo
+	// 函数来恢复执行，gobuf.ctx就会被清零。
 	MOVQ	(g_sched+gobuf_ctxt)(R14), R9
 	TESTQ	R9, R9
 	JZ	2(PC)
@@ -1044,6 +1137,7 @@ done:
 
 // func setg(gg *g)
 // set g. for use by needm.
+// 将参数 gg 存储到TLS地址处，这样以后调用get_tls+g()就可以获取到这个g
 TEXT runtime·setg(SB), NOSPLIT, $0-8
 	MOVQ	gg+0(FP), BX
 	get_tls(CX)
@@ -1600,6 +1694,7 @@ TEXT runtime·goexit(SB),NOSPLIT|TOPFRAME,$0-0
 	// traceback from goexit1 must hit code range of goexit
 	BYTE	$0x90	// NOP
 
+
 // This is called from .init_array and follows the platform, not Go, ABI.
 TEXT runtime·addmoduledata(SB),NOSPLIT,$0-0
 	PUSHQ	R15 // The access to global variables below implicitly uses R15, which is callee-save
@@ -2064,3 +2159,11 @@ TEXT runtime·retpolineR12(SB),NOSPLIT,$0; RETPOLINE(12)
 TEXT runtime·retpolineR13(SB),NOSPLIT,$0; RETPOLINE(13)
 TEXT runtime·retpolineR14(SB),NOSPLIT,$0; RETPOLINE(14)
 TEXT runtime·retpolineR15(SB),NOSPLIT,$0; RETPOLINE(15)
+
+
+// func OutputField(a uintptr)(r int)
+TEXT ·OutputField(SB),$0-16
+    MOVQ a+0(FP),AX
+    MOVQ g(AX),BX
+    MOVQ BX,r+8(FP)
+    RET

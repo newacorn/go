@@ -139,6 +139,8 @@ var mainStarted bool
 var runtimeInitTime int64
 
 // Value to use for signal mask for newly created M's.
+// 初始值为0，在 schedinit 函数中进行了修改为 m0.sigmask。在macos平台下测试
+// 使赋值过为4。
 var initSigmask sigset
 
 // The main goroutine.
@@ -271,6 +273,7 @@ func main() {
 	}
 	runExitHooks(0)
 
+	// 主goroutine执行完毕后直接让整个进程退出
 	exit(0)
 	for {
 		var x *int32
@@ -707,27 +710,44 @@ func schedinit() {
 	// The world starts stopped.
 	worldStopped()
 
+	// 校验程序的各个模块，因为golang支持 shared、plugin等build模式，可能会有多个
+	// 二进制模块，这里会校验各个模块的符号、ABI等，确保模块间一致。
 	moduledataverify()
+	// 初始化栈分配。goroutine的栈是动态分配、动态增长的，这一步会初始化用于栈分配的
+	// 的全局缓存池以及相关锁。
 	stackinit()
+	// 初始化堆分配
 	mallocinit()
 	godebug := getGodebugEarly()
 	initPageTrace(godebug) // must run after mallocinit but before anything allocates
+	// 进行与CPU相关的初始化工作，检测CPU是否支持某些指令集，以及根据GODEBUG环境变量来启用或禁用
+	// 某些硬件特性。
 	cpuinit(godebug)       // must run before alginit
+	// 根据CPU对AES相关指令的支持情况，选择不同的Hash算法。
 	alginit()              // maps, hash, fastrand must not be used before this call
+	// 初始化 fastrandseed ，后者会被接下来的 mcommoninit() 函数用到
 	fastrandinit()         // must run before mcommoninit
+	// 为当前工作线程 M 分配 ID，初始化 gsignal，并把M添加到 allm 链表中。
 	mcommoninit(gp.m, -1)
+	// 基于所有已加载的模块，构造一个活跃模块切片 modulesSlice ，并初始化GC需要的Mask数据。
 	modulesinit()   // provides activeModules
+	// 基于活跃模块列表构建模块级的 typemap ，实现全局范围内对类型元数据进行去重。
 	typelinksinit() // uses maps, activeModules
+	// 遍历活跃模块列表，将编译阶段生成的所有 itab 添加到 itabTable中
 	itabsinit()     // uses activeModules
 	stkobjinit()    // must run before GC starts
 
 	sigsave(&gp.m.sigmask)
 	initSigmask = gp.m.sigmask
 
+	// 解析命令行参数，程序中通过 os.Args 得到的参数是在这里初始化的（windows除外）
 	goargs()
+	// 解析环境变量，程序中通过 os.Getenv 获取的环境变量是在这里初始化的（Windows除外）
 	goenvs()
 	secure()
+	// 解析环境变量 GODEBUG，为runtime各个调试参数赋值
 	parsedebugvars()
+	// 初始化 GC相关的参数，根据环境变量 GOGC 设置 gcpercent
 	gcinit()
 
 	// if disableMemoryProfiling is set, update MemProfileRate to 0 to turn off memprofile.
@@ -744,6 +764,7 @@ func schedinit() {
 	if n, ok := atoi32(gogetenv("GOMAXPROCS")); ok && n > 0 {
 		procs = n
 	}
+	// 根据CPU的核数或环境变量 GOMAXPROCS 确定P的数量，调用 procresize 进行调整
 	if procresize(procs) != nil {
 		throw("unknown runnable goroutine during bootstrap")
 	}
@@ -806,12 +827,18 @@ func mReserveID() int64 {
 	checkmcount()
 	return id
 }
-
+// mcommoninit()
+// 如果参数id小于0，则分配一个id设置到mp.id字段。
+// 将mp添加到全局all链表头。
+// 如果使用了CGO则初始化 mp.cgoCallers 字段。
+// 为mp初始化gsignal字段
+//
 // Pre-allocated ID may be passed as 'id', or omitted by passing -1.
 func mcommoninit(mp *m, id int64) {
 	gp := getg()
 
 	// g0 stack won't make sense for user (and is not necessary unwindable).
+	// 如果此函数是在非g0栈上被调用则跳过一帧
 	if gp != gp.m.g0 {
 		callers(1, mp.createstack[:])
 	}
@@ -837,8 +864,10 @@ func mcommoninit(mp *m, id int64) {
 		mp.fastrand = uint64(hi)<<32 | uint64(lo)
 	}
 
+	// 为mp初始化gsignal字段
 	mpreinit(mp)
 	if mp.gsignal != nil {
+		// 信号goroutine也需要设置stackguard1字段
 		mp.gsignal.stackguard1 = mp.gsignal.stack.lo + _StackGuard
 	}
 
@@ -1413,11 +1442,19 @@ func mStackIsSystemAllocated() bool {
 	}
 	return false
 }
-
+// mstart()
+// 此函数是所有新建M关联线程的入口函数
+// 调用此函数的有：
+// 1. m0
+// 2. 新建的M其所在线程的初始化函数是 mstart_stub() -> mstart()
+//
 // mstart is the entry-point for new Ms.
 // It is written in assembly, uses ABI0, is marked TOPFRAME, and calls mstart0.
 func mstart()
 
+// mstart0()
+// 更新 m0.g0 中的一些字段，然后执行 schedule()函数开始调度。
+//
 // mstart0 is the Go entry-point for new Ms.
 // This must not split the stack because we may not even have stack
 // bounds set up yet.
@@ -1430,7 +1467,13 @@ func mstart()
 func mstart0() {
 	gp := getg()
 
+	// 启用CGO,gp.stack.hi- gp.stack.lo的差值：
+	// m0:8384544，其它M:8388608
+	// 未启用CGO时的差值：
+	// m0:65432，其它M:524288
+	//
 	osStack := gp.stack.lo == 0
+	// 无论是否启用CGO，osStac都为0，除了了M0
 	if osStack {
 		// Initialize stack bounds from system stack.
 		// Cgo may have left stack size in stack.hi.
@@ -1440,8 +1483,10 @@ func mstart0() {
 		// We set hi to &size, but there are things above
 		// it. The 1024 is supposed to compensate this,
 		// but is somewhat arbitrary.
+		// 未使用CGO时 size = 524288，使用时 size = 8388608
 		size := gp.stack.hi
 		if size == 0 {
+			// 目前没有发现可以到这里的路径
 			size = 8192 * sys.StackGuardMultiplier
 		}
 		gp.stack.hi = uintptr(noescape(unsafe.Pointer(&size)))
@@ -1453,6 +1498,16 @@ func mstart0() {
 	// This is the g0, so we can also call go:systemstack
 	// functions, which check stackguard1.
 	gp.stackguard1 = gp.stackguard0
+	// 至此：
+	// 使用CGO:
+	// gp.stack.hi - gp.stack.lo =8384544/8387584;
+	// gp.stackguard0-gp.stack.lo=928
+	// go.statckguard1-gp.stack.lo=928
+	//
+	// 未使用CGO:
+	// gp.stack.hi - gp.stack.lo =65432/523264;
+	// gp.stackguard0-gp.stack.lo=928
+	// go.statckguard1-gp.stack.lo=928
 	mstart1()
 
 	// Exit this thread.
@@ -1486,20 +1541,25 @@ func mstart1() {
 	gp.sched.pc = getcallerpc()
 	gp.sched.sp = getcallersp()
 
+	// linux amd64 下位空函数
 	asminit()
+	// 设置 线程信号处理栈、从阻塞信号列表中清除某些不应该被阻塞的信号
 	minit()
 
 	// Install signal handlers; after minit so that minit can
 	// prepare the thread to be able to handle the signals.
 	if gp.m == &m0 {
+		// 设置主线程的型号处理函数，猜测其他线程可能共享主线程的型号处理函数
 		mstartm0()
 	}
 
+	// fn 有可能是 runtime.mspinning 函数
 	if fn := gp.m.mstartfn; fn != nil {
 		fn()
 	}
 
 	if gp.m != &m0 {
+		// m0 已经在 schedInit 函数调用中绑定过P了
 		acquirep(gp.m.nextp.ptr())
 		gp.m.nextp = 0
 	}
@@ -1518,8 +1578,10 @@ func mstartm0() {
 	// syscall.NewCallback. See issue #6751 for details.
 	if (iscgo || GOOS == "windows") && !cgoHasExtraM {
 		cgoHasExtraM = true
+		// 创M实例放入到 extram 链表中，供非go线程使用
 		newextram()
 	}
+	// 只会被 m0 调用一次，其它线程应该与m0关联的线程共享。
 	initsig(false)
 }
 
@@ -1770,12 +1832,21 @@ func runSafePointFn() {
 // foreign code.
 var cgoThreadStart unsafe.Pointer
 
-type cgothreadstart struct {
-	g   guintptr
-	tls *uint64
-	fn  unsafe.Pointer
-}
 
+// 当使用CGO时，线程的创建需要通过 调用 _cgo_thread_start 函数，
+// 而 cgothreadstart 类型就是这个函数的参数类型。
+type cgothreadstart struct {
+	g   guintptr // g0
+	tls *uint64  // &g0.m.tls[0]
+	fn  unsafe.Pointer // runtime.mstart，线程的启动函数。 在 newm1 函数中使用。
+}
+// allocm()
+// 新分配个M，初始化 m.gsignal 字段，将M添加到全局 allm。
+// 初始化 m.g0 字段，但根据情况为g0创建栈。
+// 如果没有使用CGO或者平台不是macos等，则会为 m.g0 分配栈空间(8192）
+// 如果使用了CGO或平台为windows还会初始化 m.cgoCallers 字段。
+// 整理 sched.freem 链表。
+//
 // Allocate a new m unassociated with any thread.
 // Can use p for allocation context if needed.
 // fn is recorded as the new m's m.mstartfn.
@@ -1794,18 +1865,25 @@ func allocm(pp *p, fn func(), id int64) *m {
 	acquirem()
 
 	gp := getg()
+	// 通过这个判断可以看出 gp.m.p和pp不能都为0
 	if gp.m.p == 0 {
 		acquirep(pp) // temporarily borrow p for mallocs in this function
 	}
 
 	// Release the free M list. We need to do this somewhere and
 	// this may free up a stack we can use.
+	// 释放m.go占据的栈空间，以便被接下来新建的M所利用
 	if sched.freem != nil {
 		lock(&sched.lock)
 		var newList *m
 		for freem := sched.freem; freem != nil; {
 			wait := freem.freeWait.Load()
 			if wait == freeMWait {
+				// freeMWait 表示这个freem已经在使用中，
+				//
+				// 遍历结束后，以newList为链表头倒序连接所有处于
+				// freeMWait状态的M
+				//
 				next := freem.freelink
 				freem.freelink = newList
 				newList = freem
@@ -1815,6 +1893,8 @@ func allocm(pp *p, fn func(), id int64) *m {
 			// Free the stack if needed. For freeMRef, there is
 			// nothing to do except drop freem from the sched.freem
 			// list.
+			//
+			// M done, free stack and reference.
 			if wait == freeMStack {
 				// stackfree must be on the system stack, but allocm is
 				// reachable off the system stack transitively from
@@ -1825,23 +1905,33 @@ func allocm(pp *p, fn func(), id int64) *m {
 			}
 			freem = freem.freelink
 		}
+		// newList为剔除掉处于freeMStack和freeMRef状态的M后的链表
 		sched.freem = newList
 		unlock(&sched.lock)
 	}
 
 	mp := new(m)
 	mp.mstartfn = fn
+	// 如果参数id小于0，则分配一个id设置到mp.id字段。
+	// 将mp添加到全局all链表头。
+	// 如果使用了CGO则初始化 mp.cgoCallers 字段。
+	// 为mp初始化gsignal字段
 	mcommoninit(mp, id)
 
 	// In case of cgo or Solaris or illumos or Darwin, pthread_create will make us a stack.
 	// Windows and Plan 9 will layout sched stack on OS stack.
 	if iscgo || mStackIsSystemAllocated() {
+		// 系统为我们分配g0栈
 		mp.g0 = malg(-1)
 	} else {
+		// 否则自己分配g0栈
 		mp.g0 = malg(8192 * sys.StackGuardMultiplier)
 	}
 	mp.g0.m = mp
+	// CGO or mac os 下面的println输出0
+	// println(mp.g0.stack.hi-mp.g0.stack.lo)
 
+	// 如果借用了pp则释放掉
 	if pp == gp.m.p.ptr() {
 		releasep()
 	}
@@ -1953,7 +2043,8 @@ func needm() {
 	casgstatus(mp.curg, _Gdead, _Gsyscall)
 	sched.ngsys.Add(-1)
 }
-
+// 如果 extraMWaiters 大于0则创建 extraMWaiters 个M实例，否则创建一个M实例，并添加到 extram 链表。
+//
 // newextram allocates m's and puts them on the extra list.
 // It is called with a working local m, so that it can do things
 // like call schedlock and allocate.
@@ -1973,6 +2064,10 @@ func newextram() {
 	}
 }
 
+// oneNewExtraM()
+// 创建一个M实例，并未关联线程。等到非go线程调用 needm 时会关联非go现场
+// mp的shcedlin字段设置为全局变量 extram ，而 extram 设置为新建的mp地址。
+//
 // oneNewExtraM allocates an m and puts it on the extra list.
 func oneNewExtraM() {
 	// Create extra goroutine locked to extra m.
@@ -2089,8 +2184,11 @@ func getm() uintptr {
 	return uintptr(unsafe.Pointer(getg().m))
 }
 
+// extram 串联 oneNewExtraM 创建的M实例，这些M实例没有关联的线程
+// 被非go线程在调用 needm 时使用。
 var extram atomic.Uintptr
 var extraMCount uint32 // Protected by lockextra
+// 待需创建的额外M的个数
 var extraMWaiters atomic.Uint32
 
 // lockextra locks the extra list and returns the list head.
@@ -2174,6 +2272,10 @@ var newmHandoff struct {
 	haveTemplateThread uint32
 }
 
+// newm()
+// 这个fn不应该返回，fn的执行在M关联线程的入口函数 mstart()-> mstart0() -> mstart1() 中被调用，
+// 如果fn返回了，之后的逻辑需要的是关联P的M
+//
 // Create a new m. It will start off with a call to fn, or else the scheduler.
 // fn needs to be static and not a heap allocated closure.
 // May run with m.p==nil, so write barriers are not allowed.
@@ -2194,9 +2296,22 @@ func newm(fn func(), pp *p, id int64) {
 	// start.
 	acquirem()
 
+	// allocm()
+	// 新分配个M，初始化 m.gsignal 字段，将M添加到全局 allm。
+	// 初始化 m.g0 字段，但根据情况为g0创建栈。
+	// 如果没有使用CGO或者平台不是macos等，则会为 m.g0 分配栈空间(8192）
+	// 如果使用了CGO或平台为windows还会初始化 m.cgoCallers 字段。
+	// 整理 sched.freem 链表。
 	mp := allocm(pp, fn, id)
 	mp.nextp.set(pp)
+
 	mp.sigmask = initSigmask
+	// mp.sigmask = initSigmask = 4
+
+	// locked M or a thread that may have been started by C.
+	// 这种父线程栈是未知状态所以
+	// 从 temlate thread 克隆了新的线程来关联mp。
+	//
 	if gp := getg(); gp != nil && gp.m != nil && (gp.m.lockedExt != 0 || gp.m.incgo) && GOOS != "plan9" {
 		// We're on a locked M or a thread that may have been
 		// started by C. The kernel state of this thread may
@@ -2214,6 +2329,7 @@ func newm(fn func(), pp *p, id int64) {
 			throw("on a locked thread with no template thread")
 		}
 		mp.schedlink = newmHandoff.newm
+		//
 		newmHandoff.newm.set(mp)
 		if newmHandoff.waiting {
 			newmHandoff.waiting = false
@@ -2223,13 +2339,22 @@ func newm(fn func(), pp *p, id int64) {
 		// The M has not started yet, but the template thread does not
 		// participate in STW, so it will always process queued Ms and
 		// it is safe to releasem.
+		// 虽然M还没有开始运行且关联了P，但是因为让它运行的 template thread 不会参与STW
+		// 所以执行releasem() 函数。
 		releasem(getg().m)
 		return
 	}
+	// 当前线程状态可知，可以从其为mp克隆新的线程
 	newm1(mp)
 	releasem(getg().m)
 }
 
+// newm1()
+// 当前线程状态可知，可以从其为mp克隆新的线程。
+//
+// 为mp创建新的线程，分是否使用CGO两种情况：
+// 如果使用了CGO，使用 _cgo_thread_start 函数创建线程， g0 的栈也由此函数分配。
+// 否则使用 newosproc 函数，栈通过 malg 函数分配，大小为8192。
 func newm1(mp *m) {
 	if iscgo {
 		var ts cgothreadstart
@@ -2246,6 +2371,8 @@ func newm1(mp *m) {
 			asanwrite(unsafe.Pointer(&ts), unsafe.Sizeof(ts))
 		}
 		execLock.rlock() // Prevent process clone.
+		// 至此 mp.g0.stack.hi = mp.g0.stack.lo = 0
+		// g0栈由_cgo_thread_start 分配
 		asmcgocall(_cgo_thread_start, unsafe.Pointer(&ts))
 		execLock.runlock()
 		return
@@ -2313,7 +2440,14 @@ func templateThread() {
 		notesleep(&newmHandoff.wake)
 	}
 }
-
+// stopm 被以下几种情况调用：
+// 1. 在 schedule 调用中
+//    1.1 找到了个G，但这个G绑定到了特定的M，为了执行这个G，将当前P传递给那个M，并停止当前M
+//    1.2 sched.gcWorking 的值为1，停用当前M响应GC
+//    1.3 在 schedule 执行过程中实在找不到可以运行的G，会调用 stopm 休眠自己
+// 2. exitsyscall 调用中
+//
+// 此时的M肯定没有关联的P，将M防止到 sched.midle 链表头，并休眠当前线程
 // Stops execution of the current m until new work is available.
 // Returns with acquired P.
 func stopm() {
@@ -2330,6 +2464,7 @@ func stopm() {
 	}
 
 	lock(&sched.lock)
+	// 将当前M放置到sched.midle上
 	mput(gp.m)
 	unlock(&sched.lock)
 	mPark()
@@ -2341,7 +2476,12 @@ func mspinning() {
 	// startm's caller incremented nmspinning. Set the new M's spinning.
 	getg().m.spinning = true
 }
-
+// startm()
+// 如果传入的参数pp不是nil或者在函数调用中找到了空闲的P，则唤醒一个M或者新建一个M与这个P关联
+// 这个M要么恢复执行（旧的M），要么从 schedule 函数开始执行。
+//
+// 如果参数pp为nil且没有找到空闲的P，则返回
+//
 // Schedules some M to run the p (creates an M if necessary).
 // If p==nil, tries to get an idle P, if no idle P's does nothing.
 // May run with m.p==nil, so write barriers are not allowed.
@@ -2356,6 +2496,10 @@ func mspinning() {
 //go:nowritebarrierrec
 func startm(pp *p, spinning bool) {
 	// Disable preemption.
+	//
+	// 如果传入的pp不为nil，则调用者必须处于一个 non-premmptible 状态
+	// 因为如果发生了抢占，之后当前M因GC而处于休眠状态，但这个P没有任何一个
+	// M负责停用，因为它还未关联任何M。
 	//
 	// Every owned P must have an owner that will eventually stop it in the
 	// event of a GC stop request. startm takes transient ownership of a P
@@ -2401,11 +2545,18 @@ func startm(pp *p, spinning bool) {
 		// thus marking it as 'running' before we drop sched.lock. This
 		// new M will eventually run the scheduler to execute any
 		// queued G's.
+		//
+		// 在四方 sched.lock 之前，标记这个还未被创建的M处于运行状态（调用 mReserveID()，
+		// 递增sched.mnext)，防止 checkdead 函数误判死锁。有任务但没有在运行的M，则为死锁状态
+		//
 		id := mReserveID()
 		unlock(&sched.lock)
 
 		var fn func()
 		if spinning {
+			// 如果参数spinning为true，则将fn设置为mspinning函数，这个函数在线程入口函数
+			// mastart()->mastart0()->mastart1() 中被调用，它将 m.spinning 字段设置为true
+			//
 			// The caller incremented nmspinning, so set m.spinning in the new M.
 			fn = mspinning
 		}
@@ -2504,13 +2655,29 @@ func handoffp(pp *p) {
 		wakeNetPoller(when)
 	}
 }
-
+// wakep()
+//
+// 预计有新的任务，所以要启动一个新的处于spinning状态的M去执行这些可能存在的待执行任务。如果已经有处于 spinning状态的M则便不会启动。
+// 成功启动一个M的条件：1. 有空闲的P 2.没有其他处于spinning状态的M
+//
+// 1. 尝试获取一个空闲的P并关联到M，将M的 spinning 字段设置为true。
+// 2. 如果没有获取到空闲的P，这将sched.needspinning 字段设置为1，并返回。
+//
+// 在以下几种情况被调用：
+// 1. go 语句创建了新的goroutine
+// 2. 唤醒 _Gwaiting 状态的G， ready() -> wakep()
+// 3. 如果一个执行 schedule() 的M的 spinning 字段为true，则在其发现到一个可以执行的goroutine时，其会调用 resetspinning() -> wakep()
+// 4. 当执行 schedule() 时，如果发现的是一个 GCworker or tracereader ，则会调用 wakep()
+// 5. startTheWorldWithSema -> wakep()
+//
 // Tries to add one more P to execute G's.
 // Called when a G is made runnable (newproc, ready).
 // Must be called with a P.
 func wakep() {
 	// Be conservative about spinning threads, only start one if none exist
 	// already.
+	// 如果已经有正在自旋的M，则直接返回，否则将 sched.nmspinning 设置1，
+	// 更新sched.nmspinning状态
 	if sched.nmspinning.Load() != 0 || !sched.nmspinning.CompareAndSwap(0, 1) {
 		return
 	}
@@ -2539,6 +2706,7 @@ func wakep() {
 	// see at least one running M (ours).
 	unlock(&sched.lock)
 
+	// 获取PP成功，启动M，且将M的状态设置为自旋
 	startm(pp, true)
 
 	releasem(mp)
@@ -2666,6 +2834,9 @@ func execute(gp *g, inheritTime bool) {
 	gogo(&gp.sched)
 }
 
+// findRunnable 找到一个处于 _Grunnable 状态的 goroutine
+// 来源：
+// 1. 别的队列
 // Finds a runnable goroutine to execute.
 // Tries to steal from other P's, get g from local or global queue, poll network.
 // tryWakeP indicates that the returned goroutine is not normal (GC worker, trace
@@ -2715,6 +2886,7 @@ top:
 	// Check the global runnable queue once in a while to ensure fairness.
 	// Otherwise two goroutines can completely occupy the local runqueue
 	// by constantly respawning each other.
+	// 每执行60次schedule()之后，尝试从全局队列中寻找可执行goroutine
 	if pp.schedtick%61 == 0 && sched.runqsize > 0 {
 		lock(&sched.lock)
 		gp := globrunqget(pp, 1)
@@ -2725,6 +2897,7 @@ top:
 	}
 
 	// Wake up the finalizer G.
+	// 唤醒执行析构函数的G
 	if fingStatus.Load()&(fingWait|fingWake) == fingWait|fingWake {
 		if gp := wakefing(); gp != nil {
 			ready(gp, 0, true)
@@ -2735,11 +2908,13 @@ top:
 	}
 
 	// local runq
+	// 尝试从本地队列中获取goroutine
 	if gp, inheritTime := runqget(pp); gp != nil {
 		return gp, inheritTime, false
 	}
 
 	// global runq
+	// 尝试从global窃取一批任务放入本地队列，并返回可以执行任务。
 	if sched.runqsize != 0 {
 		lock(&sched.lock)
 		gp := globrunqget(pp, 0)
@@ -2756,8 +2931,14 @@ top:
 	// blocked thread (e.g. it has already returned from netpoll, but does
 	// not set lastpoll yet), this thread will do blocking netpoll below
 	// anyway.
+	// 不执行 netpoll() 的条件：
+	// 1. netpollinited() 返回false，即netpoll还未初始化
+	// 2. netpollWaiters==0, 即没有netpoll等待者(与文件描述符关联的goroutine)
+	// 3. sched.lastpoll==0，已经有其它goroutine阻塞在netpoll调用上
 	if netpollinited() && netpollWaiters.Load() > 0 && sched.lastpoll.Load() != 0 {
 		if list := netpoll(0); !list.empty() { // non-blocking
+			// 从netpoll调用获取的任务链表后，只取第一个。
+			// 剩余任务的处理见 injectglist 函数
 			gp := list.pop()
 			injectglist(&list)
 			casgstatus(gp, _Gwaiting, _Grunnable)
@@ -2773,16 +2954,26 @@ top:
 	// Limit the number of spinning Ms to half the number of busy Ps.
 	// This is necessary to prevent excessive CPU consumption when
 	// GOMAXPROCS>>1 but the program parallelism is low.
+	// 本执行窃取任务的条件之一：
+	// 本M在执行schedule()函数之前已经处于 spinning 状态
+	// 处于 spinning 状态的M 数量小于空闲P的一半
 	if mp.spinning || 2*sched.nmspinning.Load() < gomaxprocs-sched.npidle.Load() {
+		// 执行到此，说明任务不是很多。所以要将本M设置为 spinning 状态，防止
+		// 有更多的自旋M在运行，浪费CPU资源。
 		if !mp.spinning {
 			mp.becomeSpinning()
 		}
 
+		// 从其他P的本地任务队列中窃取一半任务放入本地任务队列
+		// tnow: 为参数now或者当前时间
 		gp, inheritTime, tnow, w, newWork := stealWork(now)
 		if gp != nil {
 			// Successfully stole.
 			return gp, inheritTime, false
 		}
+		// 满足以下条件之一，newWork为true：
+		// 1. sched.gcwaiting == 1
+		// 2. stealWork 执行 checktimers 时至少执行了一个到期的 timer
 		if newWork {
 			// There may be new timer or GC work; restart to
 			// discover.
@@ -2791,6 +2982,8 @@ top:
 
 		now = tnow
 		if w != 0 && (pollUntil == 0 || w < pollUntil) {
+			// pollUntil为其他P的timers最近到期时间（如果窃取逻辑执行时在其他P上执行了 checktimers 函数的话) 、本P的timers种最早
+			// 到期的时间中的较小者。
 			// Earlier timer to wait for.
 			pollUntil = w
 		}
@@ -2800,7 +2993,11 @@ top:
 	//
 	// If we're in the GC mark phase, can safely scan and blacken objects,
 	// and have work to do, run idle-time marking rather than give up the P.
+	// 1. 标记阶段
+	// 2. 有任务分配给当前P去做
+	// 3. 添加 idleWorker 计数成功
 	if gcBlackenEnabled != 0 && gcMarkWorkAvailable(pp) && gcController.addIdleMarkWorker() {
+		//
 		node := (*gcBgMarkWorkerNode)(gcBgMarkWorkerPool.pop())
 		if node != nil {
 			pp.gcMarkWorkerMode = gcMarkWorkerIdleMode
@@ -2809,8 +3006,10 @@ top:
 			if trace.enabled {
 				traceGoUnpark(gp, 0)
 			}
+			// 返回执行GC标记任务的goroutine
 			return gp, false, false
 		}
+		// 如果没有node了（node数量等于 GOMAXPROCS的值），则idleWorker 的计数减1
 		gcController.removeIdleMarkWorker()
 	}
 
@@ -2841,25 +3040,34 @@ top:
 	timerpMaskSnapshot := timerpMask
 
 	// return P and block
+	// 再次查看是否要相应GC
 	lock(&sched.lock)
 	if sched.gcwaiting.Load() || pp.runSafePointFn != 0 {
 		unlock(&sched.lock)
 		goto top
 	}
+
+	// 再次尝试从全局任务队列汉中获取任务
 	if sched.runqsize != 0 {
 		gp := globrunqget(pp, 0)
 		unlock(&sched.lock)
 		return gp, false, false
 	}
+
+
+	// 再次尝试spinning
 	if !mp.spinning && sched.needspinning.Load() == 1 {
 		// See "Delicate dance" comment below.
 		mp.becomeSpinning()
 		unlock(&sched.lock)
 		goto top
 	}
+
+	// 解除P和M的绑定关系
 	if releasep() != pp {
 		throw("findrunnable: wrong p")
 	}
+	// now 不为0时，返回当前时间
 	now = pidleput(pp, now)
 	unlock(&sched.lock)
 
@@ -2916,6 +3124,7 @@ top:
 		// See https://go.dev/issue/43997.
 
 		// Check all runqueues once again.
+		// 如果存在空闲的P且存在本地任务队列不为空的P，则返回一个空闲P即下面的pp
 		pp := checkRunqsNoP(allpSnapshot, idlepMaskSnapshot)
 		if pp != nil {
 			acquirep(pp)
@@ -2924,6 +3133,7 @@ top:
 		}
 
 		// Check for idle-priority GC work again.
+		// 有GC标记任务、空闲的P和goroutine worker(node) 这返回那个P和goroutine worker
 		pp, gp := checkIdleGCNoP()
 		if pp != nil {
 			acquirep(pp)
@@ -2944,10 +3154,18 @@ top:
 		// Note that we cannot use checkTimers here because it calls
 		// adjusttimers which may need to allocate memory, and that isn't
 		// allowed when we don't have an active P.
+		//
+		// 更新pollUntil，为所有P的所有timers堆中最先到期的时间
 		pollUntil = checkTimersNoP(allpSnapshot, timerpMaskSnapshot, pollUntil)
 	}
 
 	// Poll network until next timer.
+	// 需满足以下条件if语句才会返回true:
+	// 1. netpoll 已经初始化了
+	// 2. 有goroutine 已经将其描述符添加到了netpoll中或者pollUntil不为0，即反正没有任务可做且有终止时间不如阻塞在netpoll上。
+	// 3. 没有其他M阻塞在netpoll上
+	//
+	// 至此当前M没有绑定P且没有处于spinning状态，上面的那个if逻辑排除了这些情况
 	if netpollinited() && (netpollWaiters.Load() > 0 || pollUntil != 0) && sched.lastpoll.Swap(0) != 0 {
 		sched.pollUntil.Store(pollUntil)
 		if mp.p != 0 {
@@ -2969,23 +3187,30 @@ top:
 			// When using fake time, just poll.
 			delay = 0
 		}
+		// 阻塞到 pollUntil或者之前有新的工作返回
 		list := netpoll(delay) // block until new work is available
+		//
 		sched.pollUntil.Store(0)
+		// 结束 netpoll 阻塞后设置	sched.lastpoll 以便其他M可以进行 netpoll调用
 		sched.lastpoll.Store(now)
+		//
 		if faketime != 0 && list.empty() {
 			// Using fake time and nothing is ready; stop M.
 			// When all M's stop, checkdead will call timejump.
 			stopm()
 			goto top
 		}
+
 		lock(&sched.lock)
 		pp, _ := pidleget(now)
 		unlock(&sched.lock)
 		if pp == nil {
 			injectglist(&list)
 		} else {
+			// 有空闲P便继续运行
 			acquirep(pp)
 			if !list.empty() {
+				// netpoll返回的任务列表不为空
 				gp := list.pop()
 				injectglist(&list)
 				casgstatus(gp, _Gwaiting, _Grunnable)
@@ -2994,17 +3219,25 @@ top:
 				}
 				return gp, false, false
 			}
+			// 如果 M本来是 spinning状态则回复spinning状态
 			if wasSpinning {
 				mp.becomeSpinning()
 			}
 			goto top
 		}
 	} else if pollUntil != 0 && netpollinited() {
+		// 不满足执行 netpoll 的情况下的处理分支：
+
+		// 1. pollerPollUntil 为0的话，有可能存在永久阻塞在notepoll上的M
+		// 2. 有timers比netpoll阻塞的预计时间要提前到来
 		pollerPollUntil := sched.pollUntil.Load()
 		if pollerPollUntil == 0 || pollerPollUntil > pollUntil {
+			// 结束netpoll阻塞，以便让即将到期的timers能被处理
 			netpollBreak()
 		}
 	}
+	// 这是一个没有关联P的M。几乎不可能有待执行的任务。
+	// 休眠当前M
 	stopm()
 	goto top
 }
@@ -3029,7 +3262,34 @@ func pollWork() bool {
 	}
 	return false
 }
-
+// stealWork
+// 任务：从其他P的本地任务队列、nextg和timers中窃取任务
+//
+// 返回条件：一旦窃取到任务就结束循环并返回或者执行完循环返回
+//
+// 最多进行4轮窃取：
+// 前3轮只考虑其他P的本地任务队列中窃取一半放入当前P的本地任务队列，并返回窃取
+// 的任务重的一个。
+// 最后一轮会在每个P上执行：
+// 1. checkTimers, 然后尝试查看当前P的本地任务队列中有没有因执行 checkTimers 而添
+// 加的任务
+// 2. 尝试从P的本地任务队列中窃取一半（n-n/2)，如果队列为空则尝试从 nextg 上窃取
+// 返回值：
+// gp:为窃取到的goroutine，可能为nil
+//
+// inheritTime:返回的gp是从P的nexg字段获取的，checTimers得到执行且添加了任务则
+// 此值设置为true
+//
+// rnow:
+// 1. 参数now：没有执行checktimers
+// 2. checktimers的返回值rnow:
+//    rnow:参数now，除非pp的timers中有活跃的tiemr切参数now为0，这种情况下返回当前时间。
+//
+// pollUntil:接下来最先到期的的timer的when，指导netpoll调用应该在pollUntil时刻之
+// 前结束阻塞。
+// newWork:如果在调用 checkTimers 时，执行过 runtiemr 或者 sched.gcWaitting=1
+// 则为true，否则为false。
+//
 // stealWork attempts to steal a runnable goroutine or timer from any P.
 //
 // If newWork is true, new work may have been readied.
@@ -3045,11 +3305,13 @@ func stealWork(now int64) (gp *g, inheritTime bool, rnow, pollUntil int64, newWo
 	for i := 0; i < stealTries; i++ {
 		stealTimersOrRunNextG := i == stealTries-1
 
+		// 下面的for循环步长为 MAXPROCS，每次P的排序都是随机
 		for enum := stealOrder.start(fastrand()); !enum.done(); enum.next() {
 			if sched.gcwaiting.Load() {
 				// GC work may be available.
 				return nil, false, now, pollUntil, true
 			}
+			// 排除当前P
 			p2 := allp[enum.position()]
 			if pp == p2 {
 				continue
@@ -3068,13 +3330,26 @@ func stealWork(now int64) (gp *g, inheritTime bool, rnow, pollUntil int64, newWo
 			//
 			// timerpMask tells us whether the P may have timers at all. If it
 			// can't, no need to check at all.
+			// 执行P的 checkTimers 条件：
+			// 1. 处于主循环的第4轮
+			// 2. P上有timers
 			if stealTimersOrRunNextG && timerpMask.read(enum.position()) {
 				tnow, w, ran := checkTimers(p2, now)
 				now = tnow
 				if w != 0 && (pollUntil == 0 || w < pollUntil) {
+					// 更新 pollUntil 为更小的值
 					pollUntil = w
 				}
 				if ran {
+					// 在调用 checkTimers 函数时，至少执行了一次 runtimer 函数
+					// 检查当前P的任务队列，看是否因为在其它P上执行 checkTimers
+					// 而有任务加入本地任务队列。
+					//
+					//  checkTimers 可能会执行 runtimer -> runOneTimer
+					//					// runOneTimer 会执行 timer.f 而f会执行 goready(g)
+					//					// goready 调用 runqput(getg().m.p.ptr(),g)
+					//					// 将就绪的g放入调用 goready的P的任务队列里即当前P。
+					//
 					// Running the timers may have
 					// made an arbitrary number of G's
 					// ready and added them to this P's
@@ -3091,6 +3366,10 @@ func stealWork(now int64) (gp *g, inheritTime bool, rnow, pollUntil int64, newWo
 			}
 
 			// Don't bother to attempt to steal if p2 is idle.
+			// 排除处于 _Pidle 状态的P
+			// 尝试从p2的本地任务队列中窃取一半放入当前P的本地任务队列，
+			// 如果 stealTimersOrRunNextG 为true且p2的本地任务队列
+			// 空，会尝试从p2的 nexg 字段上窃取。
 			if !idlepMask.read(enum.position()) {
 				if gp := runqsteal(pp, p2, stealTimersOrRunNextG); gp != nil {
 					return gp, false, now, pollUntil, ranTimer
@@ -3105,6 +3384,8 @@ func stealWork(now int64) (gp *g, inheritTime bool, rnow, pollUntil int64, newWo
 	return nil, false, now, pollUntil, ranTimer
 }
 
+// checkRunqsNoP
+// 如果存在空闲的P且存在本地任务队列不为空的P，则返回一个空闲P即下面的pp
 // Check all Ps for a runnable G to steal.
 //
 // On entry we have no P. If a G is available to steal and a P is available,
@@ -3245,6 +3526,20 @@ func resetspinning() {
 	wakep()
 }
 
+// injectglist
+//
+// 	// 如果没有本地P，则将任务列表全部放入到sched.runq全局队列
+//	// 并尝试启动列表长度个M并为每个M分配一个空闲的P（如果空闲P
+//	// 的数量允许的话）
+//  // 返回
+//
+//	// 本地P不为nil。
+//	// 取sched.npidle和任务列表长度较小者，然后从任务列表中取出这么多个
+//	// 任务放入到 sched.runq 全局队列。并启动这么多个M并为每个M分配一个
+//	// 空闲的P。
+//	// 剩余的任务(如果有的话)放入到本地P的队列中
+//  // 返回
+//
 // injectglist adds each runnable G on the list to some run queue,
 // and clears glist. If there is no current P, they are added to the
 // global queue, and up to npidle M's are started to run them.
@@ -3298,6 +3593,9 @@ func injectglist(glist *gList) {
 		}
 	}
 
+	// 如果没有本地P，则将任务列表全部放入到sched.runq全局队列
+	// 并尝试启动列表长度个M并为每个M分配一个空闲的P（如果空闲P
+	// 的数量允许的话）
 	pp := getg().m.p.ptr()
 	if pp == nil {
 		lock(&sched.lock)
@@ -3306,6 +3604,11 @@ func injectglist(glist *gList) {
 		startIdle(qsize)
 		return
 	}
+	// 至此，本地P不为nil。
+	// 取sched.npidle和任务列表长度较小者，然后从任务列表中取出这么多个
+	// 任务放入到 sched.runq 全局队列。并启动这么多个M并为每个M分配一个
+	// 空闲的P。
+	// 剩余的任务放入到本地P的队列中
 
 	npidle := int(sched.npidle.Load())
 	var globq gQueue
@@ -3314,6 +3617,7 @@ func injectglist(glist *gList) {
 		g := q.pop()
 		globq.pushBack(g)
 	}
+
 	if n > 0 {
 		lock(&sched.lock)
 		globrunqputbatch(&globq, int32(n))
@@ -3336,6 +3640,8 @@ func schedule() {
 		throw("schedule: holding locks")
 	}
 
+	// 如果当前M与某个G互相绑定了(让其目前只能运行那个G且那个G也只能在此M上运行，)。
+	// 则进入休眠，等待另外一个执行schedule()的M发现了那个与此M绑定的G,会唤醒这个M。
 	if mp.lockedg != 0 {
 		stoplockedm()
 		execute(mp.lockedg.ptr(), false) // Never returns.
@@ -3343,26 +3649,31 @@ func schedule() {
 
 	// We should not schedule away from a g that is executing a cgo call,
 	// since the cgo call is using the m's g0 stack.
+	// 执行schedule函数之后并不会回到g0现场且破坏了cgo正在使用的g0栈
 	if mp.incgo {
 		throw("schedule: in cgo")
 	}
 
 top:
 	pp := mp.p.ptr()
+	// 禁止对P的抢占
 	pp.preempt = false
 
 	// Safety check: if we are spinning, the run queue should be empty.
 	// Check this before calling checkTimers, as that might call
 	// goready to put a ready goroutine on the local run queue.
+	// 本地队列有任务且M处于自旋状态，不应该调用 schedule 函数
 	if mp.spinning && (pp.runnext != 0 || pp.runqhead != pp.runqtail) {
 		throw("schedule: spinning with local work")
 	}
 
+	// 调用 findRunnable 找到可执行的 grotuine
 	gp, inheritTime, tryWakeP := findRunnable() // blocks until work is available
 
 	// This thread is going to run a goroutine and is not spinning anymore,
 	// so if it was marked as spinning we need to reset it now and potentially
 	// start a new spinning M.
+	// 至此已经找到了一个待运行的goroutine，重置 mp.spinning 状态
 	if mp.spinning {
 		resetspinning()
 	}
@@ -3389,6 +3700,7 @@ top:
 	if tryWakeP {
 		wakep()
 	}
+	// 如果gp被绑定到特定的M，则唤醒关联的M，重新执行查找逻辑
 	if gp.lockedm != 0 {
 		// Hands off own p to the locked m,
 		// then blocks waiting for a new p.
@@ -3413,6 +3725,18 @@ func dropg() {
 	setGNoWB(&gp.m.curg, nil)
 }
 
+// checkTimers
+// 目的：整理pp.timers，并执行到期的timer，到期的timer关联的g会放入当前P的本地任务队列。
+//
+// 参数：
+// pp: 要被检查的timers所属的P
+// now: 如果存在变更的timer且其目标时间小于now，这整理pp.timers堆，如果为0则设置为当前时间
+//
+// 返回值：
+// rnow:参数now，除非pp的timers种有活跃的tiemr切参数now为0，这种情况下返回当前时间。
+// pollUntil:pp的timers中最快到期时间，否则返回0。
+// ran:在pp.timers中只是找到一个到期的tiemr的话返回true，否则返回false。
+//
 // checkTimers runs any timers for the P that are ready.
 // If now is not 0 it is the current time.
 // It returns the passed time or the current time if now was passed as 0.
@@ -3431,7 +3755,8 @@ func checkTimers(pp *p, now int64) (rnow, pollUntil int64, ran bool) {
 	if next == 0 || (nextAdj != 0 && nextAdj < next) {
 		next = nextAdj
 	}
-
+	// next 为 pp.timer0When 和 pp.timerModifiedEarliest 中的较小者
+	// 为0表示没有timer可以运行或者需要调整，即没有活跃的timer(将来会执行的tiemr)
 	if next == 0 {
 		// No timers to run or adjust.
 		return now, 0, false
@@ -3440,6 +3765,9 @@ func checkTimers(pp *p, now int64) (rnow, pollUntil int64, ran bool) {
 	if now == 0 {
 		now = nanotime()
 	}
+	// 即使没有到期的timer，如果满足以下条件之一还是会继续下去：
+	// 1. 当前P与参数PP不同
+	// 2. pp中的待移除的timer数量大于于总timers数量的1/4
 	if now < next {
 		// Next timer is not ready to run, but keep going
 		// if we would clear deleted timers.
@@ -3452,11 +3780,13 @@ func checkTimers(pp *p, now int64) (rnow, pollUntil int64, ran bool) {
 
 	lock(&pp.timersLock)
 
+	// 调整pp 中的 timers，并是尝试执行到期的 timers。
 	if len(pp.timers) > 0 {
 		adjusttimers(pp, now)
 		for len(pp.timers) > 0 {
 			// Note that runtimer may temporarily unlock
 			// pp.timersLock.
+			// tw不等于0说明pp中已经没有到期的timer了
 			if tw := runtimer(pp, now); tw != 0 {
 				if tw > 0 {
 					pollUntil = tw
@@ -3470,6 +3800,7 @@ func checkTimers(pp *p, now int64) (rnow, pollUntil int64, ran bool) {
 	// If this is the local P, and there are a lot of deleted timers,
 	// clear them out. We only do this for the local P to reduce
 	// lock contention on timersLock.
+	// 尝试从pp.timers中清除已经删除的timers
 	if pp == getg().m.p.ptr() && int(pp.deletedTimers.Load()) > len(pp.timers)/4 {
 		clearDeletedTimers(pp)
 	}
@@ -3613,6 +3944,12 @@ func goyield_m(gp *g) {
 	schedule()
 }
 
+// goexit1()
+// 用户goroutine退出时会执行 goexit()
+// goexit()-> goexit1()
+//
+// 此函数只被 Goexit() 调用
+//
 // Finishes execution of the current goroutine.
 func goexit1() {
 	if raceenabled {
@@ -3623,7 +3960,15 @@ func goexit1() {
 	}
 	mcall(goexit0)
 }
-
+// goexit0()
+// 将参数gp的状态设置为 _Gdead，并重置其它字段，然后将其放入到当前P的 gFree 链表
+// 此函数被 mcall 所调用
+// gp.gcAssistBytes 信誉值添加到全局 gcController.bgScanCredit
+// 如果当前M与某个g锁定，这结束这个M所在的线程
+// 继续执行 schedule 进入下一轮调用
+//
+// 此函数只被 goexit1() 函数调用
+//
 // goexit continuation on g0.
 func goexit0(gp *g) {
 	mp := getg().m
@@ -3649,6 +3994,7 @@ func goexit0(gp *g) {
 	gp.timer = nil
 
 	if gcBlackenEnabled != 0 && gp.gcAssistBytes > 0 {
+		// 将gp做的GC标记任务得到的信誉值添加到全局gcController.bgScanCredit上
 		// Flush assist credit to the global pool. This gives
 		// better information to pacing if the application is
 		// rapidly creating an exiting goroutines.
@@ -3669,8 +4015,11 @@ func goexit0(gp *g) {
 		print("invalid m->lockedInt = ", mp.lockedInt, "\n")
 		throw("internal lockOSThread error")
 	}
+	// 将gp放入pp的本地 gFree 链表
 	gfput(pp, gp)
 	if locked {
+		// 当前M与某个特定的G绑定了，如果OS不是plan9则杀掉当前线程
+		//
 		// The goroutine may have locked this thread because
 		// it put it in an unusual kernel state. Kill it
 		// rather than returning it to the thread pool.
@@ -3678,6 +4027,8 @@ func goexit0(gp *g) {
 		// Return to mstart, which will release the P and exit
 		// the thread.
 		if GOOS != "plan9" { // See golang.org/issue/22227.
+			// mp.g0.sched 在mstart1函数调用中设置，下面的gogo函数调用
+			// 会让当前线程继续在 mstart0 中执行退出线程逻辑
 			gogo(&mp.g0.sched)
 		} else {
 			// Clear lockedExt on plan9 since we may end up re-using
@@ -4241,6 +4592,7 @@ func malg(stacksize int32) *g {
 // The compiler turns a go statement into a call to this.
 func newproc(fn *funcval) {
 	gp := getg()
+	// newproc's return address
 	pc := getcallerpc()
 	systemstack(func() {
 		newg := newproc1(fn, gp, pc)
@@ -4248,6 +4600,7 @@ func newproc(fn *funcval) {
 		pp := getg().m.p.ptr()
 		runqput(pp, newg, true)
 
+		// 在 runtime.main 中设置为true
 		if mainStarted {
 			wakep()
 		}
@@ -4264,6 +4617,7 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr) *g {
 
 	mp := acquirem() // disable preemption because we hold M and P in local vars.
 	pp := mp.p.ptr()
+	// 先尝试 gfget()函数从空闲队列中获取，如果没有，再用 malg() 函数分配新的g
 	newg := gfget(pp)
 	if newg == nil {
 		newg = malg(_StackMin)
@@ -4278,8 +4632,11 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr) *g {
 		throw("newproc1: new g is not Gdead")
 	}
 
+	// lo:824634263552 hi:824634265600 差值 2048
+	// 824634264480 - 824634263552  = 928
 	totalSize := uintptr(4*goarch.PtrSize + sys.MinFrameSize) // extra space in case of reads slightly beyond frame
 	totalSize = alignUp(totalSize, sys.StackAlign)
+	// totalSize = 32
 	sp := newg.stack.hi - totalSize
 	spArg := sp
 	if usesLR {
@@ -4294,6 +4651,9 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr) *g {
 	newg.stktopsp = sp
 	newg.sched.pc = abi.FuncPCABI0(goexit) + sys.PCQuantum // +PCQuantum so that previous instruction is in same function
 	newg.sched.g = guintptr(unsafe.Pointer(newg))
+	// 更新newg.sched.buf.sp-=1，在空出来的位置插入原来的newg.sched.pc。
+	// newg.sched.buf.ctx = fn
+	// newg.sched.buf.pc = fn.fn
 	gostartcallfn(&newg.sched, fn)
 	newg.gopc = callerpc
 	newg.ancestors = saveAncestors(callergp)
@@ -4322,6 +4682,7 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr) *g {
 	casgstatus(newg, _Gdead, _Grunnable)
 	gcController.addScannableStack(pp, int64(newg.stack.hi-newg.stack.lo))
 
+	// 如果当前P的goroutine编号已经用完需从全局sched那里申请新的一批id
 	if pp.goidcache == pp.goidcacheend {
 		// Sched.goidgen is the last allocated id,
 		// this batch must be [sched.goidgen+1, sched.goidgen+GoidCacheBatch].
@@ -4343,6 +4704,7 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr) *g {
 	if trace.enabled {
 		traceGoCreate(newg, newg.startpc)
 	}
+	// 释放 m.locks 结束防止抢占goroutine
 	releasem(mp)
 
 	return newg
@@ -4381,7 +4743,15 @@ func saveAncestors(callergp *g) *[]ancestorInfo {
 	*ancestorsp = ancestors
 	return ancestorsp
 }
-
+// gfput(pp *p, gp *g)
+// 如果参数gp的栈大小不是 startingStackSize，则先将其栈回收
+// 然后再将其放入到 p.gFree 链表。
+//
+// 如果 p.gFree 链表长度大于等于64，则只保留前31个g。剩余
+// 的根据有没有栈迁移到 sched.gFree.noStack 或者 sched.gFree.Stack
+//
+// 此函数只被 goexit0 函数调用
+//
 // Put on gfree list.
 // If local list is too long, transfer a batch to the global list.
 func gfput(pp *p, gp *g) {
@@ -5030,6 +5400,7 @@ func procresize(nprocs int32) *p {
 		pp := allp[0]
 		pp.m = 0
 		pp.status = _Pidle
+		// m0 在 acquirep 函数中被绑定到 allp[0]
 		acquirep(pp)
 		if trace.enabled {
 			traceGoStart()
@@ -5080,6 +5451,12 @@ func procresize(nprocs int32) *p {
 	return runnablePs
 }
 
+// acquirep
+// 前置条件：
+// 当期M满足：m.p = 0，参数pp满足：pp.m=0,pp.status = _Pidle
+// 执行之后：
+// m.p = pp , pp.status = _Prunning
+// 肯定会将pp绑定到当前M，并将pp状态从m
 // Associate p and the current m.
 //
 // This function is allowed to have write barriers even if the caller
@@ -5089,6 +5466,7 @@ func procresize(nprocs int32) *p {
 func acquirep(pp *p) {
 	// Do the part that isn't allowed to have write barriers.
 	wirep(pp)
+	// 至此当前为一个绑定了状态为 _Prunning 的P的M
 
 	// Have p; write barriers now allowed.
 
@@ -5101,6 +5479,8 @@ func acquirep(pp *p) {
 	}
 }
 
+// 将 pp 绑定到当前M，且必须满足：pp状态是 _Pidle 、pp.m==0和m.p==0
+//
 // wirep is the first step of acquirep, which actually associates the
 // current M to pp. This is broken out so we can disallow write
 // barriers for this part, since we don't yet have a P.
@@ -5902,6 +6282,8 @@ func pidleget(now int64) (*p, int64) {
 	return pp, now
 }
 
+// pidlegetSpinning 尝试从sched的pidle链获取空闲p，如果没有发现将 sched.needspinning
+// 设置为1。 告知未来进入休眠状态的M应该自旋尝试寻找这个任务。
 // pidlegetSpinning tries to get a p from the _Pidle list, acquiring ownership.
 // This is called by spinning Ms (or callers than need a spinning M) that have
 // found work. If no P is available, this must synchronized with non-spinning
@@ -5920,6 +6302,9 @@ func pidlegetSpinning(now int64) (*p, int64) {
 		// See "Delicate dance" comment in findrunnable. We found work
 		// that we cannot take, we must synchronize with non-spinning
 		// Ms that may be preparing to drop their P.
+		//
+		// 有任务，但是没有发现可用的P，需通过sched.needspinning告知那些准备抛弃P的M
+		// 去自旋寻找这个任务。
 		sched.needspinning.Store(1)
 		return nil, now
 	}

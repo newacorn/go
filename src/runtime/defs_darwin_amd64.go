@@ -120,6 +120,7 @@ type sigactiont struct {
 }
 
 type usigactiont struct {
+	// usigactiont.__sigaction_u 一个8字节的值，其指向的内存中存储的信号处理函数第一条指令的地址
 	__sigaction_u [8]byte
 	sa_mask       uint32
 	sa_flags      int32

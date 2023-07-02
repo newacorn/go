@@ -32,6 +32,7 @@ const (
 	kindStruct
 	kindUnsafePointer
 
+	// 标记存储在接口的data字段的指针是存储的值的本身，而不是存储数据的地址。
 	kindDirectIface = 1 << 5
 	kindGCProg      = 1 << 6
 	kindMask        = (1 << 5) - 1

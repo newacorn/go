@@ -28,26 +28,46 @@ const (
 	tflagRegularMemory tflag = 1 << 3 // equal and hash can treat values of this type as a single region of t.size bytes
 )
 
+// _type 提供了适用于所有类型的最基本的描述，对于一些更复杂的类型，例如符合类型slice和map等，run
+// time中分别定义了 maptype slicetype 等对应的结构。例如 slicetype 就是一个由一个用来描述类型本身
+// 的 _type 结构和一个指向元素类型的指针组成。
 // Needs to be in sync with ../cmd/link/internal/ld/decodesym.go:/^func.commonsize,
 // ../cmd/compile/internal/reflectdata/reflect.go:/^func.dcommontype and
 // ../reflect/type.go:/^type.rtype.
 // ../internal/reflectlite/type.go:/^type.rtype.
 type _type struct {
+	// 此类型的数据需要占用多少字节的存储空间。被 newobject / mallocgc 所需要。
 	size       uintptr
+	// 表示数据的前多少字节包含指针，用来应用写屏障时优化范围大小，例如某个stuct类型在
+	// 64位平台占32字节，但只有第一个字段是指针类型，这个值就是8，剩下的24字节就不需要写
+	// 屏障了。GC进行位图标记的时候，也会用到该字段。
 	ptrdata    uintptr // size of memory prefix holding all pointers
+	// 当前类型的哈希值，runtime基于这个值构建类型映射表，加速类型比较和查找。
 	hash       uint32
+	// 额外的类型标识，目前由4个独立的二进制位组合而成。 tflagUncommon 表明这种类型元数据结构后面
+	// 有个紧邻的 uncommontype 结构， uncommontype 主要在自定义类型定义方法集时用到。 tflagExtraStar
+	// 表示类型的名称字符串有个前缀 *， 因为对于程序中的大多数类型T而言，*T也同样存在，复用同一个名称字符串
+	// 能够节省空间。 tflagNamed 表示类型有名称。 tflagRegularMemory 表示相等比较和哈希函数可以把该
+	// 类型的数据当成内存中的单块区间来处理，即类型没有间接部分。
 	tflag      tflag
+	// 表示当前类型变量的对齐边界
 	align      uint8
+	// 表示当前类型的struct字段的对齐边界
 	fieldAlign uint8
+	// 表示当前类型所属的分类，目前Go语言的reflect包定义了26种有效分类。
 	kind       uint8
 	// function for comparing objects of this type
 	// (ptr to object A, ptr to object B) -> ==?
+	// 用来比较两个当前类型的变量是否相等。
 	equal func(unsafe.Pointer, unsafe.Pointer) bool
 	// gcdata stores the GC type data for the garbage collector.
 	// If the KindGCProg bit is set in kind, gcdata is a GC program.
 	// Otherwise it is a ptrmask bitmap. See mbitmap.go for details.
+	// 和垃圾回收相关，GC扫描和写屏障用来追踪指针。
 	gcdata    *byte
+	// 偏移，通过str可以找到当前类型的名称等文本信息。
 	str       nameOff
+	// 偏移，假设当期类型为T，通过它可以找到类型*T的类型元数据。
 	ptrToThis typeOff
 }
 
@@ -58,7 +78,8 @@ func (t *_type) string() string {
 	}
 	return s
 }
-
+// uncommon 方法，对于一个自定义类型可以通过此方法得到一个指向 uncommontype 结构的指针
+// ,也就是说编译器会为自定义类型生成一个 uncommontype 结构。
 func (t *_type) uncommon() *uncommontype {
 	if t.tflag&tflagUncommon == 0 {
 		return nil
@@ -233,6 +254,7 @@ func resolveTypeOff(ptrInModule unsafe.Pointer, off typeOff) *_type {
 		// See cmd/link/internal/ld/data.go:relocsym.
 		return nil
 	}
+	// 根据base确定在哪个模块类型区间里查找
 	base := uintptr(ptrInModule)
 	var md *moduledata
 	for next := &firstmoduledata; next != nil; next = next.next {
@@ -242,6 +264,7 @@ func resolveTypeOff(ptrInModule unsafe.Pointer, off typeOff) *_type {
 		}
 	}
 	if md == nil {
+		// 如果未找到模块，说明此类型是运行时通过反射创建的, 要在reflectOffs中查找。
 		reflectOffsLock()
 		res := reflectOffs.m[int32(off)]
 		reflectOffsUnlock()
@@ -254,9 +277,13 @@ func resolveTypeOff(ptrInModule unsafe.Pointer, off typeOff) *_type {
 		}
 		return (*_type)(res)
 	}
+	// 先在模块的 typemap字段中查找
 	if t := md.typemap[off]; t != nil {
 		return t
 	}
+	// 但是第一个模块的typemap 字段为nil。
+	// 所以再尝试通过偏移来查找。
+	// see: runtime.typelinksinit
 	res := md.types + uintptr(off)
 	if res > md.etypes {
 		println("runtime: typeOff", hex(off), "out of range", hex(md.types), "-", hex(md.etypes))
@@ -327,29 +354,57 @@ type nameOff int32
 type typeOff int32
 type textOff int32
 
+// method 为类型方法集（数组）的元素类型，按name进行升序排列。
+// 指针接收者方法的 ifn 和 tfn 的值是一样的。
 type method struct {
+	// name 通过这个偏移可以找到方法名称字符串。
+	// nameOff 相对于具体类型 _type 的起始地址偏移量。
+	// 可以通过 reflect.(*rtype).nameOff(t *_type, name nameOff) 返回的 reflect.name 类型的值
+	// 然后通过其 name 方法来获取字符串名称。
 	name nameOff
+	// mtyp 偏移除是方法的类型元数据，进一步可以已找到参数和返回值的类型元数据
+	// 可以通过 reflect.(*rtype).typeOff(t *_type, mtyp typeOff) 返回的 reflect.(*rtype) 类型的值
+	// 再通过其 String 方法可以获得方法类型的字符串表示。
 	mtyp typeOff
+	// ifn 供接口调用的方法地址。 ifn 的接收者类型一定是指针。
+	// 因为接口中 data 字段总是保存了动态值的地址，所以可以直接调用这个方法。
+	// 可以通过 reflect.(*rtype).textOff(t *_type, inf textOff) 返回的方法的指针
 	ifn  textOff
+	// tfn 是正常方法地址，tfn的接收者类型跟源代码中的实现一致。
+	// 可以通过 reflect.(*rtype).textOff(t *_type, inf textOff) 返回的方法的指针
 	tfn  textOff
 }
 
 type uncommontype struct {
+	// pkgpath 定义该类型的包名称
 	pkgpath nameOff
-	mcount  uint16 // number of methods
-	xcount  uint16 // number of exported methods
+	// mcount 该类型共有多少个方法
+	mcount  uint16 // nummber of methods
+	// xcount 该类型有多少个方法被导出
+	xcount  uint16 // numbetr of exported methods
+	// moff 是个偏移值，那里就是方法方法集的元数据，也就是一组 method 结构构成的数组。
 	moff    uint32 // offset from this uncommontype to [mcount]method
 	_       uint32 // unused
 }
 
+// imethod 接口的方法对应的数据结构
+// 必自定义类型的方法 method 结构少了方法地址，只包含方法名和类型
+// 元数据的偏移。这些偏移的实际类型为int32，与指针的作用一样，但是在
+// 64位平台比使用指针节省一半空间。
 type imethod struct {
 	name nameOff
+	// ityp 方法元信息的偏移，以 ityp 为起点，可以找到方法的参数（包括
+	// 返回值）列表，以及每个参数的类型信息，也就是说这个 ityp 是方法的
+	// 原型信息。
 	ityp typeOff
 }
 
+// 接口类型的元数据信息对应的数据结构
 type interfacetype struct {
 	typ     _type
+	// pkgpath 表示接口类型被定义在哪个包
 	pkgpath name
+	// mhdr 是接口声明的方法列表
 	mhdr    []imethod
 }
 
@@ -498,19 +553,29 @@ func (n name) isBlank() bool {
 	return l == 1 && *n.data(2) == '_'
 }
 
+// typelinksinit 函数返回后，所有模块内部使用的类型信息都可以在其 moduledata.typemap 映射中
+// 找到，用的键还是本模块存放类型元数据区段的偏移量(相对于 moduledata.types )，而值_type指针有
+// 可能指向的是其他模块的内存元数据区间。 这样就达到了所有模块内部类型元信息的唯一性。
+// 这里的模块只的是二进制模块，比如将某个模块构建为插件。
+// 不同module在一起构建的认为是一个模块。
 // typelinksinit scans the types from extra modules and builds the
 // moduledata typemap used to de-duplicate type pointers.
 func typelinksinit() {
+	// 没有其他二进制模块时（plugin），firstmoduledata.next的值为nil
 	if firstmoduledata.next == nil {
 		return
 	}
+	// 用来收集所有模块中的类型信息，用类型的`hash`作为`map`的key，收集的类型元数据
+	// _type结构的地址，把hash相同类型的地址放到同一个slice中。
 	typehash := make(map[uint32][]*_type, len(firstmoduledata.typelinks))
-
+    // activeModules 函数得到当前活动模块的列表，也就是所有能够正常使用的Go
+	// 二进制模块，然后从第二个模块开始向后遍历。
 	modules := activeModules()
 	prev := modules[0]
 	for _, md := range modules[1:] {
 		// Collect types from the previous module into typehash.
 	collect:
+		// tl 为模块内的类型元数据地址相对于moduledata.types 的偏移量。
 		for _, tl := range prev.typelinks {
 			var t *_type
 			if prev.typemap == nil {
@@ -521,24 +586,39 @@ func typelinksinit() {
 			// Add to typehash if not seen before.
 			tlist := typehash[t.hash]
 			for _, tcur := range tlist {
+				// 如果模块prev在之前下面的去重遍历中发现了自己模块中的类型与之前模块的重复
+				// 就会使用之前的模块类型地址（它们都收集在typehash中）。所以下面 tcur==t
+				// 会出现为真的情况。如果在去重遍历中使用了自己的类型地址，这不会出现下面地址
+				// 相等的情况。
 				if tcur == t {
 					continue collect
 				}
 			}
+			// typsehash 这里存储着hash形同但类型地址不同的_type。
+			// 因为hash相同不能代表_type是相同的，所以这里都要收集，用于下
+			// 一步深度去重做准备。
 			typehash[t.hash] = append(tlist, t)
 		}
 
+		// 所有模块中除了 firstmoduledata 的 typemap 字段为nil，其它模块都不会为nil。
 		if md.typemap == nil {
+			// 如果当前模块的 typemap 位nil，就分配一个新的map并填充数据。遍历当前
+			// 模块的 typelinks，对于其中所有的类型，先去 typehash 中查找，优先使用
+			// typehash 中的类型地址， typehash 中没有的类型才使用当前模块自身包含
+			// 的地址，把地址添加到 typemap 中。
 			// If any of this module's typelinks match a type from a
 			// prior module, prefer that prior type by adding the offset
 			// to this module's typemap.
 			tm := make(map[typeOff]*_type, len(md.typelinks))
+			// pinnedTypemaps 主要避免GC回收掉 typemap，因为模块列表对GC不可见。
 			pinnedTypemaps = append(pinnedTypemaps, tm)
 			md.typemap = tm
 			for _, tl := range md.typelinks {
 				t := (*_type)(unsafe.Pointer(md.types + uintptr(tl)))
+				// hash 相同只是去重的第一步
 				for _, candidate := range typehash[t.hash] {
 					seen := map[_typePair]struct{}{}
+					// 在哈希相同的情况下，还需深度比较，因为hash会发生碰撞。
 					if typesEqual(t, candidate, seen) {
 						t = candidate
 						break

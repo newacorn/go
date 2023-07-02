@@ -106,6 +106,23 @@ func init() {
 
 var signalsOK bool
 
+// initsig()
+// 此函数只会被 m0 调用一次，并不会被其它新建的M所调用，猜测其他线程可能共享主线程设置的型号处理函数
+//
+// 调用栈：
+// 0  0x0000000100048940 in runtime.initsig
+//   at /Users/acorn/workspace/gosource/src/runtime/signal_unix.go:114
+//1  0x000000010003aab9 in runtime.mstartm0
+//   at /Users/acorn/workspace/gosource/src/runtime/proc.go:1551
+//2  0x000000010003a9f2 in runtime.mstart1
+//   at /Users/acorn/workspace/gosource/src/runtime/proc.go:1523
+//3  0x000000010003a965 in runtime.mstart0
+//   at /Users/acorn/workspace/gosource/src/runtime/proc.go:1484
+//4  0x0000000100061725 in runtime.mstart
+//   at /Users/acorn/workspace/gosource/src/runtime/asm_amd64.s:430
+//5  0x00000001000616b1 in runtime.rt0_go
+//   at /Users/acorn/workspace/gosource/src/runtime/asm_amd64.s:393
+//
 // Initialize signals.
 // Called by libpreinit so runtime may not be initialized.
 //
@@ -123,38 +140,56 @@ func initsig(preinit bool) {
 		return
 	}
 
+	// _NSIG = 32
 	for i := uint32(0); i < _NSIG; i++ {
 		t := &sigtable[i]
+		// t.flgs=0的sig：9(SIGKILL)、17(SIGSTOP)
+		// t.flags&_SigDefault != 0 的sig：[18,19]和[21,22]
 		if t.flags == 0 || t.flags&_SigDefault != 0 {
 			continue
 		}
 
 		// We don't need to use atomic operations here because
 		// there shouldn't be any other goroutines running yet.
+		//
+		// macos 平台下测试 getsig(i)返回的都是0
+		// getsig(i) 返回的是:信号原来对应的处理函数第一条指令的地址。
 		fwdSig[i] = getsig(i)
 
 		if !sigInstallGoHandler(i) {
 			// Even if we are not installing a signal handler,
 			// set SA_ONSTACK if necessary.
 			if fwdSig[i] != _SIG_DFL && fwdSig[i] != _SIG_IGN {
+				// 信号处理函数指针不为0且不为_SIG_IGN
+				// 则设置sa.sa_flags = osa.sa_flags | _SA_ONSTACK
 				setsigstack(i)
 			} else if fwdSig[i] == _SIG_IGN {
 				sigInitIgnored(i)
 			}
 			continue
 		}
+		// macos 平台至此：
+		// i为下面的值，共25个信号被安装了 sighandler 处理函数
+		// [1-8] [10-16] [20] [23-31]
 
 		handlingSig[i] = 1
 		setsig(i, abi.FuncPCABIInternal(sighandler))
 	}
 }
 
+// sigInstallGoHandler()
+//
+// 对于 _SIGHUP 和 _SIGINT 如果原来已经设置为忽略，则返回false。不另行安装处理函数。
+// 其它信号linux和macos平台都会返回true，表示可以安装go handler。
+// [32-34]信号值设置了 _SigSetStack 也会返回false,在macos平台下没有被用到
+//
 //go:nosplit
 //go:nowritebarrierrec
 func sigInstallGoHandler(sig uint32) bool {
 	// For some signals, we respect an inherited SIG_IGN handler
 	// rather than insist on installing our own default handler.
 	// Even these signals can be fetched using the os/signal package.
+	// 对于 _SIGHUP 和 _SIGINT 如果原来已经设置为忽略，则返回false。不另行安装处理函数。
 	switch sig {
 	case _SIGHUP, _SIGINT:
 		if atomic.Loaduintptr(&fwdSig[sig]) == _SIG_IGN {
@@ -171,6 +206,7 @@ func sigInstallGoHandler(sig uint32) bool {
 
 	t := &sigtable[sig]
 	if t.flags&_SigSetStack != 0 {
+		// [32-34]信号值设置了_SigSetStack，在macos平台下没有被用到
 		return false
 	}
 
@@ -1206,6 +1242,11 @@ func minitSignals() {
 	minitSignalMask()
 }
 
+// minitSignalStack()
+// 如果线程未设置 alternate signal stack 或者未使用CGO
+// 都会将 alternate signal stack 设置为 gsignal stack
+// 否则将 m.goSigStack 设置为 alternate signal stack
+//
 // minitSignalStack is called when initializing a new m to set the
 // alternate signal stack. If the alternate signal stack is not set
 // for the thread (the normal case) then set the alternate signal
@@ -1220,15 +1261,21 @@ func minitSignalStack() {
 	mp := getg().m
 	var st stackt
 	sigaltstack(nil, &st)
+	// 如果线程未设置 alternate signal stack 或者 未使用CGO
+	// 都会将 alternate signal stack 设置为 gsignal stack
 	if st.ss_flags&_SS_DISABLE != 0 || !iscgo {
 		signalstack(&mp.gsignal.stack)
 		mp.newSigstack = true
 	} else {
+		// 将 m.goSigStack 设置为 alternate signal stack
 		setGsignalStack(&st, &mp.goSigStack)
 		mp.newSigstack = false
 	}
 }
-
+// minitSignalMask()
+// 设置哪些信号被要被阻塞，即不被该线程处理
+// 通过调试发现此函数调用后没有任何信号会被任何线程阻塞，即 _SIG_SETMASK 的值为0
+//
 // minitSignalMask is called when initializing a new m to set the
 // thread's signal mask. When this is called all signals have been
 // blocked for the thread.  This starts with m.sigmask, which was set
@@ -1239,12 +1286,18 @@ func minitSignalStack() {
 // After this is called the thread can receive signals.
 func minitSignalMask() {
 	nmask := getg().m.sigmask
+	// macos平台下nmask = 4
 	for i := range sigtable {
 		if !blockableSig(uint32(i)) {
+			// unblockableSig: 1-8 10-12 15-16 20 27
 			sigdelset(&nmask, i)
 		}
 	}
+	// 经过上面的循环:nmask = 0
 	sigprocmask(_SIG_SETMASK, &nmask, nil)
+	// var old sigset
+	// sigprocmask(_SIG_SETMASK, &nmask, &old)
+	// println(old) //4294901503 mac平台下测试
 }
 
 // unminitSignals is called from dropm, via unminit, to undo the

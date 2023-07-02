@@ -20,6 +20,7 @@ import "unsafe"
 
 var (
 	_cgo_init                     unsafe.Pointer
+	// 当使用CGO时，与M关联的线程需要通过在 newm1 函数中通过此函数创建，除了m0关联的线程。
 	_cgo_thread_start             unsafe.Pointer
 	_cgo_sys_thread_create        unsafe.Pointer
 	_cgo_notify_runtime_init_done unsafe.Pointer

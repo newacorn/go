@@ -83,7 +83,7 @@ const (
 	_FixedStack4 = _FixedStack3 | (_FixedStack3 >> 4)
 	_FixedStack5 = _FixedStack4 | (_FixedStack4 >> 8)
 	_FixedStack6 = _FixedStack5 | (_FixedStack5 >> 16)
-	_FixedStack  = _FixedStack6 + 1
+	_FixedStack  = _FixedStack6 + 1 // 2048
 
 	// Functions that need frames bigger than this use an extra
 	// instruction to do the stack split check, to avoid overflow
@@ -1124,6 +1124,8 @@ func nilfunc() {
 	*(*uint8)(nil) = 0
 }
 
+// 参数：fv：闭包指针
+// fn 函数指针
 // adjust Gobuf as if it executed a call to fn
 // and then stopped before the first instruction in fn.
 func gostartcallfn(gobuf *gobuf, fv *funcval) {
@@ -1298,6 +1300,10 @@ func morestackc() {
 	throw("attempt to execute system stack code on user stack")
 }
 
+// 初始值为：_FixedStack=2048
+// 这个值会被更新，根据每次GC扫描的栈的平均值
+// 但介于 [ _FixedStack, maxstacksize]这个范围
+//
 // startingStackSize is the amount of stack that new goroutines start with.
 // It is a power of 2, and between _FixedStack and maxstacksize, inclusive.
 // startingStackSize is updated every GC by tracking the average size of

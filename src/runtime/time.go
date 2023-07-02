@@ -661,6 +661,15 @@ func moveTimers(pp *p, timers []*timer) {
 	}
 }
 
+// adjusttimers
+// 目的：
+// 1. 移除处于删除状态的tiemr： timerDeleted -> timerRemoving (由 dodeltimer 函数执行具体的移除任务）-> timerRemoved
+// 2. 将 timerModifiedLater 和 timerModifiedEarlier 状态改为 timerMoving ，并添加到 moved队列，然后摘一同添加
+// ( addAdjustedTimers )-> timerWaiting。
+// 3. timerModifying 状态的 timer 继续遍历等待其到一个确定状态。
+//
+// 运行条件：参数now的值小于 pp.timerModifiedEarliest 或者 pp.timerModifiedEarliest 的值为0
+//
 // adjusttimers looks through the timers in the current P's heap for
 // any timers that have been modified to run earlier, and puts them in
 // the correct place in the heap. While looking for those timers,
@@ -673,6 +682,8 @@ func adjusttimers(pp *p, now int64) {
 	// We'll postpone looking through all the adjusted timers until
 	// one would actually expire.
 	first := pp.timerModifiedEarliest.Load()
+	// 如果没有 timerModifiedEarLier 状态的 timer或者最到到期的且处于timerModifiedEarlier
+	// 状态的 timer 小于参数 now 则直接返回。因为调整堆的目的就是为了接下来执行 runtimer
 	if first == 0 || first > now {
 		if verifyTimers {
 			verifyTimerHeap(pp)
@@ -681,6 +692,8 @@ func adjusttimers(pp *p, now int64) {
 	}
 
 	// We are going to clear all timerModifiedEarlier timers.
+	// 此函数返回后，pp.timers 中不会在有处于 timerModifiedEarlier 或者 timerModifiedLater
+	// 状态的timer。
 	pp.timerModifiedEarliest.Store(0)
 
 	var moved []*timer
@@ -699,6 +712,8 @@ func adjusttimers(pp *p, now int64) {
 				pp.deletedTimers.Add(-1)
 				// Go back to the earliest changed heap entry.
 				// "- 1" because the loop will add 1.
+				// 因为 dodeltimer 对堆进行了调整，导致一些可能还没被迭代的 timer 移动到了之前的位置
+				// ,所以这里要进行修正。-1抵消循环末尾的 i++
 				i = changed - 1
 			}
 		case timerModifiedEarlier, timerModifiedLater:
@@ -716,12 +731,14 @@ func adjusttimers(pp *p, now int64) {
 				i = changed - 1
 			}
 		case timerNoStatus, timerRunning, timerRemoving, timerRemoved, timerMoving:
+			// 这些状态的 timer 不应该出现在堆中
 			badTimer()
 		case timerWaiting:
 			// OK, nothing to do.
 		case timerModifying:
 			// Check again after modification is complete.
 			osyield()
+			// 抵消 i++
 			i--
 		default:
 			badTimer()
@@ -729,10 +746,12 @@ func adjusttimers(pp *p, now int64) {
 	}
 
 	if len(moved) > 0 {
+		// 批量插入
 		addAdjustedTimers(pp, moved)
 	}
 
 	if verifyTimers {
+		// 堆正确性校验
 		verifyTimerHeap(pp)
 	}
 }

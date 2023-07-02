@@ -1315,6 +1315,16 @@ func readGOMEMLIMIT() int64 {
 	return n
 }
 
+// addIdleMarkWorker
+// 目的:尝试增加 idleWorker 的计数，如果增加成功调用者需称为一个 idleWorker
+// 返回值：
+// 		false，满足下列条件之一:
+// 			 1.当期正在运行的 idleWorker 已经超过了所允许的最大 idleWorker 的数量
+//           2.原子增加 idleWorker 计数失败
+//      true，其它情况
+//
+// gcControllerState.idleMarkWorkers 高32位的值为 idleWorker允许的最大数量
+// 低32位的值为当前 idleWorker的数量
 // addIdleMarkWorker attempts to add a new idle mark worker.
 //
 // If this returns true, the caller must become an idle mark worker unless

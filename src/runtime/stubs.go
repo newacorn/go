@@ -338,7 +338,8 @@ func publicationBarrier()
 // that might relocate the stack in order to grow or shrink it.
 // A general rule is that the result of getcallersp should be used
 // immediately and can only be passed to nosplit functions.
-
+// getcallerpc 返回 其父调用的父调用在调用其父调用时入栈指令指针，即return address。是其父调用执行完毕后紧接着的那条指令。
+// getcallersp 返回 其父调用的父调用栈顶指针。即父调用的args from caller区间末端地址。
 //go:noescape
 func getcallerpc() uintptr
 

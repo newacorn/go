@@ -990,6 +990,7 @@ func gopanic(e any) {
 
 // getargp returns the location where the caller
 // writes outgoing function call arguments.
+// 父调用的栈顶指针。args from caller区间末端地址。
 //
 //go:nosplit
 //go:noinline

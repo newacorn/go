@@ -1251,6 +1251,8 @@ func memclrNoHeapPointersChunked(size uintptr, x unsafe.Pointer) {
 // compiler (both frontend and SSA backend) knows the signature
 // of this function.
 func newobject(typ *_type) unsafe.Pointer {
+	//t:=reflect.TypeOf(0)
+	//println(typ.string())
 	return mallocgc(typ.size, typ, true)
 }
 
@@ -1378,6 +1380,8 @@ const persistentChunkSize = 256 << 10
 // persistent chunk. This is updated atomically.
 var persistentChunks *notInHeap
 
+// persistentalloc 函数分配的内存不会被回收，分配的大小为 itab 结构的大小加上接口方法数减去一个指针的大小，
+// 因为 itab 中的 fun 数组声明的长度为1，已包含了一个指针，分配空间时只需补齐剩下的即可。
 // Wrapper around sysAlloc that can allocate small chunks.
 // There is no associated free operation.
 // Intended for things like function/type/debug-related persistent data.

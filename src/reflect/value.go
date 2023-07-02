@@ -48,12 +48,41 @@ type Value struct {
 	//
 	// The lowest five bits give the Kind of the value, mirroring typ.Kind().
 	//
+	/*
+	type S struct {
+	a int
+	B string
+	N // 内嵌导出字段
+	n // 内嵌非导出字段
+	q Q
+}
+
+	type Q struct {
+	q1 int    // 从S获取q1的reflect.Value为非导出字段，stickRo被设置
+	Q1 string // 从S获取Q1的reflect.Value为导出字段
+}
+	type N struct {
+	c int    // 同下面的n.c1
+	A string // 同下面的n.A1
+}
+	type n struct {
+	// 无论通过S findByName直接获得c1字段的
+	// reflectValue，还是先获取n在获取c1,
+	// 其都属于非导出非内嵌字段，即 flagStickyRO
+	// 位被设置。
+	c1 int
+	// 通过S间接还是直接获取到A1自动的reflectValue
+	// 其都是导出非内嵌。
+	A1 string
+}
+	 */
+	//
 	// The next set of bits are flag bits:
-	//	- flagStickyRO: obtained via unexported not embedded field, so read-only
-	//	- flagEmbedRO: obtained via unexported embedded field, so read-only
-	//	- flagIndir: val holds a pointer to the data
-	//	- flagAddr: v.CanAddr is true (implies flagIndir and ptr is non-nil)
-	//	- flagMethod: v is a method value.
+	//	- flagStickyRO: 非导出非内嵌，obtained via unexported not embedded field, so read-only
+	//	- flagEmbedRO: 内嵌非导出，obtained via unexported embedded field, so read-only
+	//	- flagIndir: ptr字段中存储的是要保存值的地址，而非值本事。val holds a pointer to the data
+	//	- flagAddr:  可以取址。v.CanAddr is true (implies flagIndir and ptr is non-nil)
+	//	- flagMethod: Value 存储的是方法。v is a method value.
 	// If ifaceIndir(typ), code can assume that flagIndir is set.
 	//
 	// The remaining 22+ bits give a method number for method values.
@@ -1207,6 +1236,9 @@ func (v Value) Complex() complex128 {
 	panic(&ValueError{"reflect.Value.Complex", v.kind()})
 }
 
+// Elem 获取接口的动态类型和动态值构成的 reflect.Value 或者 指针
+// 元素类型和指针指向的值构成的 reflect.Value
+// 只会继承包裹接口 和 指针的只读标志位，并未指针元素添加 flagIndir 和 flagAddr标志位
 // Elem returns the value that the interface v contains
 // or that the pointer v points to.
 // It panics if v's Kind is not Interface or Pointer.
@@ -1216,14 +1248,24 @@ func (v Value) Elem() Value {
 	switch k {
 	case Interface:
 		var eface any
+		// 下面的if和else都是从接口中取动态类型的_type
+		// v.ptr 中存储的接口类型值的地址
+		// eface 表示v.ptr指向的接口
 		if v.typ.NumMethod() == 0 {
+			// 底层类型为interface{}的接口，直接用any来解引用
 			eface = *(*any)(v.ptr)
 		} else {
+			// 当接口有方法时使用带方法的接口类型来转换
+			// 因为与空接口内存布局不一样。然后再转换为
+			// 空接口，非空接口到空接口的转换是提取其动态
+			// 类型_type和data字段，然后赋值给空接口。
 			eface = (any)(*(*interface {
 				M()
 			})(v.ptr))
 		}
+		// 从结构转换到 reflect.Value
 		x := unpackEface(eface)
+		// 只会继承包裹接口的只读属性
 		if x.flag != 0 {
 			x.flag |= v.flag.ro()
 		}
@@ -1231,7 +1273,10 @@ func (v Value) Elem() Value {
 	case Pointer:
 		ptr := v.ptr
 		if v.flag&flagIndir != 0 {
+			// 对元素为指针类型的指针类型的reflect.Value，进行第二次Elem()调用可以进入此逻辑
 			if ifaceIndir(v.typ) {
+				// 当类型被 //go:notinheap 标准时，对其指针类型的值对应的reflect.Value
+				// 进行Elem()调用时，可以进入到这个逻辑。
 				// This is a pointer to a not-in-heap object. ptr points to a uintptr
 				// in the heap. That uintptr is the address of a not-in-heap object.
 				// In general, pointers to not-in-heap objects can be total junk.
@@ -1246,16 +1291,27 @@ func (v Value) Elem() Value {
 					panic("reflect: reflect.Value.Elem on an invalid notinheap pointer")
 				}
 			}
+			// 解引用获取更深一层的指针指
 			ptr = *(*unsafe.Pointer)(ptr)
 		}
 		// The returned value's address is v's value.
+		// 如果指针为空着返回Value类型的零值
 		if ptr == nil {
 			return Value{}
 		}
+		// 或去指针元素的元数据_type
 		tt := (*ptrType)(unsafe.Pointer(v.typ))
 		typ := tt.elem
+		// 元素只继承指针的只读标志，并设置 flagIndir和flagAddr标志
+		// 设置flagIndir表示其中存储的是目标值的地址，所以可以通过地址
+		// 解引用修改目标值。但仍需需要语法允许，完全能取址还需有flagAddr
+		// 标志
+		// 需设置 flagIndir，不然对指针的Value多次调用Elem()每次不会改
+		// 变Value.ptr的值
 		fl := v.flag&flagRO | flagIndir | flagAddr
+		// 获取指针元素的类型元数据_type
 		fl |= flag(typ.Kind())
+		// ptr有可能还是 v.ptr或者(*v.ptr)
 		return Value{typ, ptr, fl}
 	}
 	panic(&ValueError{"reflect.Value.Elem", v.kind()})

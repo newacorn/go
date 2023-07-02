@@ -542,6 +542,7 @@ func reflectlite_resolveTypeOff(rtype unsafe.Pointer, off int32) unsafe.Pointer 
 }
 
 // reflect_addReflectOff adds a pointer to the reflection offset lookup map.
+// 添加运行时通过reflect创建的类型元数据到全局的 reflectOffs 中并分配一个负的 typeOff
 //
 //go:linkname reflect_addReflectOff reflect.addReflectOff
 func reflect_addReflectOff(ptr unsafe.Pointer) int32 {

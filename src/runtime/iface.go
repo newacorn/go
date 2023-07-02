@@ -19,10 +19,19 @@ var (
 	itabTableInit = itabTableType{size: itabInitSize} // starter table
 )
 
+// itabTable 就是runtime中 itab 的全局缓存，它本身是个 itabTableType 类型的指针
+// itabTable 被实现成一个散列表。查找和插入操作使用的key是由接口类型元数据和动态类型元
+// 数据组合而成的，哈希计算方方式为接口类型的元数据哈希值 inter.typ.hash 与东塔类型元数据哈希值
+// typ.hash 进行异或运算。
 // Note: change the formula in the mallocgc call in itabAdd if you change these fields.
 type itabTableType struct {
+	// size 表示缓存的容量，也就是 entries 数组的大小
 	size    uintptr             // length of entries array. Always a power of 2.
+	// count 白叟实际缓存了多少个 itab
 	count   uintptr             // current number of filled entries.
+	// entries 的初始大小是通过 itabInitSize 指定的，这个常量值是512。当缓存满后，runtime会
+	// 重新分配整个 struct，entries 数组是 itabTableType 的最后一个字段，可以无限增大它的下标
+	// 来使用超出容量大小的内存，只要在struct之后分配足够的空间就好了，这也是C语言里的常用手法。
 	entries [itabInitSize]*itab // really [size] large
 }
 
@@ -31,6 +40,12 @@ func itabHashFunc(inter *interfacetype, typ *_type) uintptr {
 	return uintptr(inter.typ.hash ^ typ.hash)
 }
 
+// getitab 运行阶段可通过此函数来获得相应的 itab 。
+// inter 接口类型， typ 具体类型元数据。
+// canfail 表示是否允许失败。
+// 如果  typ 没有实现 inter 要求的所有方法，这 canfail 为true时函数返回nil，
+// canfail 为false时就会造成 panic 。对应的具体用法就是 commoa ok 风格的类型断言和普通
+// 的类型断言。
 func getitab(inter *interfacetype, typ *_type, canfail bool) *itab {
 	if len(inter.mhdr) == 0 {
 		throw("internal error - misuse of itab")
@@ -154,6 +169,12 @@ func itabAdd(m *itab) {
 	t.add(m)
 }
 
+// add 方法操作内部不会扩容存储空间，重新分配操作是在外层实现的，因此对于 find 方法而言
+// 已经插入的内容不会被修改，所以查找时不需要加锁。方法 add 操作需要再加锁的前提下进行，
+// getitab 函数是通过调用 itabAdd 函数来完成添加缓存的， itabAdd 函数内部会按需对
+// 缓存进行扩容然后调用 add 方法。因为扩容需要重新分配 itabTableTYpe 结构，为了并发安全
+// 使用原子操作更新 itabTable 指针。加锁后立刻再次查询也是处于并发的考虑，避免其它协程已经
+// 将同样的itab添加至缓存了。
 // add adds the given itab to itab table t.
 // itabLock must be held.
 func (t *itabTableType) add(m *itab) {
@@ -185,6 +206,11 @@ func (t *itabTableType) add(m *itab) {
 	}
 }
 
+// init 函数内部就是遍历接口的方法列表和具体类型的方法集，来寻找匹配的方法的地址。
+// 虽然遍历操作使用了两层嵌套循环，但是方法列表和方法集都是有序的，两层循环实际上
+// 只需执行一次。匹配还会考虑到方法是否导出，以及接口和具体类型所在包。
+// 如果是导出方法直接匹配成功，如果导出方法未导出，这接口和具体类型需要定义在同一包中，方可
+// 匹配成功。对于匹配成功的方法，地址取的是 method 结构中的 method.ifn 字段。
 // init fills in the m.fun array with all the code pointers for
 // the m.inter/m._type pair. If the type does not implement the interface,
 // it sets m.fun[0] to 0 and returns the name of an interface function that is missing.
@@ -262,6 +288,8 @@ func panicdottypeE(have, want, iface *_type) {
 	panic(&TypeAssertionError{iface, have, want, ""})
 }
 
+// panicdottypeI 函数在接口类型到具体类型断言失败时调用。
+// AX:源接口的itab，BX:目标具体类型的_type,CX:源接口的类型的_type
 // panicdottypeI is called when doing an i.(T) conversion and the conversion fails.
 // Same args as panicdottypeE, but "have" is the dynamic itab we have.
 func panicdottypeI(have *itab, want, iface *_type) {
@@ -417,7 +445,9 @@ func convI2I(dst *interfacetype, src *itab) *itab {
 	}
 	return getitab(dst, src._type, false)
 }
-
+// assertI2I 非空接口类型到非空接口类型的断言
+// inter 目标接口类型的元数据
+// tab 源接口的itab字段
 func assertI2I(inter *interfacetype, tab *itab) *itab {
 	if tab == nil {
 		// explicit conversions require non-nil interface value.
@@ -428,7 +458,7 @@ func assertI2I(inter *interfacetype, tab *itab) *itab {
 	}
 	return getitab(inter, tab._type, false)
 }
-
+// assertI2I2 非空接口类型到非空接口类型的断言，commaOk风格。
 func assertI2I2(inter *interfacetype, i iface) (r iface) {
 	tab := i.tab
 	if tab == nil {
@@ -445,16 +475,22 @@ func assertI2I2(inter *interfacetype, i iface) (r iface) {
 	return
 }
 
+// assertE2I 从一个接口类型断言到另一个接口类型，断言失败触发panic。
+// inter 为目标接口元信息，t 为源接口具体类型元信息。
 func assertE2I(inter *interfacetype, t *_type) *itab {
+	// 没有具体类型的接口不可断言
 	if t == nil {
 		// explicit conversions require non-nil interface value.
 		panic(&TypeAssertionError{nil, nil, &inter.typ, ""})
 	}
 	return getitab(inter, t, false)
 }
-
+// assertE2I2 从一个接口类型断言到另一个接口类型，断言失败不会触发panic
+// inter 为目标接口元数据信息， e 为源接口类型。
+// 返回目标接口。
 func assertE2I2(inter *interfacetype, e eface) (r iface) {
 	t := e._type
+	// 源接口没有动态类型元数据，直接返回。
 	if t == nil {
 		return
 	}

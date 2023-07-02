@@ -196,11 +196,16 @@ func goenvs() {
 	goenvs_unix()
 }
 
+// 为mp创建关联线程，没有使用CGO的情况相才会使用此函数创建线程
 // May run with m.p==nil, so write barriers are not allowed.
 //
 //go:nowritebarrierrec
 func newosproc(mp *m) {
 	stk := unsafe.Pointer(mp.g0.stack.hi)
+	// 至此：
+	// mac 平台下，至此 mp.g0.stack.hi = mp.g0.stack.lo = 0
+	// linux 平台下，mp.g0.stack.hi-mp.g0.stack.lo = 8192
+	//
 	if false {
 		print("newosproc stk=", stk, " m=", mp, " g=", mp.g0, " id=", mp.id, " ostk=", &mp, "\n")
 	}
@@ -220,6 +225,7 @@ func newosproc(mp *m) {
 		writeErrStr(failthreadcreate)
 		exit(1)
 	}
+	// mac os 平台下此值 stacksize=524288
 	mp.g0.stack.hi = stacksize // for mstart
 
 	// Tell the pthread library we won't join with this thread.
@@ -232,9 +238,12 @@ func newosproc(mp *m) {
 	// setup and then calls mstart.
 	var oset sigset
 	sigprocmask(_SIG_SETMASK, &sigset_all, &oset)
+	// oset = 0
+	// 新的线程克隆是会继承刚刚设置的值为 sigset_all 的 _SIG_SETMASK
 	err = retryOnEAGAIN(func() int32 {
 		return pthread_create(&attr, abi.FuncPCABI0(mstart_stub), unsafe.Pointer(mp))
 	})
+	// 线程克隆完毕后恢复之前的 _SIG_SETMASK
 	sigprocmask(_SIG_SETMASK, &oset, nil)
 	if err != 0 {
 		writeErrStr(failthreadcreate)
@@ -298,9 +307,14 @@ func newosproc0(stacksize uintptr, fn uintptr) {
 //go:nosplit
 //go:nowritebarrierrec
 func libpreinit() {
+	// For c-archive/c-shared this is called by libpreinit with
+	// preinit == true.
 	initsig(true)
 }
 
+// mpreinit()
+// 初始化 m.gsignal，mac和linux下大小都为 32*1024
+//
 // Called to initialize a new m (including the bootstrap m).
 // Called on the parent thread (main thread in case of bootstrap), can allocate memory.
 func mpreinit(mp *m) {
@@ -314,14 +328,20 @@ func mpreinit(mp *m) {
 	}
 }
 
+// minit()
+// 设置线程信号处理栈、从阻塞信号列表中清除某些不应该被阻塞的信号
+//
 // Called to initialize a new m (including the bootstrap m).
 // Called on the new thread, cannot allocate memory.
 func minit() {
 	// iOS does not support alternate signal stack.
 	// The signal handler handles it directly.
 	if !(GOOS == "ios" && GOARCH == "arm64") {
+		// 设置 alternate signal stack
 		minitSignalStack()
 	}
+
+	// 如果线程的信号处理阻塞了某些信号，则清除一些不能被阻塞的信号
 	minitSignalMask()
 	getg().m.procid = uint64(pthread_self())
 }
@@ -405,6 +425,9 @@ func setsigstack(i uint32) {
 	sigaction(i, &sa, nil)
 }
 
+// getsig()
+// 获取信号i对应的处理函数的第一条指令的地址
+//
 //go:nosplit
 //go:nowritebarrierrec
 func getsig(i uint32) uintptr {
