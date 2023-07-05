@@ -28,8 +28,10 @@ const (
 	mutexWLock   = 1 << 2
 	mutexRef     = 1 << 3
 	mutexRefMask = (1<<20 - 1) << 3
+	// rwaiter 的起始位
 	mutexRWait   = 1 << 23
 	mutexRMask   = (1<<20 - 1) << 23
+	// wwaiter 的起始位
 	mutexWWait   = 1 << 43
 	mutexWMask   = (1<<20 - 1) << 43
 )
@@ -193,7 +195,9 @@ func (mu *fdMutex) rwunlock(read bool) bool {
 }
 
 // Implemented in runtime package.
+// runtime.sync_runtime_Semacquire
 func runtime_Semacquire(sema *uint32)
+// runtime.sync_runtime_Semrelease
 func runtime_Semrelease(sema *uint32)
 
 // incref adds a reference to fd.

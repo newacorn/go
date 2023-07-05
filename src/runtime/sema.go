@@ -38,22 +38,34 @@ import (
 // before we introduced the second level of list, and
 // BenchmarkSemTable/OneAddrCollision/* for a benchmark that exercises this.
 type semaRoot struct {
+	// lock 用来保护这棵平衡树
 	lock  mutex
+	// 是正在平衡树数据结构的根，实际上平衡树的每个节点都是个sudog类型
+	// 的对象。
 	treap *sudog        // root of balanced tree of unique waiters.
+	// 表明了树中结点的数量
 	nwait atomic.Uint32 // Number of waiters. Read w/o the lock.
 }
-
+// runtime内存会通过一个大小为251的 semtable 来管理所有的
+// semaphore。
 var semtable semTable
 
 // Prime to not correlate with any user patterns.
+// runtime 会把semaphore放到平衡树中，而sematable存储的是251棵平衡
+// 树的根，对应的数据结构为 semaRoot。
 const semTabSize = 251
 
 type semTable [semTabSize]struct {
 	root semaRoot
 	pad  [cpu.CacheLinePadSize - unsafe.Sizeof(semaRoot{})]byte
 }
-
+// 根据addr进行计算并映射到sematale中的一棵平衡树上，rootFor
+// 将addr映射到平衡树的根。
 func (t *semTable) rootFor(addr *uint32) *semaRoot {
+	// 先把 addr转换成uintptr，然后对其到8字节，在对表的大小取模，
+	// 结果用作数组下标。定位到某刻平衡树后，再根据sudog.elem存储的地址
+	// 与信号量的地址是否相等，进一步定位到某个节点，这样就找到该信号量对应
+	// 的等待队列了。
 	return &t[(uintptr(unsafe.Pointer(addr))>>3)%semTabSize].root
 }
 
@@ -110,7 +122,31 @@ const (
 func semacquire(addr *uint32) {
 	semacquire1(addr, false, 0, 0, waitReasonSemacquire)
 }
-
+// semacquire1()
+// runtime中的semaphore是可用协程使用的信号量实现，预期用它来提供一组sleep和wakeup原语
+// ,目标与Linux的futex相同。也就是说，不要把它视为信号量，而是把应把它当成实现休眠和唤醒
+// 的一种方式。每个sleep都与一次wakeup对应，即使因为竞争的关系，wakeup发生在sleep之前。
+// 如果wakeup先调用，后调用的sleep会立即返回。
+// 参数：
+// addr 用作信号量的uint32型变量的地址
+// lifo 表示是否采用LIFO的排队策略
+// profile 与性能分析相关，表示要进行哪些种类的采样，目前有 semaBlockProfile
+// 和 semaMutexProfile。
+// skipframes 用来指示栽回溯跳过runtime自身的栈帧。
+//
+// 当要使用一个信号量时，需要提供一个记录信号量数值的变量，根据它的地址
+// addr进行即使并映射到 semtable 中的一颗平衡树上， semTable.rootFor 函数专门
+// 用来把 addr 映射到对应的平衡数的根。
+//
+// 根据addr进行计算并映射到sematale中的一棵平衡树上，rootFor
+// 将addr映射到平衡树的根。
+//func (t *semTable) rootFor(addr *uint32) *semaRoot {
+// 先把 addr转换成uintptr，然后对其到8字节，在对表的大小取模，
+// 结果用作数组下标。
+//
+// 定位到某刻平衡树后，再根据sudog.elem存储的地址
+// 与信号量的地址是否相等，进一步定位到某个节点，这样就找到该信号量对应
+// 的等待队列了。
 func semacquire1(addr *uint32, lifo bool, profile semaProfileFlags, skipframes int, reason waitReason) {
 	gp := getg()
 	if gp != gp.m.curg {
@@ -134,6 +170,9 @@ func semacquire1(addr *uint32, lifo bool, profile semaProfileFlags, skipframes i
 	s.releasetime = 0
 	s.acquiretime = 0
 	s.ticket = 0
+	// blockProfilerate  控制内存MemProfile的频率为1表示profile everything
+	// profile 信号量阻塞分析
+	// semaBlockProfile 常量值为1
 	if profile&semaBlockProfile != 0 && blockprofilerate > 0 {
 		t0 = cputicks()
 		s.releasetime = -1
@@ -156,22 +195,32 @@ func semacquire1(addr *uint32, lifo bool, profile semaProfileFlags, skipframes i
 		}
 		// Any semrelease after the cansemacquire knows we're waiting
 		// (we set nwait above), so go to sleep.
+		// 获取失败，将关联的sudog入队列
 		root.queue(addr, s, lifo)
+		// 停靠
 		goparkunlock(&root.lock, reason, traceEvGoBlockSync, 4+skipframes)
+		// 被信号量的持有者唤醒
+		// s.ticket 的值不等于0，表示释放者已经为其获得了信号量不用再尝试了
 		if s.ticket != 0 || cansemacquire(addr) {
 			break
 		}
 	}
+	// 最后一次被唤醒且获得锁的时间
 	if s.releasetime > 0 {
+		// 从休眠到被唤醒的时间差值
 		blockevent(s.releasetime-t0, 3+skipframes)
 	}
+	// 释放sudog结构回缓存池
 	releaseSudog(s)
 }
 
 func semrelease(addr *uint32) {
 	semrelease1(addr, false, 0)
 }
-
+// 参数：
+// 被唤醒的协程会设置到当前P的runnext，如果 handoff 为true
+// ，则当前协程会通过 goyield()让出CPU，被唤醒的协程会立即
+// 得到调度。
 func semrelease1(addr *uint32, handoff bool, skipframes int) {
 	root := semtable.rootFor(addr)
 	atomic.Xadd(addr, 1)
@@ -180,23 +229,33 @@ func semrelease1(addr *uint32, handoff bool, skipframes int) {
 	// This check must happen after the xadd, to avoid a missed wakeup
 	// (see loop in semacquire).
 	if root.nwait.Load() == 0 {
+		// 如果观察到 root.nwait=0，那么将nwait=1的等候者
+		// 绝对可以观察到addr=1，所以不用唤醒它。
 		return
 	}
+	// 如果观察到 root.nwait!=0
+	// 不能说明等待者观察到了addr=1
 
 	// Harder case: search for a waiter and wake it.
 	lockWithRank(&root.lock, lockRankRoot)
 	if root.nwait.Load() == 0 {
+		// 能观察到 root.nwait=0
+		// 说明等待队列中没有成员
+
 		// The count is already consumed by another goroutine,
 		// so no need to wake up another goroutine.
 		unlock(&root.lock)
 		return
 	}
+	// 至此等待队列中肯定有成员
+	// 因为对 nwait 的变更必须持有锁，而目前正在此锁中。
 	s, t0 := root.dequeue(addr)
 	if s != nil {
 		root.nwait.Add(-1)
 	}
 	unlock(&root.lock)
 	if s != nil { // May be slow or even yield, so unlock first
+		// s关联的g肯定会恢复运行
 		acquiretime := s.acquiretime
 		if acquiretime != 0 {
 			mutexevent(t0-acquiretime, 3+skipframes)
@@ -204,11 +263,17 @@ func semrelease1(addr *uint32, handoff bool, skipframes int) {
 		if s.ticket != 0 {
 			throw("corrupted semaphore ticket")
 		}
+		// handoff 决定是否让出当前时间片
+		// addr不一定还是1，因为其它等待者可以在没有进入锁的情况下执行
+		// cansemacquire(addr)
 		if handoff && cansemacquire(addr) {
+			// 使用当前时间片同时获得了信号量
 			s.ticket = 1
 		}
+		// 将s关联的g设置到当前P的nextg字段。
 		readyWithTime(s, 5+skipframes)
 		if s.ticket == 1 && getg().m.locks == 0 {
+			// 挂起当前g，让出时间片。让上面的s.g恢复运行。
 			// Direct G handoff
 			// readyWithTime has added the waiter G as runnext in the
 			// current P; we now call the scheduler so that we start running
@@ -229,13 +294,15 @@ func semrelease1(addr *uint32, handoff bool, skipframes int) {
 		}
 	}
 }
-
+// *addr 等于0返回false
+// 原子递减1且保证之后的结果大于等于0，则返回true。
 func cansemacquire(addr *uint32) bool {
 	for {
 		v := atomic.Load(addr)
 		if v == 0 {
 			return false
 		}
+		// 下面的保证成功后*addr的值大于等于0。
 		if atomic.Cas(addr, v, v-1) {
 			return true
 		}

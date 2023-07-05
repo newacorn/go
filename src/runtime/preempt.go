@@ -102,6 +102,7 @@ type suspendGState struct {
 //
 //go:systemstack
 func suspendG(gp *g) suspendGState {
+	println("suspendG called.")
 	if mp := getg().m; mp.curg != nil && readgstatus(mp.curg) == _Grunning {
 		// Since we're on the system stack of this M, the user
 		// G is stuck at an unsafe point. If another goroutine
@@ -336,6 +337,22 @@ func init() {
 	}
 }
 
+// wantAsyncPreempt()
+//
+// readgstatus(gp)&^_Gscan == _Grunning需满足true：
+// 1. GC栈扫描：GC扫描就是一种不稳定的种不稳定的状态，因为GC栈扫描要求暂停和恢复运行都必须由扫描方负责。
+// 2. 对于超时抢占目标G也必须处于运行状态，如果已经不在运行状态便也就没有必要抢占了。
+// 3. stopTheWorld：因为检测 sched.gcwaiting 必须在 schedule()函数调用中执行，gp处于运行状态才能
+//    才能注入代码让其切换到 schedule() 调用。
+//
+// gp.preempt 字段必须为true：
+// 1.超时抢占：因为如果不为true说明已经不是当初要抢占的那个G了。
+// 2.GC栈扫描也是处于同样的理由。
+//
+// gp.m.p != 0 && gp.m.p.ptr().preempt 为true：
+// 1. stopTheWorld：因为如果 gp.m.p.ptr().preempt 为false说明P进入了下一轮 schedule，
+//    避免刚刚执行新任务又被 抢占了。
+//
 // wantAsyncPreempt returns whether an asynchronous preemption is
 // queued for gp.
 func wantAsyncPreempt(gp *g) bool {

@@ -41,6 +41,7 @@ func when(d Duration) int64 {
 func startTimer(*runtimeTimer)
 func stopTimer(*runtimeTimer) bool
 func resetTimer(*runtimeTimer, int64) bool
+// runtime.modtimer
 func modTimer(t *runtimeTimer, when, period int64, f func(any, uintptr), arg any, seq uintptr)
 
 // The Timer type represents a single event.

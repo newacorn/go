@@ -1585,6 +1585,9 @@ func mstartm0() {
 	initsig(false)
 }
 
+// mPark()
+// 休眠当前M，此时M肯定没有关联P
+//
 // mPark causes a thread to park itself, returning once woken.
 //
 //go:nosplit
@@ -2448,6 +2451,7 @@ func templateThread() {
 // 2. exitsyscall 调用中
 //
 // 此时的M肯定没有关联的P，将M防止到 sched.midle 链表头，并休眠当前线程
+//
 // Stops execution of the current m until new work is available.
 // Returns with acquired P.
 func stopm() {
@@ -2712,6 +2716,10 @@ func wakep() {
 	releasem(mp)
 }
 
+// stoplockedm()
+// 将P从当前M剥离并进入休眠直到与其绑定的G处于可运行状态，另外一个M在发现与其绑定的G可运行时
+// 会将它自己的P传递给这个休眠的M并唤醒它(通过调用 startlockedm())
+//
 // Stops execution of the current m that is locked to a g until the g is runnable again.
 // Returns with acquired P.
 func stoplockedm() {
@@ -3107,6 +3115,7 @@ top:
 	//
 	// Also see "Worker thread parking/unparking" comment at the top of the
 	// file.
+	// 至此，当前是一个未关联P的M
 	wasSpinning := mp.spinning
 	if mp.spinning {
 		mp.spinning = false
@@ -3879,6 +3888,9 @@ func goschedguarded_m(gp *g) {
 	goschedImpl(gp)
 }
 
+// gopreempt_m()
+// see: preemptPark()
+//
 func gopreempt_m(gp *g) {
 	if trace.enabled {
 		traceGoPreempt()
@@ -3886,6 +3898,23 @@ func gopreempt_m(gp *g) {
 	goschedImpl(gp)
 }
 
+// preemptPark()
+// markroot 函数调用时在扫描G栈时会调用 suspendG 函数其会
+// 将想要扫描的G设置以下字段：
+// gp.preemptStop = true
+// gp.preempt = true
+// gp.stackguard0 = stackPreempt
+// 如果支持异步信号则通过信号让目标G暂停，否则只能等待目标G执行下一个函数调用。
+// 异步信号处理函数或栈增长函数都会检查 preemptStop 字段如果为true便会调用
+// preemptPark 函数，这个函数并不会将G插入到队列，只会转到 schedule 函数，
+// 恢复G运行的任务由 suspendG 调用者负值恢复。
+//
+// 另外一种抢占是当一个G原型时间超过10ms时，此时只会设置目标G的下面两个字段：
+// gp.preemptStop = true
+// gp.preempt = true
+// 信号处理函数或者栈增长函数检测到上面两个字段会调用 gopreempt_m 函数，这个
+// 函数会将目标G放入到全局队列并转到 schedule 函数调用。
+//
 // preemptPark parks gp and puts it in _Gpreempted.
 //
 //go:systemstack
@@ -5505,7 +5534,9 @@ func wirep(pp *p) {
 	pp.m.set(gp.m)
 	pp.status = _Prunning
 }
-
+// releasep()
+// 将P从当前M剥离，设置其状态变更为 _Pidle,并返回
+//
 // Disassociate p and the current m.
 func releasep() *p {
 	gp := getg()

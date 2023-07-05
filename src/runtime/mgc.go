@@ -642,6 +642,7 @@ func gcStart(trigger gcTrigger) {
 		}
 	}
 
+
 	gcBgMarkStartWorkers()
 
 	systemstack(gcResetMarkState)
@@ -663,6 +664,7 @@ func gcStart(trigger gcTrigger) {
 		traceGCSTWStart(1)
 	}
 	systemstack(stopTheWorldWithSema)
+	println("world stop.")
 	// Finish sweep before we start concurrent scan.
 	systemstack(func() {
 		finishsweep_m()
@@ -1190,6 +1192,7 @@ func gcMarkTermination() {
 // the work is not stopped and from a regular G stack. The caller must hold
 // worldsema.
 func gcBgMarkStartWorkers() {
+	println("gcBgMarkStartWorkers")
 	// Background marking is performed by per-P G's. Ensure that each P has
 	// a background GC G.
 	//

@@ -372,7 +372,8 @@ func sigpipe() {
 	}
 	dieFromSignal(_SIGPIPE)
 }
-
+// doSigPreempt() 函数被 sighandler() 函数调用
+//
 // doSigPreempt handles a preemption signal on gp.
 func doSigPreempt(gp *g, ctxt *sigctxt) {
 	// Check if this G wants to be preempted and is safe to

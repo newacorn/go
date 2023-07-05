@@ -43,7 +43,7 @@ x_cgo_yield()
 {
 	/*
 	The libc function(s) we call here must form a no-op and include at least one
-	call that triggers TSAN to process pending asynchronous signals.
+	call that triggers TSAN(ThreadSanitizer (aka TSan) is a data race detector for C/C++) to process pending asynchronous signals.
 
 	sleep(0) would be fine, but it's not portable C (so it would need more header
 	guards).

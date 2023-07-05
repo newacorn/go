@@ -761,14 +761,33 @@ type p struct {
 
 	palloc persistentAlloc // per-P to avoid mutex
 
+	// 表示最小堆顶的 timer 的触发时间，也就是复制其 when 字段。
 	// The when field of the first entry on the timer heap.
 	// This is 0 if the timer heap is empty.
 	timer0When atomic.Int64
 
+	// 表示所有已知的处于 timerModifiedEarlier 状态的 timer 中，
+	// nextwhen 最小的那个 timer 的 nextwhen的值。和 timer0When
+	// 相同都通过atomic函数来操作的，两者之间更小的那个被认为接下来第
+	// 一个要触发的 timer 的触发时间。
+	//
 	// The earliest known nextwhen field of a timer with
 	// timerModifiedEarlier status. Because the timer may have been
 	// modified again, there need not be any timer with this value.
 	// This is 0 if there are no timerModifiedEarlier timers.
+	// 这个值并不能代表timer堆中一定存在于此对应的timer其next.when为此值且状态为
+	// timerModifiedEarlier 状态，因为这个值的修该是在 modtimer 函数中更新的，
+	// 但这个过程没有加锁，所以其它函数比如 clearDeletedTimers 函数就有可能将 timerModifiedEarlier
+	// 状态的 timer 变更到 timerWaiting 状态，或者 deltimer 函数将其变更到 timerDeleted 状态。
+	// 但它们都未修改 timerModifiedEarliest 字段的值。
+	//
+	// 但是它可以保证如果值为0，大概率没有处于 timerModifiedEarlier 和 timerModifiedLater 状态的
+	// timer。有可能 modified 还刚修改完状态还没来得及更新此字段，不过会更快更新，影响不大。
+	//
+	// 第一种情况，可能会让某些函数多干些活，当发现没有符合状态的timer什么不做即可问题不大，
+	// 第二种情况可能会漏掉某些当时本可以干的活，但干第二种活的函数会被多次调用且modtimer函数
+	// 马上就会更新此字段所以影响也不大。
+	//
 	timerModifiedEarliest atomic.Int64
 
 	// Per-P GC state
@@ -804,18 +823,26 @@ type p struct {
 	// writing any stats. Its value is even when not, odd when it is.
 	statsSeq atomic.Uint32
 
+	// 主要用来保护P中的 timer 堆，也就是 timers 切片。
+	//
 	// Lock for timers. We normally access the timers while running
 	// on this P, but the scheduler can also do it from a different P.
 	timersLock mutex
 
+	// timers 切片就是用来存放 timer 的最小堆，这是一个4叉堆，与传统的2叉堆
+	// 相比有着更少的层数，也能更好地利用缓存的局部性原理。
+	//
 	// Actions to take at some time. This is used to implement the
 	// standard library's time package.
 	// Must hold timersLock to access.
 	timers []*timer
 
+	// 记录的是堆中 timer 的总数，应该与timers切片长度一致。
 	// Number of timers in P's heap.
 	numTimers atomic.Uint32
 
+	// 记录的是推中已经删除但还未被移除的 timer 的总数。
+	// 处于 timerDeleted 状态的 timer。
 	// Number of timerDeleted timers in P's heap.
 	deletedTimers atomic.Uint32
 

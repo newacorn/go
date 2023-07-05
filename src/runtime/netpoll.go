@@ -72,7 +72,9 @@ const pollBlockSize = 4 * 1024
 // No heap pointers.
 type pollDesc struct {
 	_    sys.NotInHeap
+	// 实现 pollCache 缓存，将空闲的 pollDesc 串成一个链表。
 	link *pollDesc // in pollcache, protected by pollcache.lock
+	// 要监听的文件描述符。
 	fd   uintptr   // constant for pollDesc usage lifetime
 
 	// atomicInfo holds bits from closing, rd, and wd,
@@ -94,14 +96,37 @@ type pollDesc struct {
 
 	// rg, wg are accessed atomically and hold g pointers.
 	// (Using atomic.Uintptr here is similar to using guintptr elsewhere.)
+
+	// rg, wg are accessed atomically and hold g pointers.
+	// (Using atomic.Uintptr here is similar to using guintptr elsewhere.)
+	//
+	// 有4种可能的值，常量 pdReady 、 pdWait ，一个G的指针以及nil。
+	// pdReady 【状态转移：*g -> pdReady（由 netpollunblock 负责
+	// 状态变更） -> 0（由恢复的协程负责状态变更） 】表示fd 的数据已经
+	// 准备就绪(但还未被所关联的g所读)（在 netpollunblock 函数中,在fd
+	// 有可读或可写数据时，rg 不为 pdReady 时那么rg此时就是*g ,将rg原
+	// 子设置为 pdReady，然后返回 *g，），某个 g 消费掉这些数据后会把
+	// rg 赋值为nil.
+	//
+	// pdWait 【状态转移：0(nil) -> *g（由 netpollblock 负责状态变更）】
+	// 表示相关协程还未被挂起，挂起之后会将其变更为 *g （ gopark( netpollblockcommit )
+	// 的 netpollblockcommit 回调中设置）。
+	//
 	rg atomic.Uintptr // pdReady, pdWait, G waiting for read or pdNil
 	wg atomic.Uintptr // pdReady, pdWait, G waiting for write or pdNil
 
+	// 用来保护pollDesc结构中字段。（线程锁）
 	lock    mutex // protects the following fields
+	// 表示文件描述符正在从poller中移除。
 	closing bool
+	// 在Linux 下没有用到，aix、Solaris等会利用它来存储一些扩展信息。
 	user    uint32    // user settable cookie
+	// 一个自增序列号，因为 pollDesc 结构会被复用，通过增加 rseq 的值，能够避免复用的 pollDesc 被旧的
+	// 读超时timer干扰。
 	rseq    uintptr   // protects from stale read timers
+	// 用于实现读超时的 timer ，它会在超时时间到达时唤醒等待的 goroutine。
 	rt      timer     // read deadline timer (set if rt.f != nil)
+	// 设置超时的时间。
 	rd      int64     // read deadline (a nanotime in the future, -1 when expired)
 	wseq    uintptr   // protects from stale write timers
 	wt      timer     // write deadline timer
@@ -139,6 +164,10 @@ func (pd *pollDesc) info() pollInfo {
 // that might affect the info bits.
 // In practice this means after changing closing
 // or changing rd or wd from < 0 to >= 0.
+//
+// 当 pd.closing、 pd.rd 或 pd.wd 变更时
+// 应调用 publishInfo() 以便反应到 pd.atomicInfo的值的对象位上。
+//
 func (pd *pollDesc) publishInfo() {
 	var info uint32
 	if pd.closing {
@@ -152,6 +181,10 @@ func (pd *pollDesc) publishInfo() {
 	}
 
 	// Set all of x except the pollEventErr bit.
+	//
+	// 即保留 pollEventErr 位，其它位根据上面计算出来
+	// 的 info 设置。
+	//
 	x := pd.atomicInfo.Load()
 	for !pd.atomicInfo.CompareAndSwap(x, (x&pollEventErr)|info) {
 		x = pd.atomicInfo.Load()
@@ -181,6 +214,8 @@ var (
 	netpollInited   atomic.Uint32
 
 	pollcache      pollCache
+	// 统计有多少个协程正在等待netpoller中关联的fd上的到来事件。
+	// findrunnable 会根据此值是否大于0来决定 netpoll 的策略。
 	netpollWaiters atomic.Uint32
 )
 
@@ -189,6 +224,14 @@ func poll_runtime_pollServerInit() {
 	netpollGenericInit()
 }
 
+// 初始化 poller ，只会被调用一次。在 Linux系统上主要用来创建 epoll 实例，还会创建
+// 一个非阻塞式的 pipe, 用来唤醒阻塞中的 netpoller。
+// efpd 、 netpollBreakRd 和 netpollBreakWr 都是包级别的变量。
+// efpd 是epoll实例的文件描述符。
+// netpollBreakRd 和 netpollBreakWr 是非阻塞管道两端的文件描述发，分别被用作读端和写端。
+// 读取端 netpollBreakRd 被添加到 epoll 中的监听 EPOLLIN 事件，后续从写入端 netpollBreakWr 写入数据
+// 就能唤醒阻塞中的 poller。
+//
 func netpollGenericInit() {
 	if netpollInited.Load() == 0 {
 		lockInit(&netpollInitLock, lockRankNetpollInit)
@@ -201,6 +244,7 @@ func netpollGenericInit() {
 	}
 }
 
+// netpoller 已经被初始化过了。
 func netpollinited() bool {
 	return netpollInited.Load() != 0
 }
@@ -209,10 +253,20 @@ func netpollinited() bool {
 
 // poll_runtime_isPollServerDescriptor reports whether fd is a
 // descriptor being used by netpoll.
+//
+// 同时监听文件描述发fd的读写事件
+// 用来判断文件描述符fd是否被poller使用，在Linux对应的实现中，
+// 只有 epfd 、 netpollBreakRd 和 netpollBreakWr 属于poller使用的描述符。
+//
 func poll_runtime_isPollServerDescriptor(fd uintptr) bool {
 	return netpollIsPollDescriptor(fd)
 }
 
+// 用来把要监听的文件描述符fd和与之关联的 pollDesc 结构添加到poller实例中，在Linux 上就是添加到epoll中。
+// Linux系统，文件描述符以EPOLLET（监听边缘触发模式）被添加到epoll 中的，同时监听读、写事件。
+// pollDesc 类型的结构 pd 作为与fd关联的自定义数据被一同添加到epoll中。
+// evt.Data = &pollDesc 。
+//
 //go:linkname poll_runtime_pollOpen internal/poll.runtime_pollOpen
 func poll_runtime_pollOpen(fd uintptr) (*pollDesc, int) {
 	pd := pollcache.alloc()
@@ -225,16 +279,25 @@ func poll_runtime_pollOpen(fd uintptr) (*pollDesc, int) {
 	if rg != pdNil && rg != pdReady {
 		throw("runtime: blocked read on free polldesc")
 	}
+	// 初始化 fd
 	pd.fd = fd
 	pd.closing = false
+	// 初始时间应该没有错误
 	pd.setEventErr(false)
+	// 递增读写序列号，复用pd需要更新以区分旧的pd
 	pd.rseq++
 	pd.rg.Store(pdNil)
+	// 清空deadline
 	pd.rd = 0
+	// 递增写序列号，复用pd需要更新以区别于旧的pd。
 	pd.wseq++
 	pd.wg.Store(pdNil)
+	// 清空写 deadline
 	pd.wd = 0
 	pd.self = pd
+	// 下面会清空pd.atomicInfo中的错误位
+	// 因为上面已经将pd.atomicInfo设置来源的各个
+	// 字段已经清空了。
 	pd.publishInfo()
 	unlock(&pd.lock)
 
@@ -248,18 +311,23 @@ func poll_runtime_pollOpen(fd uintptr) (*pollDesc, int) {
 
 //go:linkname poll_runtime_pollClose internal/poll.runtime_pollClose
 func poll_runtime_pollClose(pd *pollDesc) {
+	// 已经在 evict() 中调用 poll_runtime_pollUnblock 时设置过了。
 	if !pd.closing {
 		throw("runtime: close polldesc w/o unblock")
 	}
 	wg := pd.wg.Load()
+	// netpollunblock 中已经确定了
 	if wg != pdNil && wg != pdReady {
 		throw("runtime: blocked write on closing polldesc")
 	}
 	rg := pd.rg.Load()
+ 	// netpollunblock 中已经确定了
 	if rg != pdNil && rg != pdReady {
 		throw("runtime: blocked read on closing polldesc")
 	}
+	// 关闭底层文件表示符与之关联的事件自动清除。
 	netpollclose(pd.fd)
+	//  释放 pollDesc 结构到缓存。
 	pollcache.free(pd)
 }
 
@@ -301,6 +369,7 @@ func poll_runtime_pollWait(pd *pollDesc, mode int) int {
 	}
 	// As for now only Solaris, illumos, and AIX use level-triggered IO.
 	if GOOS == "solaris" || GOOS == "illumos" || GOOS == "aix" {
+		// netpollarm 函数只有在应用水平触发的系统上才会被用到。
 		netpollarm(pd, mode)
 	}
 	for !netpollblock(pd, int32(mode), false) {
@@ -322,14 +391,33 @@ func poll_runtime_pollWaitCanceled(pd *pollDesc, mode int) {
 	for !netpollblock(pd, int32(mode), true) {
 	}
 }
-
+// 如果 d 为0：
+//		1.mode对应的超时已经设置会将timer删除,不会设新的，pd.rd或pd.wd加1。
+//      2.mode对应的超时未设置没有效果。
+// 如果 d 小于0：
+//      1.mode对应的事件未设置timer，直接尝试唤醒监听pd+mode事件的gs。
+//      2.mode对应的事件设置了timer，递增对应的seq删除timer，然后尝试唤醒监听pd+mode事件的gs。
+// 如果 d 大于0：
+//      1.mode对应的事件未设置timer，为pd+mode事件设置timer。
+//      2.mode对应的时机设置了tiemr，递增对应的seq，并重置对应的timer。
+//
+// pd.*seq的作用可以保证在seq递增后，所有之前关联pd.*t即使得到执行其f也是无操作。
+// 因为接下来的modifying timer需要时间。
+//
+// 参数：
+// pd：文件描述符绑定的 pollDesc 结构。
+// d： deadline截止时间。
+// mode: 'r'、'w'或 'r+w'，在什么事件上设置deadline。
+//
 //go:linkname poll_runtime_pollSetDeadline internal/poll.runtime_pollSetDeadline
 func poll_runtime_pollSetDeadline(pd *pollDesc, d int64, mode int) {
 	lock(&pd.lock)
+	// 已经关闭了设置deadline是没有意义的。
 	if pd.closing {
 		unlock(&pd.lock)
 		return
 	}
+	// rd0、wd0存储旧的deadline
 	rd0, wd0 := pd.rd, pd.wd
 	combo0 := rd0 > 0 && rd0 == wd0
 	if d > 0 {
@@ -340,19 +428,28 @@ func poll_runtime_pollSetDeadline(pd *pollDesc, d int64, mode int) {
 			d = 1<<63 - 1
 		}
 	}
+	// 溢出处理end
+
+	// 设置pd.rd和pd.wd
 	if mode == 'r' || mode == 'r'+'w' {
 		pd.rd = d
 	}
 	if mode == 'w' || mode == 'r'+'w' {
 		pd.wd = d
 	}
+
+	// 因为 pd.rd和pd.wd发生了变更，所以要更新 pd.atomicInfo。
+	// 可能存在pd.rd或pd.wd设置小于0的情况。
 	pd.publishInfo()
+
+	// 如果为true，表示读写超时都设置相等的且未来的时间。
 	combo := pd.rd > 0 && pd.rd == pd.wd
 	rtf := netpollReadDeadline
 	if combo {
 		rtf = netpollDeadline
 	}
 	if pd.rt.f == nil {
+		// 之前未设置读超时
 		if pd.rd > 0 {
 			pd.rt.f = rtf
 			// Copy current seq into the timer arg.
@@ -363,16 +460,21 @@ func poll_runtime_pollSetDeadline(pd *pollDesc, d int64, mode int) {
 			resettimer(&pd.rt, pd.rd)
 		}
 	} else if pd.rd != rd0 || combo != combo0 {
+		// 之前也设置了读超时但时间不同，或者时间虽相同但设置是通用处理函数或者特别处理
+		// 函数与现在的不同。
 		pd.rseq++ // invalidate current timers
 		if pd.rd > 0 {
 			modtimer(&pd.rt, pd.rd, 0, rtf, pd.makeArg(), pd.rseq)
 		} else {
+			// 如果以前设置了且现在设的超时已经过期
+			// 需删除就得计时器。
 			deltimer(&pd.rt)
 			pd.rt.f = nil
 		}
 	}
 	if pd.wt.f == nil {
 		if pd.wd > 0 && !combo {
+			// 如果读超时与写超时不同分别设置
 			pd.wt.f = netpollWriteDeadline
 			pd.wt.arg = pd.makeArg()
 			pd.wt.seq = pd.wseq
@@ -381,8 +483,11 @@ func poll_runtime_pollSetDeadline(pd *pollDesc, d int64, mode int) {
 	} else if pd.wd != wd0 || combo != combo0 {
 		pd.wseq++ // invalidate current timers
 		if pd.wd > 0 && !combo {
+			// 如果读超时与写超时不同分别设置
 			modtimer(&pd.wt, pd.wd, 0, netpollWriteDeadline, pd.makeArg(), pd.wseq)
 		} else {
+			// 现在的超时已经到期且存在就得超时计时器
+			// 删除旧的。
 			deltimer(&pd.wt)
 			pd.wt.f = nil
 		}
@@ -391,9 +496,11 @@ func poll_runtime_pollSetDeadline(pd *pollDesc, d int64, mode int) {
 	// Note that pd.publishInfo has already been called, above, immediately after modifying rd and wd.
 	var rg, wg *g
 	if pd.rd < 0 {
+		// 处理当前设置的超时已经到期的逻辑
 		rg = netpollunblock(pd, 'r', false)
 	}
 	if pd.wd < 0 {
+		// 处理当前设置的超时已经到期的逻辑
 		wg = netpollunblock(pd, 'w', false)
 	}
 	unlock(&pd.lock)
@@ -415,6 +522,8 @@ func poll_runtime_pollUnblock(pd *pollDesc) {
 	pd.rseq++
 	pd.wseq++
 	var rg, wg *g
+	// 因为 pd.closing 发生了变更，
+	// 更新 pd.atomicInfo的值。
 	pd.publishInfo()
 	rg = netpollunblock(pd, 'r', false)
 	wg = netpollunblock(pd, 'w', false)
@@ -443,13 +552,24 @@ func poll_runtime_pollUnblock(pd *pollDesc) {
 //
 // This may run while the world is stopped, so write barriers are not allowed.
 //
+// 根据mode的值判定是 pd 上关联的fd的可读还是可写事件就绪了
+// 然后调用 netpollunblock ,从pd.wg 或者 pd.rg 字段获取关联的 g，
+// 如果g不为nil则添加到 gList 链表中。
+//
+// 例如 mode 的值是可读或可读可写，而 pollDesc 中也有等待读事件的
+// goroutine,那么这个 goroutine
+// 就应该被唤醒继续运行了，所以就会把这个goroutine添加到toRun中。
+// 从pollDesc中获得对应G指针的操作是由 netpollunblock 函数完成的。
+//
 //go:nowritebarrier
 func netpollready(toRun *gList, pd *pollDesc, mode int32) {
 	var rg, wg *g
 	if mode == 'r' || mode == 'r'+'w' {
+		// 有可读事件，尝试唤醒监听此读事件的g如果有的话。
 		rg = netpollunblock(pd, 'r', true)
 	}
 	if mode == 'w' || mode == 'r'+'w' {
+		// 有可写事件，尝试唤醒监听此写事件的g如果有的话。
 		wg = netpollunblock(pd, 'w', true)
 	}
 	if rg != nil {
@@ -478,6 +598,15 @@ func netpollcheckerr(pd *pollDesc, mode int32) int {
 }
 
 func netpollblockcommit(gp *g, gpp unsafe.Pointer) bool {
+	//
+	// 如果 pdWait -> *g 成功 则返回true，否则返回false。
+	// 返回false会立即恢复gp的执行。
+	//
+	// 出现返回false情况时可能是：关闭fd，或者 deadline 到期，
+	// 它们的处理逻辑会将 pdWait -> 0，同时在 pd.atomicInfo 上
+	// 设置相应的错误位。
+	// 停靠失败的g恢复运行后会检查是否设置了错误位，如果设置了
+	// 会直接返回错误码到上层逻辑，并不会重试停靠。
 	r := atomic.Casuintptr((*uintptr)(gpp), pdWait, uintptr(unsafe.Pointer(gp)))
 	if r {
 		// Bump the count of goroutines waiting for the poller.
@@ -497,6 +626,22 @@ func netpollgoready(gp *g, traceskip int) {
 // waitio - wait only for completed IO, ignore errors
 // Concurrent calls to netpollblock in the same mode are forbidden, as pollDesc
 // can hold only a single waiting goroutine for each mode.
+//
+// 目的：
+// 将当前g停靠，等待 pd所关联的描述符上mode事件就绪。
+// 正常情况由 netpoll 唤醒，或者有 closing和deadline机制
+// 唤醒。
+//
+// 参数：waitio 表示是否阻塞等待，即使有错误也停靠（目前只发现在Windows上有用true值）
+//
+//	mode 'r'或者'w'不会同时是'r+w'，因为一个协程只关联一个事件。
+//	pd 与事件所有模式符绑定定，是协程与netpoll机制之间的桥梁。
+//
+// 返回值 如果为true表示io就绪，
+// false则可能是：
+//
+//	1.超时(deadline机制)
+//	2.FD.Close时使用ioready=false调用了runtime_pollUnblock。
 func netpollblock(pd *pollDesc, mode int32, waitio bool) bool {
 	gpp := &pd.rg
 	if mode == 'w' {
@@ -504,17 +649,34 @@ func netpollblock(pd *pollDesc, mode int32, waitio bool) bool {
 	}
 
 	// set the gpp semaphore to pdWait
+	// 下面的for循环会将 pd.wg 或pd.rg 设置为0或者pdWait
+	// 为0表表示事件已经就绪可以直接返回。
 	for {
 		// Consume notification if already ready.
+		// gpp 为 pdReady 表示IO已处于就绪状态，所以直接返回true。
+		// 不必停靠。
 		if gpp.CompareAndSwap(pdReady, pdNil) {
 			return true
 		}
+		// 如果为0，就先通过CAS把它置为 pdWait，表示当前协程即将挂起等待IO就绪，
+		// 然后当前协程会调用 gopark 函数来挂起自己，
+		// netpollblockcommit 函数会把当前g的地址赋值给 *gpp。等到挂起的协程会
+		// netpoller唤醒后，就从gopark 返回，从 gpp
+		// 中获取新的 IO 的状态，继续执行后面的逻辑。
 		if gpp.CompareAndSwap(pdNil, pdWait) {
 			break
 		}
 
 		// Double check that this isn't corrupt; otherwise we'd loop
 		// forever.
+		//
+		// 旧值可能是 pdWait，因为pdWait 只可能由上面的
+		// if 语句设置，如果上面设置成功便不会到这，如果没
+		// 设置成功到这，v不会是pdWait。
+		// 如果未 pdWait 说明使用同一个 pollDesc 也在执行
+		// 此函数。
+		// 因为 FD 进行读写是经过分别序列化的，通过 FD.fdmux锁
+		// 所以正常逻辑下面的if不会为true。
 		if v := gpp.Load(); v != pdReady && v != pdNil {
 			throw("runtime: double wait")
 		}
@@ -523,17 +685,55 @@ func netpollblock(pd *pollDesc, mode int32, waitio bool) bool {
 	// need to recheck error states after setting gpp to pdWait
 	// this is necessary because runtime_pollUnblock/runtime_pollSetDeadline/deadlineimpl
 	// do the opposite: store to closing/rd/wd, publishInfo, load of rg/wg
+	// 停靠之前再次检查，防止中途设置了 closing、 deadline 错误。
+	//
 	if waitio || netpollcheckerr(pd, mode) == pollNoError {
+		// 尝试一次 pdWait->*g，如果不成功继续执行下面的语句。
 		gopark(netpollblockcommit, unsafe.Pointer(gpp), waitReasonIOWait, traceEvGoBlockNet, 5)
 	}
 	// be careful to not lose concurrent pdReady notification
+	// 停靠的g恢复运行，或者停靠g失败了：
 	old := gpp.Swap(pdNil)
+	// old应是 pdReady或者0，不能是其它值。
+	//
+	// old为0：表示关闭了文件描述符时用ioready=false
+	// 调用了runtime_pollUnblock或者关联的deadlineLine
+	// 到期了它们会将 pd.wg或者pd.rg设置为0，并在pd.atomicInfo上
+	// 设置相应的错误位。
 	if old > pdWait {
 		throw("runtime: corrupted polldesc")
 	}
+	// 如果 old 为0，返回false，
+	// 上层调用者会验证 pd.atomicInfo 中的错误标志位有没有设置
+	// 如果没设置会重新调用此函数。
 	return old == pdReady
 }
 
+// 目的：
+// 1.与mode对应的事件就绪需将 pd.rg或pd.wg设为 pdReady，如果旧值是*g则返回它。
+// 2.以ioready=false,调用，想唤醒与pd+mode关联的g，让它们结束等待。一般有两种情况：
+//   2.1.上面的逻辑FD调用了Close要关闭文件描述符了。
+//	 2.2设置了deadline机制，且到期了。
+//
+// 因为Go在给文件描述符设置监听事件时无论是否监听读写都会设置这两个事件，所以
+// pd+r/w 并不一定关联两个g（读、写），但至少关联一个g。
+
+// 参: mode 只能是 'r' 或者是 'w' 。不会是 'r'+'w'，一个g只监听一个事件。
+//
+//	pd 与mode所属文件模式符绑定。
+//	ioready 事件是否就绪。
+//
+// 目的是根据 mode 从 pollDesc 的 rg 或 wg 中获取对应的 goroutine
+// (如果有的话，即目前存在监听事件的g）并返回。
+//
+// 结果：
+// 同时会更新 rg 或 wg 的状态到 pdReady 或在 0（表示nil)。
+//
+// 函数返回后：mode是'w'，pd.wg的结果值是 pdReady 或者 0。
+//
+//	mode是'r'，pd.rg的结果值是 pdReady 或者 0。
+//
+// 返回的 *g 可能是一个 goroutine的地址或者nil。
 func netpollunblock(pd *pollDesc, mode int32, ioready bool) *g {
 	gpp := &pd.rg
 	if mode == 'w' {
@@ -542,19 +742,40 @@ func netpollunblock(pd *pollDesc, mode int32, ioready bool) *g {
 
 	for {
 		old := gpp.Load()
+		// 对应的事件已经就绪:
+		// 1.表示事件所属协程(已经放入队列,或接下来注定放入队列)还没有得到执行或者还未执行到将 pdReady->0的语句。
+		// 2.根本没有协程在关注此事件。
+		// 以上两种情况都直接返回因为事件已经就绪不必再就绪。
 		if old == pdReady {
 			return nil
 		}
+		// 此刻没有关注此事件的g，又因为ioready为false。
+		// 从0->0是没意义的，直接返回。
 		if old == pdNil && !ioready {
 			// Only set pdReady for ioready. runtime_pollWait
 			// will check for timeout/cancel before waiting.
 			return nil
 		}
 		var new uintptr
+		// 如果 ioready=true，则带表关注事件肯定就绪。
+		// 但数据不一定没有被读取，因为可能上次唤醒的g
+		// 正在处理上次事件的数据同时也会顺带处理这次到达的数据。
+		// 这种情况old肯定不会是*g，所以没关系。
 		if ioready {
 			new = pdReady
 		}
+		//
+		// 因为同时可能存在其它线程也在操作此pd.wg或pd.rg，
+		// old的值可能会发生变更。
+		// 所以在发生变更的情况下需再次重复此过程。
 		if gpp.CompareAndSwap(old, new) {
+			// 1.如果ioready=true调用的话, 至此old肯定是pdWait、*g或者0(new是ioready)：
+			//    1. pdWait:说明一个协程正在准备监听此事件，但还未执行到挂起本身的语句。
+			//    2. *g 表示一个协程已经处于停靠等待的状态。
+			//    3. 0，表示此刻没有协程关注此事件。
+			// 2.如果ioready=false调用的话，至此old肯定是pdWait或者*g(new是0)
+			//    1. pdWait:说明一个协程正在准备监听此事件，但还未执行到挂起本身的语句。
+			//    2. *g 表示一个协程已经处于停靠等待的状态。
 			if old == pdWait {
 				old = pdNil
 			}
@@ -563,26 +784,45 @@ func netpollunblock(pd *pollDesc, mode int32, ioready bool) *g {
 	}
 }
 
+// 文件描述符读写超时的处理函数
+// 如果读写超时时间不同：
+// timer.f
+// 如果读写超时时间相同 read=write=true，读写超时共用同一个timer，
+// timer.f = netpollDeadline。
 func netpolldeadlineimpl(pd *pollDesc, seq uintptr, read, write bool) {
 	lock(&pd.lock)
 	// Seq arg is seq when the timer was set.
 	// If it's stale, ignore the timer event.
+	//
+	// pd.rseq 保存的是实时resq
 	currentSeq := pd.rseq
 	if !read {
+		// 如果 read为false，currentSeq就设置为写seq。
 		currentSeq = pd.wseq
 	}
+	// 如果 read和write都为true则它们共用一个timer。
+	// 取pd.rseq即可，因为当初如果combo为true时设置timer时取的也是pd.rseq。
 	if seq != currentSeq {
+		// The descriptor was reused or timers were reset.
+		//
+		// pd被重用(pd回收后并不会删除与之关联的定时器,但重用时pd.rseq和pd.wseq会递增)，
+		// 或者 timer被重置（设置了新的超时但与旧值不同）
 		// The descriptor was reused or timers were reset.
 		unlock(&pd.lock)
 		return
 	}
 	var rg *g
 	if read {
+		// 不可能小于0因为小于0的逻辑已经在设置超时时处理过了，
+		// 哪里的逻辑是如果小于0，直接调用netpollunblock唤醒。
 		if pd.rd <= 0 || pd.rt.f == nil {
 			throw("runtime: inconsistent read deadline")
 		}
+		// rd<0表读超时
 		pd.rd = -1
+		// 在 pd.atomicInfo 上设置读超时标志位。
 		pd.publishInfo()
+		// 尝试唤醒等待 pd+r事件的g。
 		rg = netpollunblock(pd, 'r', false)
 	}
 	var wg *g
@@ -596,21 +836,23 @@ func netpolldeadlineimpl(pd *pollDesc, seq uintptr, read, write bool) {
 	}
 	unlock(&pd.lock)
 	if rg != nil {
+		// 加入任务队列等待执行
 		netpollgoready(rg, 0)
 	}
 	if wg != nil {
+		// 加入任务队列等待执行
 		netpollgoready(wg, 0)
 	}
 }
-
+// 当读写超时时间相同时：pd.rt.f
 func netpollDeadline(arg any, seq uintptr) {
 	netpolldeadlineimpl(arg.(*pollDesc), seq, true, true)
 }
-
+// 当读写超时时间不同时：pd.rt.f
 func netpollReadDeadline(arg any, seq uintptr) {
 	netpolldeadlineimpl(arg.(*pollDesc), seq, true, false)
 }
-
+// 当读写超时时间相同时：pd.wt.f
 func netpollWriteDeadline(arg any, seq uintptr) {
 	netpolldeadlineimpl(arg.(*pollDesc), seq, false, true)
 }

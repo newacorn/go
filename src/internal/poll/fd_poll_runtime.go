@@ -19,17 +19,27 @@ import (
 //go:linkname runtimeNano runtime.nanotime
 func runtimeNano() int64
 
+// runtime.poll_runtime_pollServerInit
 func runtime_pollServerInit()
+// runtime.poll_runtime_pollOpen
 func runtime_pollOpen(fd uintptr) (uintptr, int)
+// runtime.poll_runtime_pollClose
 func runtime_pollClose(ctx uintptr)
+// runtime.poll_runtime_pollWait
 func runtime_pollWait(ctx uintptr, mode int) int
+// runtime.poll_runtime_pollWaitCanceled
 func runtime_pollWaitCanceled(ctx uintptr, mode int)
+// runtime.poll_runtime_pollReset
 func runtime_pollReset(ctx uintptr, mode int) int
+// runtime.poll_runtime_pollSetDeadline
 func runtime_pollSetDeadline(ctx uintptr, d int64, mode int)
+// runtime.poll_runtime_pollUnblock
 func runtime_pollUnblock(ctx uintptr)
+// runtime.poll_runtime_isPollServerDescriptor
 func runtime_isPollServerDescriptor(fd uintptr) bool
 
 type pollDesc struct {
+	//runtimeCtx 的值为 runtime.pollDesc 结构体指针
 	runtimeCtx uintptr
 }
 

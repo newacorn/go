@@ -594,6 +594,7 @@ func (fd *FD) WriteMsgInet6(p []byte, oob []byte, sa *syscall.SockaddrInet6) (in
 // Accept wraps the accept network call.
 func (fd *FD) Accept() (int, syscall.Sockaddr, string, error) {
 	if err := fd.readLock(); err != nil {
+		// fd关联的文件描述符已经关闭
 		return -1, nil, "", err
 	}
 	defer fd.readUnlock()
