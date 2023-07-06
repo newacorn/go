@@ -69,13 +69,24 @@ func (fd *FD) Init(net string, pollable bool) error {
 	return err
 }
 
+// destroy() 函数，目前只发现在 decref、 readUnlock 和 writeUnlock 函数调用中。
+// 主要目的：
+// 1. 在相应的多路复用机制中移除对 fd 的监听。
+// 2. 关闭fd对应的底层文件描述符。
+// 3. 调用一次 runtime_Semrelease(&fd.csema)；主要是 Close 调用中
+//    在自己不是最后一个对fd的引用时会阻塞在 runtime_Semacquire(&fd.csema)调用中。
+//
 // Destroy closes the file descriptor. This is called when there are
 // no remaining references.
 func (fd *FD) destroy() error {
 	// Poller may want to unregister fd in readiness notification mechanism,
 	// so this must be executed before CloseFunc.
+	//
+	// 从多路复用机制中移除对fd的监听。
 	fd.pd.close()
 
+	// 关闭底层文件描述符
+	//
 	// We don't use ignoringEINTR here because POSIX does not define
 	// whether the descriptor is closed if close returns EINTR.
 	// If the descriptor is indeed closed, using a loop would race
@@ -84,13 +95,39 @@ func (fd *FD) destroy() error {
 	err := CloseFunc(fd.Sysfd)
 
 	fd.Sysfd = -1
+	// 唤醒 poll.(*FD).Close 函数调用中可能的阻塞g。
 	runtime_Semrelease(&fd.csema)
 	return err
 }
-
+// Close()
+// 主要目的：
+// 1. 在 fd.fdmu.state 上设置 poll.mutexClosed 标志位，这样之后再有对这
+//    fd 进行读写的尝试，会直接返回fd已经关闭的错误。
+// 2. 清除 fd.fdmu.state 上等待读、写的计数，并执行这多次的 runtime_Semrelease(&fd.csema)
+//    调用以便唤醒它们。
+// 3. 唤醒所有因读写阻塞中的g，即因为数据没准备好或者没有空间可写而阻塞的g。
+// 3.1 前3者一般会一定成功过，除非重复调用了此函数。
+// 4. 增加一次引用计数，并调用 decref() 函数减少对应的计数，这个函数会判断如果没有其它计数了
+//    会调用 poll.(*FD).destroy函数。
+// 5. 阻塞在runtime_Semacquire(&fd.csema)调用中，如果 destroy 函数被调用
+//    就会结束阻塞(包括第4步的destroy函数调用)。
+// 5.1 其它已经在 FD.fdmu.state 上设置引用标志位的调用在结束时也会通过 decref()调用减少引用
+//     计数，同样也会有可能调用 destroy函数。
+//
+// 此函数不一定会直接关闭底层文件描述符和将文件描述符从多路复用中移除，但是此函数成功设置的 mutexClosed
+// 标志位是执行 destroy 函数的条件之一。
+//
 // Close closes the FD. The underlying file descriptor is closed by the
 // destroy method when there are no remaining references.
 func (fd *FD) Close() error {
+	//
+	// 下面的 fd.fdmu.increfAndClose()函数调用：
+	// 1. 设置 fd.fdmu.state 的 mutexClosed 标志位
+	// 2. 唤醒所有在对此fd进行读和写操作时阻塞在 poll.FD.fdmu.rwlock 函数调用处的g。
+	//    它们被唤醒时会检查 mutexClosed 标志位有没有设置如果设置了会返回false。
+	//
+	// 如果fd.fdmu.state 已经被设置了 mutexClosed 标志位会返回false。
+	// (不可以重复关闭）
 	if !fd.fdmu.increfAndClose() {
 		return errClosing(fd.isFile)
 	}
@@ -100,10 +137,18 @@ func (fd *FD) Close() error {
 	// the final decref will close fd.sysfd. This should happen
 	// fairly quickly, since all the I/O is non-blocking, and any
 	// attempts to block in the pollDesc will return errClosing(fd.isFile).
+	//
+	// 如果 netpoll 中对应的fd存在关联的处于阻塞等待中的
+	// g(因为读写操作)，则唤醒它们，即使数据可能没有准备好。
 	fd.pd.evict()
 
 	// The call to decref will call destroy if there are no other
 	// references.
+	//
+	// 因为上面的 increfAndClose() 增加了一个 ref
+	// 所以这里要减少一个。
+	//
+	// 如果没有其它引用计数这个函数也会调用 FD.destroy()
 	err := fd.decref()
 
 	// Wait until the descriptor is closed. If this was the only

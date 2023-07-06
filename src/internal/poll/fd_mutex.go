@@ -26,6 +26,9 @@ const (
 	mutexClosed  = 1 << 0
 	mutexRLock   = 1 << 1
 	mutexWLock   = 1 << 2
+	// 引用计数在 netpoll机制中在执行 poll.(*fdMutex).rwlock 函数增加计数，即
+	// 成功获取了锁。读和写可以并行，但不并发读、也不能并发写。
+	// 在 netpoll 机制中最多可能有3个引用，读、写、关闭各一个。
 	mutexRef     = 1 << 3
 	mutexRefMask = (1<<20 - 1) << 3
 	// rwaiter 的起始位
@@ -67,7 +70,14 @@ func (mu *fdMutex) incref() bool {
 		}
 	}
 }
-
+// increfAndClose()，目前此函数只被 poll.(*FD).close 函数所调用。
+// 主要目的：
+// 1. 为 mu.state 设置 mutexClosed 标志位，并将等待读和等待写计数的个20位bit清空。
+// 2. 唤醒那些阻塞在 poll.(*fdMutex).rwlock 中的g。
+// 3. 增加 mu.state 的引用计数。
+// 返回值：
+// 如果 mutexClosed 标志位已经被设置返回false。
+//
 // increfAndClose sets the state of mu to closed.
 // It returns false if the file was already closed.
 func (mu *fdMutex) increfAndClose() bool {

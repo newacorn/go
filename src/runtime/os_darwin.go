@@ -30,21 +30,30 @@ func semacreate(mp *m) {
 	if err := pthread_mutex_init(&mp.mutex, nil); err != 0 {
 		throw("pthread_mutex_init")
 	}
+	// mp.mutex 必须先于 mp.cond 之前初始化
 	if err := pthread_cond_init(&mp.cond, nil); err != 0 {
 		throw("pthread_cond_init")
 	}
 }
 
+// 休眠等待条件变量成立
+// 返回0，表示条件变量目前状态符合要求
+// 返回-1，表示因为超时而返回，而不是因为条件变量成立。
+// 信号量的成立通过大于0的mp.count来表示。
 //go:nosplit
 func semasleep(ns int64) int32 {
+	// 记录起始时间
+	// 用于计算函数执行时间
 	var start int64
 	if ns >= 0 {
 		start = nanotime()
 	}
 	mp := getg().m
+	// 等待条件变量是否成立之前需先获得锁，防止数据竞争
 	pthread_mutex_lock(&mp.mutex)
 	for {
 		if mp.count > 0 {
+			// 条件变量已经成立，直接解锁返回
 			mp.count--
 			pthread_mutex_unlock(&mp.mutex)
 			return 0
@@ -52,17 +61,23 @@ func semasleep(ns int64) int32 {
 		if ns >= 0 {
 			spent := nanotime() - start
 			if spent >= ns {
+				// 执行时间已经大于或等于休眠的时间了
+				// 需要返回
 				pthread_mutex_unlock(&mp.mutex)
 				return -1
 			}
 			var t timespec
+			// 设置等待时间
 			t.setNsec(ns - spent)
 			err := pthread_cond_timedwait_relative_np(&mp.cond, &mp.mutex, &t)
 			if err == _ETIMEDOUT {
+				// 表示 pthread_cond_timedwait_relative_np 因超时而返回
 				pthread_mutex_unlock(&mp.mutex)
 				return -1
 			}
 		} else {
+			// ns为负值，表示休眠线程永久等待
+			// 在休眠之前会释放锁
 			pthread_cond_wait(&mp.cond, &mp.mutex)
 		}
 	}
@@ -70,11 +85,16 @@ func semasleep(ns int64) int32 {
 
 //go:nosplit
 func semawakeup(mp *m) {
+	// 改变信号量之前需要上锁
 	pthread_mutex_lock(&mp.mutex)
+	// 递增 mp.count 表示信号梁成立。
 	mp.count++
 	if mp.count > 0 {
+		// 有等待线程在等待
+		// 唤醒等待线程
 		pthread_cond_signal(&mp.cond)
 	}
+	//释放锁，等待线程唤醒后需要持有锁
 	pthread_mutex_unlock(&mp.mutex)
 }
 
@@ -191,7 +211,7 @@ func getRandomData(r []byte) {
 	closefd(fd)
 	extendRandom(r, int(n))
 }
-
+// 解析环境变量，程序中通过os.Getenv 获取的环境变量是在这里初始化的（Windows除外）
 func goenvs() {
 	goenvs_unix()
 }

@@ -11,6 +11,7 @@ import "unsafe"
 // Semacquire waits until *s > 0 and then atomically decrements it.
 // It is intended as a simple sleep primitive for use by the synchronization
 // library and should not be used directly.
+// runtime.sync_runtime_Semacquire
 func runtime_Semacquire(s *uint32)
 
 // Semacquire(RW)Mutex(R) is like Semacquire, but for profiling contended
@@ -21,8 +22,11 @@ func runtime_Semacquire(s *uint32)
 // The different forms of this function just tell the runtime how to present
 // the reason for waiting in a backtrace, and is used to compute some metrics.
 // Otherwise they're functionally identical.
+// runtime.sync_runtime_SemacquireMutex
 func runtime_SemacquireMutex(s *uint32, lifo bool, skipframes int)
+// runtime.sync_runtime_SemacquireRWMutexR
 func runtime_SemacquireRWMutexR(s *uint32, lifo bool, skipframes int)
+// runtime.sync_runtime_SemacquireRWMutex
 func runtime_SemacquireRWMutex(s *uint32, lifo bool, skipframes int)
 
 // Semrelease atomically increments *s and notifies a waiting goroutine
@@ -32,6 +36,7 @@ func runtime_SemacquireRWMutex(s *uint32, lifo bool, skipframes int)
 // If handoff is true, pass count directly to the first waiter.
 // skipframes is the number of frames to omit during tracing, counting from
 // runtime_Semrelease's caller.
+// runtime.sync_runtime_Semrelease
 func runtime_Semrelease(s *uint32, handoff bool, skipframes int)
 
 // See runtime/sema.go for documentation.
@@ -55,8 +60,15 @@ func init() {
 
 // Active spinning runtime support.
 // runtime_canSpin reports whether spinning makes sense at the moment.
+//
+// 1. 最多自旋4次
+// 2. 必须多核CPU
+// 3. at least one other running P
+// 4. 当前P的任务队列不为空
 func runtime_canSpin(i int) bool
 
+// runtime_doSpin
+// 循环调用PAUSE汇编指令30次，不会让出CPU。
 // runtime_doSpin does active spinning.
 func runtime_doSpin()
 

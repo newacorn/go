@@ -200,6 +200,21 @@ const (
 // but on the contention path they sleep in the kernel.
 // A zeroed Mutex is unlocked (no need to initialize each lock).
 // Initialization is helpful for static lock ranking, but not required.
+//
+//
+// 针对线程而设计的，不适用于协程，它本质上就是一个结合了自旋锁和调度对象的优化过
+// 的锁，自旋锁部分没有什么特殊的，调度器对象部分在不同的平台上需要使用不同的系统
+// 调用。在Linux上是基于futex实现的，该实现中把mutex.key作为一个uint32来使用
+// 并且定义了三种状态，对应的3个常量的定义代码如下：
+// mutex_unlocked=0 当前锁没有被占用且没有处于休眠的等待者（线程）。
+// mutex_locked=1 当前锁被占用且没有处于休眠的等待者（线程）。
+// mutex_sleeping=2 当前锁被占用且有处于休眠的等待者（线程）。
+//
+// sema-based impl
+// key=0表示未上锁
+// key!=0表示上锁
+// key&^locked 如果不为0则是等候线程队列中队首m的地址
+// key=locked 表示有锁。
 type mutex struct {
 	// Empty struct if lock ranking is disabled, otherwise includes the lock rank
 	lockRankStruct
@@ -229,6 +244,18 @@ type mutex struct {
 //
 // notesleep/notetsleep are generally called on g0,
 // notetsleepg is similar to notetsleep but is called on user g.
+//
+// 一次性的休眠唤醒机制，一个线程休眠，另一个线程唤醒。
+// 要想重用这个note，必须在 notesleep 和 notewakeup 成对调用之后再调用
+// noteclear()。
+//
+// noteclear 不能在 notewakeup 之后调用，可能会使 notesleep 进入无限循环。
+//
+// sema-based impl:
+// key的值为：
+// 0 信号量未就绪
+// locked(1) 信号量就绪
+// &m m在休眠中，等待信号量就绪
 type note struct {
 	// Futex-based impl treats it as uint32 key,
 	// while sema-based impl as M* waitm.
@@ -242,13 +269,15 @@ type funcval struct {
 }
 // iface 对应非空接口内部数据结构
 type iface struct {
-	tab  *itab
+	tab  *itab // 编译阶段将具体类型赋值给非空接口时，tab字段由编译器填充。
 	data unsafe.Pointer
 }
 
+// 在Go语言的runtime中用来描述数据类型，习惯称之为类型元数据。
+// eface的这个_type字段用来描述data的类型元数据。也就是它给出了data的数据类型。
 type eface struct {
 	_type *_type
-	data  unsafe.Pointer
+	data  unsafe.Pointer // 用来存储实际数据的地址。
 }
 
 func efaceOf(ep *any) *eface {
@@ -390,15 +419,27 @@ type gobuf struct {
 //
 // sudogs are allocated from a special pool. Use acquireSudog and
 // releaseSudog to allocate and free them.
+//
+// 目前发现在 semacquire1 和 channel 中有用到这个结构
+// 用来保存关联的g的状态信息。
 type sudog struct {
 	// The following fields are protected by the hchan.lock of the
 	// channel this sudog is blocking on. shrinkstack depends on
 	// this for sudogs involved in channel ops.
 
+	// 用于记录当前排队的协程
+	// 记录关联的g
+	// semaphore中：由 readyWithTime 函数将其放入到当前P的p.nextg。
 	g *g
 
+	// select多路复用时串联一个select中所有去重后的channel关联的sudog。
+	// semaphore 中，在一颗平衡树种存储前后节点。
 	next *sudog
 	prev *sudog
+
+	// 用于存储信号量的地址
+	// channel 中对于接收者来说用于存放从通道中接收到的数据的位置,
+	//              发送者来说用于存放被发送的数据的地址。
 	elem unsafe.Pointer // data element (may point to stack)
 
 	// The following fields are never accessed concurrently.
@@ -406,9 +447,13 @@ type sudog struct {
 	// For semaphores, all fields (including the ones above)
 	// are only accessed when holding a semaRoot lock.
 
+	// 下面两个字段与性能分析有关。
 	acquiretime int64
 	releasetime int64
-	ticket      uint32
+
+	// 等于1表示唤醒者为其获得信号量，等到其唤醒时可以直接返回不用在尝试
+	// 获取信号量
+	ticket uint32
 
 	// isSelect indicates g is participating in a select, so
 	// g.selectDone must be CAS'd to win the wake-up race.
@@ -420,10 +465,27 @@ type sudog struct {
 	// because c was closed.
 	success bool
 
-	parent   *sudog // semaRoot binary tree
-	waitlink *sudog // g.waiting list or semaRoot
+	// semacquire1 信号量实现中的数据结构平衡树中有用到，
+	// 平衡树种存储父节点
+	parent *sudog // semaRoot binary tree
+
+	// channel中：
+	// select 多路选择中，select所在协程的waiting 字段
+	// 存储的是select中所有关联的channel去重后，上锁顺序排列后的第一个
+	// channel关联的sudog的地址。
+	// 剩余的channel关联的sudog用waitlink 关联。
+	//
+	// 非select 多路选中，此字段为nil。
+	//
+	// semaphore中：
+	// 用于串联同一个信号量锁关联的所有sudog结构。
+	waitlink *sudog // 主要用于实现channel中的等待队列。g.waiting list or semaRoot
+
+	// semaphore中：
+	// 队首的sudog的waittail字段指向队列中的最后一个sudog。
 	waittail *sudog // semaRoot
-	c        *hchan // channel
+	// sudog关联的channel
+	c *hchan // channel
 }
 
 type libcall struct {
@@ -450,6 +512,7 @@ type heldLockInfo struct {
 }
 
 type g struct {
+	// 描述了goroutine的栈空间。
 	// Stack parameters.
 	// stack describes the actual stack memory: [stack.lo, stack.hi).
 	// stackguard0 is the stack pointer compared in the Go stack growth prologue.
@@ -461,10 +524,12 @@ type g struct {
 	stackguard0 uintptr // offset known to liblink
 	stackguard1 uintptr // offset known to liblink
 
-	_panic    *_panic // innermost panic - offset known to liblink
-	_defer    *_defer // innermost defer
-	m         *m      // current m; offset known to arm liblink
-	sched     gobuf   // 调度器用来保存 goroutine 的执行上下文
+	_panic *_panic // innermost panic - offset known to liblink
+	_defer *_defer // innermost defer
+	m      *m      // 关联到正在执行当前G的工作线程M。current m; offset known to arm liblink
+	sched  gobuf   // 被调度器用来保存goroutine的执行上下文。
+	// 如果 syscallsp =0 说明当前没有在执行系统调用，系统调用可能会有一些指针指向协程的栈，并且很多
+	// 参数经过强制类型转换，无法得到最内层栈帧精确的指针位图。不能进行栈收缩。
 	syscallsp uintptr // if status==Gsyscall, syscallsp = sched.sp to use during gc
 	syscallpc uintptr // if status==Gsyscall, syscallpc = sched.pc to use during gc
 	// 在mac os平台为: g.stack.hi - 32字节
@@ -556,8 +621,14 @@ type g struct {
 	// to allocate gcAssistBytes bytes without assisting. If this
 	// is negative, then the G must correct this by performing
 	// scan work. We track this in bytes to make it fast to update
-	// and check for debt in the malloc hot path. The assist ratio
+	// and check for debt in the malloc hot path.
+	//
+	// The assist ratio （决定 gcAssistBytes 到 扫描任务的映射)
 	// determines how this corresponds to scan work debt.
+	//
+	// 每个 goroutine 都有自己的 gcAssistBytes ，在这个值用光之前不用执行
+	// 辅助 GC。辅助GC机制能能够有效地避免程序过快地分配内存，从而造成GC工作
+	// 线程来不及标记的问题。
 	gcAssistBytes int64
 }
 

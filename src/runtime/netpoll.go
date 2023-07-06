@@ -43,6 +43,7 @@ const (
 	pollNoError        = 0 // no error
 	pollErrClosing     = 1 // descriptor is closed
 	pollErrTimeout     = 2 // I/O timeout
+	// 目前只与读操作相关， pollDesc.eventErr() 返回true会认为是此错误。
 	pollErrNotPollable = 3 // general error polling descriptor
 )
 
@@ -126,7 +127,7 @@ type pollDesc struct {
 	rseq    uintptr   // protects from stale read timers
 	// 用于实现读超时的 timer ，它会在超时时间到达时唤醒等待的 goroutine。
 	rt      timer     // read deadline timer (set if rt.f != nil)
-	// 设置超时的时间。
+	// 设置超时到期的时间戳(纳秒)。
 	rd      int64     // read deadline (a nanotime in the future, -1 when expired)
 	wseq    uintptr   // protects from stale write timers
 	wt      timer     // write deadline timer
@@ -142,7 +143,9 @@ type pollInfo uint32
 
 const (
 	pollClosing = 1 << iota
+	// 由 pollDesc.setEventErr() 函数根据 ev.flags(kqueue)或ev.Events(epoll)设置
 	pollEventErr
+	// 由 pollDesc.publishInfo() 函数设置。
 	pollExpiredReadDeadline
 	pollExpiredWriteDeadline
 )
@@ -166,7 +169,7 @@ func (pd *pollDesc) info() pollInfo {
 // or changing rd or wd from < 0 to >= 0.
 //
 // 当 pd.closing、 pd.rd 或 pd.wd 变更时
-// 应调用 publishInfo() 以便反应到 pd.atomicInfo的值的对象位上。
+// 应调用 publishInfo() 以便反应到 pd.atomicInfo的值的对应位上。
 //
 func (pd *pollDesc) publishInfo() {
 	var info uint32
@@ -191,6 +194,9 @@ func (pd *pollDesc) publishInfo() {
 	}
 }
 
+// setEventErr()
+// 在 netpoll 函数中调用 (netpoll_epoll.go/netpoll_kqueue.go)
+// 根据 ev.flags==_EV_ERROR (kqueue), ev.Events==syscall.EPOLLERR(epoll)
 // setEventErr sets the result of pd.info().eventErr() to b.
 func (pd *pollDesc) setEventErr(b bool) {
 	x := pd.atomicInfo.Load()
@@ -391,6 +397,8 @@ func poll_runtime_pollWaitCanceled(pd *pollDesc, mode int) {
 	for !netpollblock(pd, int32(mode), true) {
 	}
 }
+// poll_runtime_pollSetDeadline()
+//
 // 如果 d 为0：
 //		1.mode对应的超时已经设置会将timer删除,不会设新的，pd.rd或pd.wd加1。
 //      2.mode对应的超时未设置没有效果。
@@ -511,7 +519,14 @@ func poll_runtime_pollSetDeadline(pd *pollDesc, d int64, mode int) {
 		netpollgoready(wg, 3)
 	}
 }
-
+// poll_runtime_pollUnblock()，目前只被: poll.pollDesc.evict 函数
+// 所调用。
+//
+// 1.pd.closing 设置为true，递增rseq和wseq字段。
+// 2.将关联的超时 timer 删除（如果存在的话）
+// 3.调用 pollDesc.publishInfo 更新 atomicInfo 字段的相应的标志位。
+// 4.将fd关联的阻塞g(读和写，如果存在的话)唤醒
+//
 //go:linkname poll_runtime_pollUnblock internal/poll.runtime_pollUnblock
 func poll_runtime_pollUnblock(pd *pollDesc) {
 	lock(&pd.lock)
@@ -579,7 +594,11 @@ func netpollready(toRun *gList, pd *pollDesc, mode int32) {
 		toRun.push(wg)
 	}
 }
-
+// netpollcheckerr()
+// 可能包含以下错误：
+// 1. 关联文件描述符已经关闭 pollErrClosing
+// 2. 读或写超时 pollErrTimeout
+// 3. pollErrNotPollable
 func netpollcheckerr(pd *pollDesc, mode int32) int {
 	info := pd.info()
 	if info.closing() {
@@ -784,17 +803,33 @@ func netpollunblock(pd *pollDesc, mode int32, ioready bool) *g {
 	}
 }
 
+// netpolldeadlineimpl()
+// 读写超时执行的函数，即 timer.f
+// 主要目的：
+// 1.
+// 2.
+// 参数：
+// pd:与文件描述符关联的 pollDesc。
+// seq:对文件描述符设置读写超时所构造的timer的seq字段值。
+//     如果读写的超时时间相同此值等于当时的 pollDesc.rseq ，否则
+//     读超时对应 pollDesc.rseq ，写超时对应 pollDesc.wseq 。
+// read:是否用于处理读超时。
+// write:是否用于处理写超时。
+//
 // 文件描述符读写超时的处理函数
-// 如果读写超时时间不同：
-// timer.f
-// 如果读写超时时间相同 read=write=true，读写超时共用同一个timer，
+// 如果读写超时时间不同:
+// timer.f = netpollReadDeadline 或 netpollWriteDeadline，而他们都间接调用了此函数。
+// 如果读写超时时间相同:
+// read=write=true，读写超时共用同一个timer，
 // timer.f = netpollDeadline。
+//
 func netpolldeadlineimpl(pd *pollDesc, seq uintptr, read, write bool) {
 	lock(&pd.lock)
 	// Seq arg is seq when the timer was set.
 	// If it's stale, ignore the timer event.
 	//
-	// pd.rseq 保存的是实时resq
+	// pd.rseq 保存的是pd的当前resq。
+	// 因为存在pd复用，所以rseq可能不是当初设置超时的rseq了。
 	currentSeq := pd.rseq
 	if !read {
 		// 如果 read为false，currentSeq就设置为写seq。
@@ -802,25 +837,32 @@ func netpolldeadlineimpl(pd *pollDesc, seq uintptr, read, write bool) {
 	}
 	// 如果 read和write都为true则它们共用一个timer。
 	// 取pd.rseq即可，因为当初如果combo为true时设置timer时取的也是pd.rseq。
+
 	if seq != currentSeq {
+		// pd已被重用，超时处理函数不做任何动作。
 		// The descriptor was reused or timers were reset.
 		//
 		// pd被重用(pd回收后并不会删除与之关联的定时器,但重用时pd.rseq和pd.wseq会递增)，
 		// 或者 timer被重置（设置了新的超时但与旧值不同）
+		//
 		// The descriptor was reused or timers were reset.
 		unlock(&pd.lock)
 		return
 	}
+
 	var rg *g
 	if read {
-		// 不可能小于0因为小于0的逻辑已经在设置超时时处理过了，
-		// 哪里的逻辑是如果小于0，直接调用netpollunblock唤醒。
+		//
+		// 在超时处理函数执行到这里不可能遇到 pd.rd或pd.wd小于等于0的情况。
+		// 因为到这里说明pd未被重用，超时函数未被执行。
+		// 1. 设置pd.rd或pd.wd小于0即-1由此函数在下面设置。
+		// 2. 设置超时时如果截止时间为负值修正为1<<63-1，为0会直接唤醒阻塞中的g、删除timer(如果它们存在的话)。
 		if pd.rd <= 0 || pd.rt.f == nil {
 			throw("runtime: inconsistent read deadline")
 		}
-		// rd<0表读超时
+		// 此函数得到调用说明已经超时。
 		pd.rd = -1
-		// 在 pd.atomicInfo 上设置读超时标志位。
+		// 更新 pd.atomicInfo 上的读超时标志位。
 		pd.publishInfo()
 		// 尝试唤醒等待 pd+r事件的g。
 		rg = netpollunblock(pd, 'r', false)

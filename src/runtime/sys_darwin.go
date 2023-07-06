@@ -250,6 +250,9 @@ func munmap_trampoline()
 //go:nosplit
 //go:cgo_unsafe_args
 func madvise(addr unsafe.Pointer, n uintptr, flags int32) {
+	// libcall 的第二个参数是入参 addr 在栈上的地址，
+	// 在调用 abi.FuncPCABIO(madvise_trampoline) 时，会将&addr存储到寄存器 DI
+	// madvise_trampoline 通过 0(DI)来取参addr，其它参数使用对应的偏移量。
 	libcCall(unsafe.Pointer(abi.FuncPCABI0(madvise_trampoline)), unsafe.Pointer(&addr))
 	KeepAlive(addr) // Just for consistency. Hopefully addr is not a Go address.
 }
@@ -358,6 +361,10 @@ func walltime() (int64, int32) {
 }
 func walltime_trampoline()
 
+// POSIX 标准定义的信号处理接口是 sigaction 函数，其接口头文件及原型如下：
+// #include <signal.h>
+// int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact);
+//
 //go:nosplit
 //go:cgo_unsafe_args
 func sigaction(sig uint32, new *usigactiont, old *usigactiont) {
@@ -453,6 +460,15 @@ func kqueue() int32 {
 func kqueue_trampoline()
 
 //go:nosplit
+// kevent(int	kq, const struct kevent	*changelist, int nchanges,
+//	 struct	kevent *eventlist, int nevents,
+//	 const struct timespec *timeout);
+//
+// The kevent() system call is used to register events with the queue, and
+//     return any	pending	events to the user.
+//
+// ev设置为nil，nev设置为0，可以向kq中添加事件。
+// ch随着为nil，nch设置为0，可以进行轮询获取就绪事件。
 //go:cgo_unsafe_args
 func kevent(kq int32, ch *keventt, nch int32, ev *keventt, nev int32, ts *timespec) int32 {
 	ret := libcCall(unsafe.Pointer(abi.FuncPCABI0(kevent_trampoline)), unsafe.Pointer(&kq))

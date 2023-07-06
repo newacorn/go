@@ -3910,7 +3910,7 @@ func gopreempt_m(gp *g) {
 // 恢复G运行的任务由 suspendG 调用者负值恢复。
 //
 // 另外一种抢占是当一个G原型时间超过10ms时，此时只会设置目标G的下面两个字段：
-// gp.preemptStop = true
+// gp.stackguard0 = stackPreempt
 // gp.preempt = true
 // 信号处理函数或者栈增长函数检测到上面两个字段会调用 gopreempt_m 函数，这个
 // 函数会将目标G放入到全局队列并转到 schedule 函数调用。

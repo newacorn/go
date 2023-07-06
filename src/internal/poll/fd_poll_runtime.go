@@ -63,6 +63,7 @@ func (pd *pollDesc) close() {
 	pd.runtimeCtx = 0
 }
 
+// evict()，目前只被 poll.(*FD).close() 函数调用。
 // Evict evicts fd from the pending list, unblocking any I/O running on fd.
 func (pd *pollDesc) evict() {
 	if pd.runtimeCtx == 0 {
@@ -78,7 +79,7 @@ func (pd *pollDesc) prepare(mode int, isFile bool) error {
 	res := runtime_pollReset(pd.runtimeCtx, mode)
 	return convertErr(res, isFile)
 }
-
+// call runtime_pollReset
 func (pd *pollDesc) prepareRead(isFile bool) error {
 	return pd.prepare('r', isFile)
 }
