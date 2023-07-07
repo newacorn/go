@@ -420,26 +420,39 @@ type gobuf struct {
 // sudogs are allocated from a special pool. Use acquireSudog and
 // releaseSudog to allocate and free them.
 //
-// 目前发现在 semacquire1 和 channel 中有用到这个结构
+// 目前发现在 semtable 和 hchan 中有用到这个结构，即信号量和通道操作。
+//
+// channel：
+// 在通道的 hchan.recvq 和 hchan.sendq 队列中排队。当某个协程进行
+// 通道操作时因不能立即完成而阻塞，会将创建一个 sudog 结构，并将协程
+// 赋值到 sudog.g 字段，放入到 hchan.recvq 或者 hchan.sendq 队列
+// 中，等待相应的通道操作唤醒。
+//
+// sema 信号量：
+// 协程因为执行 semacquire 等信号量获取操作，因没有准备好的信号量而阻塞，
+// 会为当前协程创建一个 sudog 结构，协程存储在 sudog.g 字段上，然后根据
+// 信号量变量地址，取模分配到一个平衡树上，再根据地址值比对具体分配到某个节
+// 点的队列中。
+//
 // 用来保存关联的g的状态信息。
 type sudog struct {
 	// The following fields are protected by the hchan.lock of the
 	// channel this sudog is blocking on. shrinkstack depends on
 	// this for sudogs involved in channel ops.
 
-	// 用于记录当前排队的协程
-	// 记录关联的g
+	// 用于记录当前排队的协程。，真正在某种队列中排队的是sudog结构，而参
+	// 与排队的g则记录在此字段上。
 	// semaphore中：由 readyWithTime 函数将其放入到当前P的p.nextg。
 	g *g
 
-	// select多路复用时串联一个select中所有去重后的channel关联的sudog。
+	// channel中，串联 hchan.sendq 和 hchan.recvq 队列中的元素。
 	// semaphore 中，在一颗平衡树种存储前后节点。
 	next *sudog
 	prev *sudog
 
-	// 用于存储信号量的地址
-	// channel 中对于接收者来说用于存放从通道中接收到的数据的位置,
-	//              发送者来说用于存放被发送的数据的地址。
+	// semaphore: 用于存储信号量变量的地址
+	// channel: 对于接收者来说用于存放从通道中接收到的数据的变量的地址,
+	//          对于发送者来说用于存放被发送的数据的地址。
 	elem unsafe.Pointer // data element (may point to stack)
 
 	// The following fields are never accessed concurrently.
@@ -451,40 +464,39 @@ type sudog struct {
 	acquiretime int64
 	releasetime int64
 
-	// 等于1表示唤醒者为其获得信号量，等到其唤醒时可以直接返回不用在尝试
-	// 获取信号量
+	// semaphore: 等于1表示唤醒者为其获得信号量，等到其唤醒时可以直接返回不用在尝试获取信号量
+	// 这个1也是唤醒者为其赋值的。
 	ticket uint32
 
 	// isSelect indicates g is participating in a select, so
 	// g.selectDone must be CAS'd to win the wake-up race.
+	// channel: 如果这个sudog因多路复用阻塞而创建并加入到通道相应
+	//          队列的便为true，否则为false。
 	isSelect bool
 
 	// success indicates whether communication over channel c
 	// succeeded. It is true if the goroutine was awoken because a
 	// value was delivered over channel c, and false if awoken
 	// because c was closed.
+	//
+	// channel: 接收操作，因通道关闭操作被唤醒。发送操作，因通道关闭操作被唤醒，
+	//          发送者根据这个值是否为true来触发panic。
+	//
 	success bool
 
-	// semacquire1 信号量实现中的数据结构平衡树中有用到，
-	// 平衡树种存储父节点
+	// semaphore: 信号量实现中的数据结构平衡树中有用到，平衡树中的节点存储父节点
 	parent *sudog // semaRoot binary tree
 
-	// channel中：
-	// select 多路选择中，select所在协程的waiting 字段
-	// 存储的是select中所有关联的channel去重后，上锁顺序排列后的第一个
-	// channel关联的sudog的地址。
-	// 剩余的channel关联的sudog用waitlink 关联。
-	//
-	// 非select 多路选中，此字段为nil。
-	//
-	// semaphore中：
-	// 用于串联同一个信号量锁关联的所有sudog结构。
+	// channel: select多路复用中，因轮询失败而进入阻塞阶段后，会为每个case关联通道创建一个关联
+	//          所在协程的sudog结构，然后按上锁的顺序通过 waitlink 字段串联，队首保存在所在协
+	//          程的 waitlink 字段上。
+	// semaphore: 用于串联同一个信号量锁关联的所有sudog结构。
 	waitlink *sudog // 主要用于实现channel中的等待队列。g.waiting list or semaRoot
 
-	// semaphore中：
-	// 队首的sudog的waittail字段指向队列中的最后一个sudog。
+	// semaphore: 一颗平衡中的一个节点的(队首的sudog)的waittail字段指向队列中的最后一个sudog。
 	waittail *sudog // semaRoot
-	// sudog关联的channel
+
+	// channel: 此sudog被推入的通道。
 	c *hchan // channel
 }
 
@@ -600,14 +612,34 @@ type g struct {
 	// goroutine 开始执行的第一条指令，即goroutine关联函数的第一条指令
 	startpc        uintptr         // pc of goroutine function
 	racectx        uintptr
+	// select 多路复用中：
+	// gp.waiting 中存储按上锁顺序排列的第一个case的关联通道的关联sudog（根据case读写操作放入通道的send或recvq)
+	// 然后第一个sudog的waiting字段存储的是第二个sudog的地址依次类推。
 	waiting        *sudog         // sudog structures this g is waiting on (that have a valid elem ptr); in lock order
 	// 主要用于实现 channel 中的等待队列
 	cgoCtxt        []uintptr      // cgo traceback context
 	// only user goroutines have labels
 	// labels can be inheired
 	labels         unsafe.Pointer // profiler labels
-	timer          *timer         // cached timer for time.Sleep
 	// runtime 内部实现的计时器类型，主要用来支持 time.Sleep
+	timer          *timer         // cached timer for time.Sleep
+
+	/**
+	// select多路选择中，如果在轮询中发现没有任何case操作可以立即完成，则会进入第二
+	// 阶段，按照上锁的顺序为每个case创建一个关联当前g的sudog，并将其放入到case关联
+	// 通道的sendq或者recvq队列。
+	// 然后调用gopark将自己挂起，并在系统栈中释放select中涉及到的所有通道的锁。
+	// 因为select中涉及的不止一个通道，这样当不只一个case就绪时，就会在获取关联g的sudog
+	// 上存在竞争。因为关联g只能被唤醒一次，但它却被多个sudog引用，所以下面通过对
+	// g的selectDone进行cas操作，这保证了g只会被唤醒一次。
+	// 又因为当g将g.selectDone重置时其已经从各个case关联通道的相应等待队列中移除了，
+	// 所以没有任何问题。
+	//
+	if sgp.isSelect && !sgp.g.selectDone.CompareAndSwap(0, 1) {
+		continue
+	}
+	*/
+
 	selectDone     atomic.Uint32  // are we participating in a select and did someone win the race?
 
 	// goroutineProfiled indicates the status of this goroutine's stack for the

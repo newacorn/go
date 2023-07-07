@@ -389,7 +389,21 @@ func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason w
 func goparkunlock(lock *mutex, reason waitReason, traceEv byte, traceskip int) {
 	gopark(parkunlock_c, unsafe.Pointer(lock), reason, traceEv, traceskip)
 }
-
+// goready()
+// 将gp从 _Gwaiting 变成 _Grunnable ，并放入任务队列。
+// 具体放入任务队列的逻辑：
+// ------
+// next 为false，将gp放入本地队列。
+// ------
+// next 为true，则肯定会将 gp 放入 pp.runnext 字段。
+// 如果 runnext 原来有值，则会将 gp 复制为 oldrunnext 其放入本地队列。
+// -----
+// 将 gp 放入本地队列的逻辑：
+// 如果本地队列已满，会将 gp和一批本地队列移到全局队列上。只能有当前P本身执行。
+//
+// 参数：
+// gp 的状态必须包含 _Gwaiting
+// traceskip 调试的作用
 func goready(gp *g, traceskip int) {
 	systemstack(func() {
 		ready(gp, traceskip, true)
@@ -898,7 +912,23 @@ func fastrandinit() {
 	s := (*[unsafe.Sizeof(fastrandseed)]byte)(unsafe.Pointer(&fastrandseed))[:]
 	getRandomData(s)
 }
-
+// ready()
+// 将gp从 _Gwaiting 变成 _Grunnable ，并放入任务队列。
+// 具体放入任务队列的逻辑：
+// ------
+// next 为false，将gp放入本地队列。
+// ------
+// next 为true，则肯定会将 gp 放入 pp.runnext 字段。
+// 如果 runnext 原来有值，则会将 gp 复制为 oldrunnext 其放入本地队列。
+// -----
+// 将 gp 放入本地队列的逻辑：
+// 如果本地队列已满，会将 gp和一批本地队列移到全局队列上。只能有当前P本身执行。
+//
+// 参数：
+// gp 的状态必须包含 _Gwaiting
+// next 表示是否将gp放入当前P的runnext 字段。
+// traceskip 调试的作用
+//
 // Mark gp ready to run.
 func ready(gp *g, traceskip int, next bool) {
 	if trace.enabled {
@@ -6376,6 +6406,15 @@ const randomizeScheduler = raceenabled
 // If next is true, runqput puts g in the pp.runnext slot.
 // If the run queue is full, runnext puts g on the global queue.
 // Executed only by the owner P.
+// ------
+// next 为false，将gp放入本地队列。
+// ------
+// next 为true，则肯定会将 gp 放入 pp.runnext 字段。
+// 如果 runnext 原来有值，则会将 gp 复制为 oldrunnext 其放入本地队列。
+// -----
+// 将 gp 放入本地队列的逻辑：
+// 如果本地队列已满，会将 gp和一批本地队列移到全局队列上。只能有当前P本身执行。
+// -----
 func runqput(pp *p, gp *g, next bool) {
 	if randomizeScheduler && next && fastrandn(2) == 0 {
 		next = false
