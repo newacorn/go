@@ -40,9 +40,9 @@ import (
 // Error codes returned by runtime_pollReset and runtime_pollWait.
 // These must match the values in internal/poll/fd_poll_runtime.go.
 const (
-	pollNoError        = 0 // no error
-	pollErrClosing     = 1 // descriptor is closed
-	pollErrTimeout     = 2 // I/O timeout
+	pollNoError    = 0 // no error
+	pollErrClosing = 1 // descriptor is closed
+	pollErrTimeout = 2 // I/O timeout
 	// 目前只与读操作相关， pollDesc.eventErr() 返回true会认为是此错误。
 	pollErrNotPollable = 3 // general error polling descriptor
 )
@@ -72,11 +72,11 @@ const pollBlockSize = 4 * 1024
 //
 // No heap pointers.
 type pollDesc struct {
-	_    sys.NotInHeap
+	_ sys.NotInHeap
 	// 实现 pollCache 缓存，将空闲的 pollDesc 串成一个链表。
 	link *pollDesc // in pollcache, protected by pollcache.lock
 	// 要监听的文件描述符。
-	fd   uintptr   // constant for pollDesc usage lifetime
+	fd uintptr // constant for pollDesc usage lifetime
 
 	// atomicInfo holds bits from closing, rd, and wd,
 	// which are only ever written while holding the lock,
@@ -117,22 +117,22 @@ type pollDesc struct {
 	wg atomic.Uintptr // pdReady, pdWait, G waiting for write or pdNil
 
 	// 用来保护pollDesc结构中字段。（线程锁）
-	lock    mutex // protects the following fields
+	lock mutex // protects the following fields
 	// 表示文件描述符正在从poller中移除。
 	closing bool
 	// 在Linux 下没有用到，aix、Solaris等会利用它来存储一些扩展信息。
-	user    uint32    // user settable cookie
+	user uint32 // user settable cookie
 	// 一个自增序列号，因为 pollDesc 结构会被复用，通过增加 rseq 的值，能够避免复用的 pollDesc 被旧的
 	// 读超时timer干扰。
-	rseq    uintptr   // protects from stale read timers
+	rseq uintptr // protects from stale read timers
 	// 用于实现读超时的 timer ，它会在超时时间到达时唤醒等待的 goroutine。
-	rt      timer     // read deadline timer (set if rt.f != nil)
+	rt timer // read deadline timer (set if rt.f != nil)
 	// 设置超时到期的时间戳(纳秒)。
-	rd      int64     // read deadline (a nanotime in the future, -1 when expired)
-	wseq    uintptr   // protects from stale write timers
-	wt      timer     // write deadline timer
-	wd      int64     // write deadline (a nanotime in the future, -1 when expired)
-	self    *pollDesc // storage for indirect interface. See (*pollDesc).makeArg.
+	rd   int64     // read deadline (a nanotime in the future, -1 when expired)
+	wseq uintptr   // protects from stale write timers
+	wt   timer     // write deadline timer
+	wd   int64     // write deadline (a nanotime in the future, -1 when expired)
+	self *pollDesc // storage for indirect interface. See (*pollDesc).makeArg.
 }
 
 // pollInfo is the bits needed by netpollcheckerr, stored atomically,
@@ -169,8 +169,7 @@ func (pd *pollDesc) info() pollInfo {
 // or changing rd or wd from < 0 to >= 0.
 //
 // 当 pd.closing、 pd.rd 或 pd.wd 变更时
-// 应调用 publishInfo() 以便反应到 pd.atomicInfo的值的对应位上。
-//
+// 应调用 publishInfo() 以便反应到 pd.atomicInfo的值的对象位上。
 func (pd *pollDesc) publishInfo() {
 	var info uint32
 	if pd.closing {
@@ -219,7 +218,7 @@ var (
 	netpollInitLock mutex
 	netpollInited   atomic.Uint32
 
-	pollcache      pollCache
+	pollcache pollCache
 	// 统计有多少个协程正在等待netpoller中关联的fd上的到来事件。
 	// findrunnable 会根据此值是否大于0来决定 netpoll 的策略。
 	netpollWaiters atomic.Uint32
@@ -237,7 +236,6 @@ func poll_runtime_pollServerInit() {
 // netpollBreakRd 和 netpollBreakWr 是非阻塞管道两端的文件描述发，分别被用作读端和写端。
 // 读取端 netpollBreakRd 被添加到 epoll 中的监听 EPOLLIN 事件，后续从写入端 netpollBreakWr 写入数据
 // 就能唤醒阻塞中的 poller。
-//
 func netpollGenericInit() {
 	if netpollInited.Load() == 0 {
 		lockInit(&netpollInitLock, lockRankNetpollInit)
@@ -263,7 +261,6 @@ func netpollinited() bool {
 // 同时监听文件描述发fd的读写事件
 // 用来判断文件描述符fd是否被poller使用，在Linux对应的实现中，
 // 只有 epfd 、 netpollBreakRd 和 netpollBreakWr 属于poller使用的描述符。
-//
 func poll_runtime_isPollServerDescriptor(fd uintptr) bool {
 	return netpollIsPollDescriptor(fd)
 }
@@ -327,7 +324,7 @@ func poll_runtime_pollClose(pd *pollDesc) {
 		throw("runtime: blocked write on closing polldesc")
 	}
 	rg := pd.rg.Load()
- 	// netpollunblock 中已经确定了
+	// netpollunblock 中已经确定了
 	if rg != pdNil && rg != pdReady {
 		throw("runtime: blocked read on closing polldesc")
 	}
@@ -397,17 +394,23 @@ func poll_runtime_pollWaitCanceled(pd *pollDesc, mode int) {
 	for !netpollblock(pd, int32(mode), true) {
 	}
 }
+
 // poll_runtime_pollSetDeadline()
 //
 // 如果 d 为0：
-//		1.mode对应的超时已经设置会将timer删除,不会设新的，pd.rd或pd.wd加1。
-//      2.mode对应的超时未设置没有效果。
+//
+//			1.mode对应的超时已经设置会将timer删除,不会设新的，pd.rd或pd.wd加1。
+//	     2.mode对应的超时未设置没有效果。
+//
 // 如果 d 小于0：
-//      1.mode对应的事件未设置timer，直接尝试唤醒监听pd+mode事件的gs。
-//      2.mode对应的事件设置了timer，递增对应的seq删除timer，然后尝试唤醒监听pd+mode事件的gs。
+//
+//	1.mode对应的事件未设置timer，直接尝试唤醒监听pd+mode事件的gs。
+//	2.mode对应的事件设置了timer，递增对应的seq删除timer，然后尝试唤醒监听pd+mode事件的gs。
+//
 // 如果 d 大于0：
-//      1.mode对应的事件未设置timer，为pd+mode事件设置timer。
-//      2.mode对应的时机设置了tiemr，递增对应的seq，并重置对应的timer。
+//
+//	1.mode对应的事件未设置timer，为pd+mode事件设置timer。
+//	2.mode对应的时机设置了tiemr，递增对应的seq，并重置对应的timer。
 //
 // pd.*seq的作用可以保证在seq递增后，所有之前关联pd.*t即使得到执行其f也是无操作。
 // 因为接下来的modifying timer需要时间。
@@ -519,6 +522,7 @@ func poll_runtime_pollSetDeadline(pd *pollDesc, d int64, mode int) {
 		netpollgoready(wg, 3)
 	}
 }
+
 // poll_runtime_pollUnblock()，目前只被: poll.pollDesc.evict 函数
 // 所调用。
 //
@@ -594,6 +598,7 @@ func netpollready(toRun *gList, pd *pollDesc, mode int32) {
 		toRun.push(wg)
 	}
 }
+
 // netpollcheckerr()
 // 可能包含以下错误：
 // 1. 关联文件描述符已经关闭 pollErrClosing
@@ -811,8 +816,10 @@ func netpollunblock(pd *pollDesc, mode int32, ioready bool) *g {
 // 参数：
 // pd:与文件描述符关联的 pollDesc。
 // seq:对文件描述符设置读写超时所构造的timer的seq字段值。
-//     如果读写的超时时间相同此值等于当时的 pollDesc.rseq ，否则
-//     读超时对应 pollDesc.rseq ，写超时对应 pollDesc.wseq 。
+//
+//	如果读写的超时时间相同此值等于当时的 pollDesc.rseq ，否则
+//	读超时对应 pollDesc.rseq ，写超时对应 pollDesc.wseq 。
+//
 // read:是否用于处理读超时。
 // write:是否用于处理写超时。
 //
@@ -822,7 +829,6 @@ func netpollunblock(pd *pollDesc, mode int32, ioready bool) *g {
 // 如果读写超时时间相同:
 // read=write=true，读写超时共用同一个timer，
 // timer.f = netpollDeadline。
-//
 func netpolldeadlineimpl(pd *pollDesc, seq uintptr, read, write bool) {
 	lock(&pd.lock)
 	// Seq arg is seq when the timer was set.
@@ -837,7 +843,6 @@ func netpolldeadlineimpl(pd *pollDesc, seq uintptr, read, write bool) {
 	}
 	// 如果 read和write都为true则它们共用一个timer。
 	// 取pd.rseq即可，因为当初如果combo为true时设置timer时取的也是pd.rseq。
-
 	if seq != currentSeq {
 		// pd已被重用，超时处理函数不做任何动作。
 		// The descriptor was reused or timers were reset.
@@ -845,6 +850,10 @@ func netpolldeadlineimpl(pd *pollDesc, seq uintptr, read, write bool) {
 		// pd被重用(pd回收后并不会删除与之关联的定时器,但重用时pd.rseq和pd.wseq会递增)，
 		// 或者 timer被重置（设置了新的超时但与旧值不同）
 		//
+		// The descriptor was reused or timers were reset.
+		//
+		// pd被重用(pd回收后并不会删除与之关联的定时器,但重用时pd.rseq和pd.wseq会递增)，
+		// 或者 timer被重置（设置了新的超时但与旧值不同）
 		// The descriptor was reused or timers were reset.
 		unlock(&pd.lock)
 		return
@@ -886,14 +895,17 @@ func netpolldeadlineimpl(pd *pollDesc, seq uintptr, read, write bool) {
 		netpollgoready(wg, 0)
 	}
 }
+
 // 当读写超时时间相同时：pd.rt.f
 func netpollDeadline(arg any, seq uintptr) {
 	netpolldeadlineimpl(arg.(*pollDesc), seq, true, true)
 }
+
 // 当读写超时时间不同时：pd.rt.f
 func netpollReadDeadline(arg any, seq uintptr) {
 	netpolldeadlineimpl(arg.(*pollDesc), seq, true, false)
 }
+
 // 当读写超时时间相同时：pd.wt.f
 func netpollWriteDeadline(arg any, seq uintptr) {
 	netpolldeadlineimpl(arg.(*pollDesc), seq, false, true)
