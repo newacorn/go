@@ -18,8 +18,12 @@ import (
 )
 
 // Central list of free objects of a given size.
+// 一个 mcentral 类型的对象，对应一种 spanClass ,管理着一组属于该
+// spanClass 的 mspan。
+//
 type mcentral struct {
 	_         sys.NotInHeap
+	// spanclass 记录当前 mcntral 管理着哪种类型的 mspan。
 	spanclass spanClass
 
 	// partial and full contain two mspan sets: one of swept in-use
@@ -40,6 +44,13 @@ type mcentral struct {
 	// to the appropriate swept list. As a result, the parts of the
 	// sweeper and mcentral that do consume from the unswept list may
 	// encounter swept spans, and these should be ignored.
+	//
+	// partial 和 full 是两个 spanSet 数组， spanSet 有自己的锁，是个并发安全地支持 push
+	// 和pop的 *mspan 集合。
+	// partial 中都是还没有分配完的 span，每个span至少包含一个空闲单元， full 中都是没有空闲
+	// 空间的 span。
+	// 数组中的两个 spanSet，有一个包含的是已清扫的 span，另一个包含的是未清扫的 sapn。
+	// 并且它们在每轮 GC 中会互换角色。
 	partial [2]spanSet // list of spans with a free object
 	full    [2]spanSet // list of spans with no free objects
 }
@@ -80,6 +91,7 @@ func (c *mcentral) fullSwept(sweepgen uint32) *spanSet {
 // Allocate a span to use in an mcache.
 func (c *mcentral) cacheSpan() *mspan {
 	// Deduct credit for this span allocation and sweep if necessary.
+	// 当前 spanclass 对应的 mspan 占用的页面包含的总字节数
 	spanBytes := uintptr(class_to_allocnpages[c.spanclass.sizeclass()]) * _PageSize
 	deductSweepCredit(spanBytes, 0)
 
@@ -107,8 +119,13 @@ func (c *mcentral) cacheSpan() *mspan {
 	var sl sweepLocker
 
 	// Try partial swept spans first.
+	// 先查看 mcentral 中的 partial mspan列表中是否有
+	// 带空闲obj且已经扫描过的 msapn。
 	sg := mheap_.sweepgen
 	if s = c.partialSwept(sg).pop(); s != nil {
+		// s中含有空闲的obj且已经被扫描过了。
+		// 已找到符合条件的 msapn 跳转到 hevesan 标签
+		// 继续后续的处理。
 		goto havespan
 	}
 
@@ -128,7 +145,8 @@ func (c *mcentral) cacheSpan() *mspan {
 			}
 			// We failed to get ownership of the span, which means it's being or
 			// has been swept by an asynchronous sweeper that just couldn't remove it
-			// from the unswept list. That sweeper took ownership of the span and
+			// from the unswept list.
+			// That sweeper took ownership of the span and
 			// responsibility for either freeing it to the heap or putting it on the
 			// right swept list. Either way, we should just ignore it (and it's unsafe
 			// for us to do anything else).
@@ -178,12 +196,15 @@ havespan:
 		throw("span has no free objects")
 	}
 	freeByteBase := s.freeindex &^ (64 - 1)
+	// s.freeindex 目前对应 s.allocBits 中的元素的索引。
+	// s.freeindex 每递增64便会对应一个新的s.allocBits数组元素。
 	whichByte := freeByteBase / 8
 	// Init alloc bits cache.
 	s.refillAllocCache(whichByte)
 
 	// Adjust the allocCache so that s.freeindex corresponds to the low bit in
 	// s.allocCache.
+	// 更新 s.allocCache 使其最低位与s.freeindex对应。
 	s.allocCache >>= s.freeindex % 64
 
 	return s
@@ -240,7 +261,9 @@ func (c *mcentral) uncacheSpan(s *mspan) {
 
 // grow allocates a new empty span from the heap and initializes it for c's size class.
 func (c *mcentral) grow() *mspan {
+	// npages: c.spanclass 类型的msapn占用的页数。
 	npages := uintptr(class_to_allocnpages[c.spanclass.sizeclass()])
+	// size: c.spanclass 类型mspan，中obj的大小。
 	size := uintptr(class_to_size[c.spanclass.sizeclass()])
 
 	s := mheap_.alloc(npages, c.spanclass)

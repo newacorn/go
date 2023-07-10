@@ -149,6 +149,8 @@ const (
 	sweepMinHeapDistance = 1024 * 1024
 )
 
+// 初始化与GC相关的参数，根据环境变量GOGC设置gcpercent。
+// gcinit() 函数只被 schedinit() 函数调用。
 func gcinit() {
 	if unsafe.Sizeof(workbuf{}) != _WorkbufSize {
 		throw("size of Workbuf is suboptimal")
@@ -233,6 +235,11 @@ const (
 	// gcMarkWorkerDedicatedMode indicates that the P of a mark
 	// worker is dedicated to running that mark worker. The mark
 	// worker should run without preemption.
+	//
+	// 表示该工作协程所在的P专门用来运行这个GC工作协程，并且应该在不被抢占
+	// 的情况下运行。实际实现的时候，dedicated 模式的worker先以可以被抢占
+	// 的模式运行，手册检测到抢占标识时，把本地runq中所有g都放入全局runq，后续
+	// 以不抢占的模式运行，这用可以使本地runq中原有的任务尽量减少延迟。
 	gcMarkWorkerDedicatedMode
 
 	// gcMarkWorkerFractionalMode indicates that a P is currently
@@ -243,12 +250,20 @@ const (
 	// The fractional worker should run until it is preempted and
 	// will be scheduled to pick up the fractional part of
 	// GOMAXPROCS*gcBackgroundUtilization.
+	// 这种模式的 worker 主要因为gomaxprocs乘以 gcBackgroundUtilizition 的结果可能
+	// 不是整数，不能用整个 dedicated 模式的worker实现，剩余小数部分就由fractional模式
+	// 的worker来负责。
 	gcMarkWorkerFractionalMode
 
 	// gcMarkWorkerIdleMode indicates that a P is running the mark
 	// worker because it has nothing else to do. The idle worker
 	// should run until it is preempted and account its time
 	// against gcController.idleMarkTime.
+	//
+	// 表是当前P没有其他任务可做，处于空闲状态，顺便来执行GC。
+	// 由 findRunnable 函数负责调度，当其找不到其他可运行的g时，就会
+	// 从 gcBgMarkWorkerPool 中pop出一个后台工作协程的g，然后把当前
+	// p.gcMarkWorkerMode = gcMarkWorkerIdleMode ，并返回工作协程的g。
 	gcMarkWorkerIdleMode
 )
 
@@ -528,23 +543,31 @@ const (
 	// gcTriggerHeap indicates that a cycle should be started when
 	// the heap size reaches the trigger heap size computed by the
 	// controller.
+	// 表示触发原因是因为堆的大小达到或超过了临界值，这个临界值是由GC控制器计算出来的。
 	gcTriggerHeap gcTriggerKind = iota
 
 	// gcTriggerTime indicates that a cycle should be started when
 	// it's been more than forcegcperiod nanoseconds since the
 	// previous GC cycle.
+	// 表示触发原因是因为距离上次GC运行时间已经超过了 forcegcperiod 这么多纳秒的时间，
+	// 目前这个时间周期被定义为两分钟。
 	gcTriggerTime
 
 	// gcTriggerCycle indicates that a cycle should be started if
 	// we have not yet started cycle number gcTrigger.n (relative
 	// to work.cycles).
+	// 主要用于强制执行GC。
 	gcTriggerCycle
 )
+func (t gcTrigger) test() bool {
+	return  TTest(t)
+}
 
 // test reports whether the trigger condition is satisfied, meaning
 // that the exit condition for the _GCoff phase has been met. The exit
 // condition should be tested when allocating.
-func (t gcTrigger) test() bool {
+// test() 用于检测当前有没有达到GC出发条件。
+func  TTest(t gcTrigger) bool {
 	if !memstats.enablegc || panicking.Load() != 0 || gcphase != _GCoff {
 		return false
 	}
@@ -554,15 +577,28 @@ func (t gcTrigger) test() bool {
 		// we are going to trigger on this, this thread just
 		// atomically wrote gcController.heapLive anyway and we'll see our
 		// own write.
+		// trigger: 是控制器计算得到的临界值。临界值来源于上次标记的堆大小和 gcpercent 的
+		// 值，后者可以通过环境变量 GOGC 进行设置，表示当堆增长超过百分之多少后触发GC，参考
+		// 的堆起始大小就是上次标记终止时标记的大小，控制器会在每次标记终止时更新临界值，第一
+		// 次出发的临界值为4MB，在 gcinit() 函数里进行初始。
 		trigger, _ := gcController.trigger()
 		return gcController.heapLive.Load() >= trigger
 	case gcTriggerTime:
 		if gcController.gcPercent.Load() < 0 {
 			return false
 		}
+		// 以纳秒为单位记录了上次GC执行的时刻， gcTrigger 的 now字段存储的是想
+		// 触发想要发起GC的时间戳，两者之间的差如果超过 forcegcperiod 就会触发
+		// GC。
 		lastgc := int64(atomic.Load64(&memstats.last_gc_nanotime))
 		return lastgc != 0 && t.now-lastgc > forcegcperiod
 	case gcTriggerCycle:
+		// work.cycles ，它会随着每轮GC自增，也就是等于记录了当前执行到第几轮。
+		// runtime.GC()函数会先读取 work.cycles 的值，然后把这个值加一作为n来
+		// 构造一个 gcTriggerCycle 类型的 gcTrigger，把它用作参数来调用 cStart()
+		// 函数。如果在这个过程中，下一轮 GC 已经在别处被触发，这work.cycles的值就
+		// 会等于甚至大于t.n的值，t.test()函数就会返回false，gcStart()函数也就随之
+		// 返回，不会再重复执行了。
 		// t.n > work.cycles, but accounting for wraparound.
 		return int32(t.n-work.cycles.Load()) > 0
 	}
@@ -575,6 +611,16 @@ func (t gcTrigger) test() bool {
 //
 // This may return without performing this transition in some cases,
 // such as when called on a system stack or with locks held.
+// Go 的GC共有3种触发方式:
+// 第1种: 是被runtime初始化阶段创建的 sysmon 线程和 forcegchelper
+//       协程发起的，触发条件是基于时间的周期性触发。
+// 第2种: 是被 mallocgc() 函数发起的，触发条件是堆大小达到或超过了临界值。
+// 第3种: 是被开发者通过 runtime.GC() 函数强制触发。
+//
+// 调用 gcStart 没有效果的几种情况：
+// 1. 处于g0栈
+// 2. m持有锁
+// 3. 设置了 m.preemptoff
 func gcStart(trigger gcTrigger) {
 	// Since this is called from malloc and malloc is called in
 	// the guts of a number of libraries that might be holding
@@ -598,6 +644,7 @@ func gcStart(trigger gcTrigger) {
 	//
 	// We check the transition condition continuously here in case
 	// this G gets delayed in to the next GC cycle.
+	// 我们在这里不断检查过渡条件，以防此 G 延迟到下一个 GC 循环。
 	for trigger.test() && sweepone() != ^uintptr(0) {
 		sweep.nbgsweep++
 	}
@@ -617,8 +664,10 @@ func gcStart(trigger gcTrigger) {
 	// start multiple STW GCs.
 	mode := gcBackgroundMode
 	if debug.gcstoptheworld == 1 {
+		// 不使用并发标记
 		mode = gcForceMode
 	} else if debug.gcstoptheworld == 2 {
+		// 不适用并发标记和并发清扫
 		mode = gcForceBlockMode
 	}
 
@@ -645,6 +694,7 @@ func gcStart(trigger gcTrigger) {
 
 	gcBgMarkStartWorkers()
 
+	//
 	systemstack(gcResetMarkState)
 
 	work.stwprocs, work.maxprocs = gomaxprocs, gomaxprocs
@@ -664,7 +714,7 @@ func gcStart(trigger gcTrigger) {
 		traceGCSTWStart(1)
 	}
 	systemstack(stopTheWorldWithSema)
-	println("world stop.")
+	//println("world stop.")
 	// Finish sweep before we start concurrent scan.
 	systemstack(func() {
 		finishsweep_m()
@@ -1124,6 +1174,7 @@ func gcMarkTermination() {
 
 		var sbuf [24]byte
 		printlock()
+		// 第几轮GC，从1开始。
 		print("gc ", memstats.numgc,
 			" @", string(itoaDiv(sbuf[:], uint64(work.tSweepTerm-runtimeInitTime)/1e6, 3)), "s ",
 			util, "%: ")
@@ -1152,12 +1203,24 @@ func gcMarkTermination() {
 			print(string(fmtNSAsMS(sbuf[:], uint64(ns))))
 		}
 		print(" ms cpu, ",
+			// 都是在STW期间统计的，GC开始时 heapLive 的大小，标记结束时 heapLive 的大小，
+			// GC标记结束时，被标记的 heapLive的大小。
 			work.heap0>>20, "->", work.heap1>>20, "->", work.heap2>>20, " MB, ",
+			// 是根据上一轮GC标记结束阶段更新的 gcPercentHeapGoal 结果值计算而来的。
+			// goal 往往就是 gcPercentHeapGoal。
+			//
+			// 影响本次GC触发的 goal。是计数本次 heap 触发时 trigger 值
+			// 的数据来源。(trigger比goal小，差很少)
 			gcController.lastHeapGoal>>20, " MB goal, ",
+			// 本次GC标记终止时，把所有扫描过的g的栈加起来的值。
+			// 并不是简单的 g.statck.hi - g.stack.lo。
+			// 而是 g.stack.hi - g.sched.sp
 			gcController.lastStackScan.Load()>>20, " MB stacks, ",
+			// bss和data区间大小之和。
 			gcController.globalsScan.Load()>>20, " MB globals, ",
 			work.maxprocs, " P")
 		if work.userForced {
+			// 调用 runtime.GC() 而执行的垃圾回收。
 			print(" (forced)")
 		}
 		print("\n")
@@ -1192,15 +1255,25 @@ func gcMarkTermination() {
 // the work is not stopped and from a regular G stack. The caller must hold
 // worldsema.
 func gcBgMarkStartWorkers() {
-	println("gcBgMarkStartWorkers")
 	// Background marking is performed by per-P G's. Ensure that each P has
 	// a background GC G.
 	//
 	// Worker Gs don't exit if gomaxprocs is reduced. If it is raised
 	// again, we can reuse the old workers; no need to create new workers.
+	// gcBgMarkWorkerCount 的值不会递减。这样一来如果多次启用GC，但 gomaxprocs
+	// 并未增加，gcBgMarkWorkers函数无操作。
 	for gcBgMarkWorkerCount < gomaxprocs {
+		// gcBgMarkWorker 会复用。
+		// 会无条件创建 gomaxprocs 个 gcBgMarkWorker。
+		// 创建之后会调用 goPark 停用自己。
+		// 并将能唤醒各个 gcBgMarkWorker 的 gcBgMarkWorkerNode 推入
+		// gcBgMarkWorkerPool 中，findRunnableGCWorker函数中会通过弹出
+		// 这些node获取其关联的 gcBgMarkWorker。
 		go gcBgMarkWorker()
 
+		// 通过notetsleepg阻塞
+		// 等待上面创建的gcBgMarkWorker 协程内部创建好 gcBgMarkWorkerNode 实例并与g关联，
+		// gcBgMarkWorker 内部会调用 wakesleepg 解除阻塞。
 		notetsleepg(&work.bgMarkReady, -1)
 		noteclear(&work.bgMarkReady)
 		// The worker is now guaranteed to be added to the pool before
@@ -1298,6 +1371,10 @@ func gcBgMarkWorker() {
 			}
 
 			// Release this G to the pool.
+			// 这里推入的是 node.node的地址其实也是node的地址。
+			// 在 findRunnableGCWorker 函数中会弹出node,因为node关联了处于休眠状态的
+			// gcBgMarkWorker所以可以在findRunnableGCWorker中获取gcBgMarkWorker并执行它。
+			//
 			gcBgMarkWorkerPool.push(&node.node)
 			// Note that at this point, the G may immediately be
 			// rescheduled and may be running.
@@ -1415,6 +1492,11 @@ func gcBgMarkWorker() {
 // gcMarkWorkAvailable reports whether executing a mark worker
 // on p is potentially useful. p may be nil, in which case it only
 // checks the global sources of work.
+// 返回true的情况之一：
+// 1. p 不为nil，且与 p 关联的gcWork不为空。
+// 2. 全局gcWork 不为空。
+// 3. 根任务标记还未完成。
+//
 func gcMarkWorkAvailable(p *p) bool {
 	if p != nil && !p.gcw.empty() {
 		return true

@@ -36,10 +36,12 @@ func (c *pageCache) empty() bool {
 // amount of scavenged memory should be ignored.
 func (c *pageCache) alloc(npages uintptr) (uintptr, uintptr) {
 	if c.cache == 0 {
+		// 没有空闲页了。
 		return 0, 0
 	}
 	if npages == 1 {
 		i := uintptr(sys.TrailingZeros64(c.cache))
+		// scav:为1或者为0
 		scav := (c.scav >> i) & 1
 		c.cache &^= 1 << i // set bit to mark in-use
 		c.scav &^= 1 << i  // clear bit to mark unscavenged
@@ -55,11 +57,17 @@ func (c *pageCache) alloc(npages uintptr) (uintptr, uintptr) {
 // Returns a base address and the amount of scavenged memory in the
 // allocated region in bytes.
 func (c *pageCache) allocN(npages uintptr) (uintptr, uintptr) {
+	// npages = 3
+	// 11111100
+	// i = 2
+	// (1<<3-1)<<i = 11100
+	// 11111100&^11100 = 11100000
 	i := findBitRange64(c.cache, uint(npages))
 	if i >= 64 {
 		return 0, 0
 	}
 	mask := ((uint64(1) << npages) - 1) << i
+	// 返回 c.scav & mask 结果中位为1的个数。最大值为 npages。
 	scav := sys.OnesCount64(c.scav & mask)
 	c.cache &^= mask // mark in-use bits
 	c.scav &^= mask  // clear scavenged bits

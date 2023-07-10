@@ -647,6 +647,9 @@ func bgscavenge(c chan int) {
 //
 // scavenge always tries to scavenge nbytes worth of memory, and will
 // only fail to do so if the heap is exhausted for now.
+//
+// 清理目标 nbytes，要么到达目标，要么堆没有可清理的页了。
+// 返回清理的字节数。
 func (p *pageAlloc) scavenge(nbytes uintptr, shouldStop func() bool) uintptr {
 	released := uintptr(0)
 	for released < nbytes {
@@ -701,6 +704,20 @@ func printScavTrace(released uintptr, forced bool) {
 // Returns the number of bytes scavenged.
 //
 // Must run on the systemstack because it acquires p.mheapLock.
+//
+// 清理 ci对应的chunk（512页*8192）中的所有可清理页,一次只能清理整数个页面同时受限于max参数，
+// 在上锁的情况下，清理先将查找到符合要求的连续页，然后标记为已分配，防止被申请使用了，然后调用 sysUnused
+// 告知操作系统这些页可以回收了。然后会取消这些页的已分配标记并被 scavenge 了。
+// 同时可能还会会更新chunks中的位图，如果整个chun都清理了。
+//
+// sysUnused transitions a memory region from Ready to Prepared
+//
+// 参数：
+// ci 要清理的chunk所在的索引
+// searchIdx ci中的页面偏移量，也就是说从 ci这个chunk的serachIdx索引的页开始倒数清理。(此函数并未用到此函数)
+// max 此次最多允许清理 max bytes
+//
+// 返回实际清理的bytes，因为是整页清理所以清理的字节数为 n*pageSize = n*8192。
 //
 //go:systemstack
 func (p *pageAlloc) scavengeOne(ci chunkIdx, searchIdx uint, max uintptr) uintptr {
@@ -999,6 +1016,9 @@ type scavengeIndex struct {
 	// iteration like uint32, but we lack the bit twiddling intrinsics. We'd need to either
 	// copy them from math/bits or fix the fact that we can't import math/bits' code from
 	// the runtime due to compiler instrumentation.
+	//
+	// 相对于 arenaBaseOffset 的偏移量。
+	//
 	searchAddr atomicOffAddr
 	chunks     []atomic.Uint8
 	minHeapIdx atomic.Int32
@@ -1007,9 +1027,22 @@ type scavengeIndex struct {
 
 // find returns the highest chunk index that may contain pages available to scavenge.
 // It also returns an offset to start searching in the highest chunk.
+//
+// 返回值：
+// chunk 的编号
+// uint 可以清理页面在chunk中的相对偏移(相对于这个chunk的起始页)，调用者就是从这个页开始
+// 递减尝试清理。
+// 返回的可能是chunk
+//
+// 这个函数复制减少 searchAddr 的值，如果减失败了
+// 就按最大可能的结果返回，所以只会损失点性能但不会丢失要清扫的页。
 func (s *scavengeIndex) find() (chunkIdx, uint) {
 	searchAddr, marked := s.searchAddr.Load()
+	// marked 表示 searchAddr所在的页是否被标记了。
+
 	if searchAddr == minOffAddr.addr() {
+		// searchAddr 等于[...]arena 的起始地址。
+		// 则没有可清扫页。
 		// We got a cleared search addr.
 		return 0, 0
 	}
@@ -1018,6 +1051,7 @@ func (s *scavengeIndex) find() (chunkIdx, uint) {
 	// iterate until we find a chunk with pages to scavenge.
 	min := s.minHeapIdx.Load()
 	searchChunk := chunkIndex(uintptr(searchAddr))
+	// 一个word对应8个chunk
 	start := int32(searchChunk / 8)
 	for i := start; i >= min; i-- {
 		// Skip over irrelevant address space.
@@ -1030,11 +1064,19 @@ func (s *scavengeIndex) find() (chunkIdx, uint) {
 		// an index. If there are no zeroes, we want the 7th
 		// index, if 1 zero, the 6th, and so on.
 		n := 7 - sys.LeadingZeros8(chunks)
+		// 这个word对应的chunks，倒数第一个对应为不为0的chunk的编号，从0开始。
+		// 比如word = 01111111 ; 7-1=6，从左数最后一个为1的位对应的chunk的索引
+		// 为6，在这组chunk(8个)中。
+
 		ci := chunkIdx(uint(i)*8 + uint(n))
+		// ci倒数是第一个包含可清理页的chunk。
 		if searchChunk == ci {
+			// 包含可清扫的页还是searchAddr所属的chunk
 			return ci, chunkPageIndex(uintptr(searchAddr))
 		}
 		// Try to reduce searchAddr to newSearchAddr.
+		//
+		// newSearchAddr 是包含可清扫页的索引最大的chunk里索引最大页的起始地址
 		newSearchAddr := chunkBase(ci) + pallocChunkBytes - pageSize
 		if marked {
 			// Attempt to be the first one to decrease the searchAddr
@@ -1043,14 +1085,18 @@ func (s *scavengeIndex) find() (chunkIdx, uint) {
 			// it doesn't matter. We may lose some performance having an
 			// incorrect search address, but it's far more important that
 			// we don't miss updates.
+			//
+			// 可能会失败，
 			s.searchAddr.StoreUnmark(searchAddr, newSearchAddr)
 		} else {
 			// Decrease searchAddr.
+			// 可能也会失败，其执行find的存储了一个更小的值。
 			s.searchAddr.StoreMin(newSearchAddr)
 		}
 		return ci, pallocChunkPages - 1
 	}
 	// Clear searchAddr, because we've exhausted the heap.
+	// 尝试将偏移量清零。
 	s.searchAddr.Clear()
 	return 0, 0
 }

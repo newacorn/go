@@ -16,12 +16,34 @@ import (
 //
 // mcaches are allocated from non-GC'd memory, so any heap pointers
 // must be specially handled.
+// mheap 中的 mcentral 数组实现了全局范围的、基于 spanClass 的mspan管理
+//
+// 因为是全局的，所以需要加锁。
+// 为了进一步减少锁竞争，GO把 mspan缓存到了每个P中，这就是 mcache。
+// mcentral 提供了两个方法用来支持 mcache，一个是 cacheSpan()方法
+// 它会分配一个span提供 mcache 使用，另一个是 uncacheSpan() 方法
+// mcache 可以通过它把一个span归还给mcentral。
+//
+// 在Go的GMP模型中， mcache 是一个 per-P 的小对象缓存，因为每个P都有自己的一个本地
+// mcache 所以不需要再加锁。mcache 结构也是在堆之外由专门的分配器分配的，所以不会被
+// GC 扫描。
+//
 type mcache struct {
 	_ sys.NotInHeap
 
 	// The following members are accessed on every malloc,
 	// so they are grouped here for better caching.
+	// nextSample 配合 memory profile 来使用的，当开启 memory profile 的首，没
+	// 分配 nextSample 这么多内存后，就会触发一次堆采样。
 	nextSample uintptr // trigger heap sample after allocating this many bytes
+	//
+	// scanAlloc 记录的是从 mcache 总共分配了多少字节 scannable 类型的内存。
+	// 其所属的obj是从是noscan 位为0，可以包含指针的 span中分配的。但是并不是将整个obj大小算作 scanable 类型的字节，
+	// 而是这个obj分配给某个 _type 时， _type.ptrdata 的大小。
+	//
+	//  refill 函数返回之前，此字段会重置为0：
+	// 	gcController.update(int64(s.npages*pageSize)-int64(usedBytes), int64(c.scanAlloc))
+	// 	c.scanAlloc = 0
 	scanAlloc  uintptr // bytes of scannable heap allocated
 
 	// Allocator cache for tiny objects w/o pointers.
@@ -36,20 +58,36 @@ type mcache struct {
 	//
 	// tinyAllocs is the number of tiny allocations performed
 	// by the P that owns this mcache.
+	// tiny和tinyoffset 用来实现针对 noscan 型小对象的 tiny allocator，
+	// tiny 指向一个16字节大小的内存单元
 	tiny       uintptr
+	// tinyoffset 记录的是这个内存单元中空闲的偏移量。
 	tinyoffset uintptr
+
+	// 记录的是总共进行了多少次 tiny 分配。
 	tinyAllocs uintptr
 
 	// The rest is not accessed on every malloc.
 
+	// alloc 是根据 spanClass 缓存的一组 mspan，因为不需要加锁，所以不像
+	// mcentral 那样对齐到 cache line。
 	alloc [numSpanClasses]*mspan // spans to allocate from, indexed by spanClass
 
+	// stackcache 是用来为 goroutine 分配栈的缓存。
+	// _NumStackOrders = 4
+	// 当本地 stackcache 中某个链表空了的时候，stackcacherefill() 函数
+	// 会循环调用 stackpollalloc() 函数重 stackpool 中对应的链表中取一些
+	// 节点过来不是按个数，而是按照空间大小为 _StackCacheSize的一半，也就是
+	// 每次16KB。
 	stackcache [_NumStackOrders]stackfreelist
 
 	// flushGen indicates the sweepgen during which this mcache
 	// was last flushed. If flushGen != mheap_.sweepgen, the spans
 	// in this mcache are stale and need to the flushed so they
 	// can be swept. This is done in acquirep.
+	//
+	// 记录的是上次执行 flush 时的 sweepgen ,如果不等于当前的 sweepgen
+	// 就说明需要再次 flush 以进行清扫。
 	flushGen atomic.Uint32
 }
 
@@ -74,8 +112,21 @@ func (p gclinkptr) ptr() *gclink {
 	return (*gclink)(unsafe.Pointer(p))
 }
 
+// 用来构建内存块链表，它会把每个节点最初的一个指针大小的内存用作
+// 指向下一个节点的指针。
+//
+// 因为栈最小也有2KB，所以list字段可以很安全地基于 gclinkptr 把它们
+// 连成一个链表，size字段用来标记链表的长度。
+// 当本地 stackcache 中某个链表空了的时候，stackcacherefill() 函数
+// 会循环调用 stackpollalloc() 函数重 stackpool 中对应的链表中取一些
+// 节点过来不是按个数，而是按照空间大小为 _StackCacheSize的一半，也就是
+// 每次16KB。
 type stackfreelist struct {
+	// 链表的头内存块的地址。
+	// 每次分配栈时都会向后移动要分配的栈的大小。
 	list gclinkptr // linked list of free stacks
+	// 链表的大小字节。
+	// 每次分配栈时都会减少栈的大小。
 	size uintptr   // total size of stacks in list
 }
 
@@ -148,43 +199,63 @@ func (c *mcache) refill(spc spanClass) {
 	// Return the current cached span to the central lists.
 	s := c.alloc[spc]
 
+	// 一致性校验，mcache 要想从 mcentral 中获取一个新的 spc 规格的 mspan
+	// 当前对应的 mspan 必要已经满了。
 	if uintptr(s.allocCount) != s.nelems {
 		throw("refill of span with free space remaining")
 	}
+
 	if s != &emptymspan {
 		// Mark this span as no longer cached.
 		if s.sweepgen != mheap_.sweepgen+3 {
 			throw("bad sweepgen in refill")
 		}
+		// 将 s 归还给 mcentral
 		mheap_.central[spc].mcentral.uncacheSpan(s)
 
 		// Count up how many slots were used and record it.
 		stats := memstats.heapStats.acquire()
+		// slotsUsed 记录将此 mspan 分配给 mcache 之后
+		// 到回收时被 mcache 用了多少个obj。
 		slotsUsed := int64(s.allocCount) - int64(s.allocCountBeforeCache)
+		// 更新全局的 smallAllocCount 计数。
 		atomic.Xadd64(&stats.smallAllocCount[spc.sizeclass()], slotsUsed)
 
 		// Flush tinyAllocs.
+		// tinySpanClass = 5 objsize 16byte
 		if spc == tinySpanClass {
+			// 更新全局的 tinyAllocCount 计数
 			atomic.Xadd64(&stats.tinyAllocCount, int64(c.tinyAllocs))
 			c.tinyAllocs = 0
 		}
+		// 更新当前 P 的 statsSeq 字段的计数
 		memstats.heapStats.release()
 
 		// Count the allocs in inconsistent, internal stats.
+		//
+		// mcache从申请s到归还s,在s中消耗的所有obj的总字节数。
 		bytesAllocated := slotsUsed * int64(s.elemsize)
+		// 更新 gcController.totalAlloc 计数
 		gcController.totalAlloc.Add(bytesAllocated)
 
 		// Clear the second allocCount just to be safe.
+		// 还回 s 之后，清空其 allocCountBeforeCache 字段。
 		s.allocCountBeforeCache = 0
 	}
 
 	// Get a new cached span from the central lists.
+	//
+	// 根据 spc(spanClass) 从 mcentral 中申请一个至少有一个闲置
+	// object 的 mspan。
 	s = mheap_.central[spc].mcentral.cacheSpan()
 	if s == nil {
+		// 不能从 mcentral 中申请到mspan，说明内存已经消耗殆尽。
+		// 抛出异常。
 		throw("out of memory")
 	}
 
 	if uintptr(s.allocCount) == s.nelems {
+		// 新申请的 mspan 必须至少有一个空闲的 object。
 		throw("span has no free space")
 	}
 
@@ -193,6 +264,8 @@ func (c *mcache) refill(spc spanClass) {
 	s.sweepgen = mheap_.sweepgen + 3
 
 	// Store the current alloc count for accounting later.
+	//
+	// 对于新申请的 mspan allocCountBeforeCache = allocCount
 	s.allocCountBeforeCache = s.allocCount
 
 	// Update heapLive and flush scanAlloc.
@@ -209,7 +282,19 @@ func (c *mcache) refill(spc spanClass) {
 	// which appears to lead to more memory used. See #53738 for
 	// more details.
 	usedBytes := uintptr(s.allocCount) * s.elemsize
+	//
+	// int64(s.npages*pageSize)-int64(usedBytes) 是新申请的 mspan 中的
+	// 空闲字节数。
+	//
+	// c.scanAlloc 记录的是从 mcache 总共分配了多少字节 scannable 类型的内存。
+	// 其所属的obj是从是noscan 位为0，可以包含指针的 span中分配的。但是并不是将整个obj大小算作 scanable 类型的字节，
+	// 而是这个obj分配给某个 _type 时， _type.ptrdata 的大小。
+	//
+	//  refill 函数返回之前，此字段会重置为0：
+	// 	gcController.update(int64(s.npages*pageSize)-int64(usedBytes), int64(c.scanAlloc))
+	// 	c.scanAlloc = 0
 	gcController.update(int64(s.npages*pageSize)-int64(usedBytes), int64(c.scanAlloc))
+	// 重置 c.scanAlloc
 	c.scanAlloc = 0
 
 	c.alloc[spc] = s
@@ -279,6 +364,7 @@ func (c *mcache) releaseAll() {
 			gcController.totalAlloc.Add(slotsUsed * int64(s.elemsize))
 
 			if s.sweepgen != sg+1 {
+				print("----")
 				// refill conservatively counted unallocated slots in gcController.heapLive.
 				// Undo this.
 				//

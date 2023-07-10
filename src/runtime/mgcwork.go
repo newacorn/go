@@ -29,6 +29,7 @@ func init() {
 	}
 }
 
+
 // Garbage collector work pool abstraction.
 //
 // This implements a producer/consumer model for pointers to grey
@@ -53,6 +54,8 @@ func init() {
 // the garbage collector from transitioning to mark termination since
 // gcWork may locally hold GC work buffers. This can be done by
 // disabling preemption (systemstack or acquirem).
+// gcWork
+// 在runtime中GC工作队列的具体实现就是 gcWork 这个结构体
 type gcWork struct {
 	// wbuf1 and wbuf2 are the primary and secondary work buffers.
 	//
@@ -72,21 +75,27 @@ type gcWork struct {
 	// next.
 	//
 	// Invariant: Both wbuf1 and wbuf2 are nil or neither are.
+	// wbuf1 和 wbuf2 分别是主要和次要工作缓冲区，
 	wbuf1, wbuf2 *workbuf
 
 	// Bytes marked (blackened) on this gcWork. This is aggregated
 	// into work.bytesMarked by dispose.
+	// bytesMarked 记录了
+	// 通过当前工作队列标记了多少内存空间，最终会被聚合到全局的 work.bytesMarked
 	bytesMarked uint64
 
 	// Heap scan work performed on this gcWork. This is aggregated into
 	// gcController by dispose and may also be flushed by callers.
 	// Other types of scan work are flushed immediately.
+	// 记录了当前工作队列执行了多少扫描工作，也是以字节为单位的。
 	heapScanWork int64
 
 	// flushedWork indicates that a non-empty work buffer was
 	// flushed to the global work list since the last gcMarkDone
 	// termination check. Specifically, this indicates that this
 	// gcWork may have communicated work to another gcWork.
+	// 表示从上次 gcMarkDone 检测之后，有非空的工作缓冲区被冲刷到了全局工作
+	// 列表，与标记终止的判定有关。
 	flushedWork bool
 }
 
@@ -118,16 +127,26 @@ func (w *gcWork) put(obj uintptr) {
 	lockWithRankMayAcquire(&work.wbufSpans.lock, lockRankWbufSpans)
 	lockWithRankMayAcquire(&mheap_.lock, lockRankMheap)
 	if wbuf == nil {
+		// 初始化 w.wbuf1 和 w.wbuf2
+		// w.wbuf2 被赋值为一个满的 wbuf，
+		// 从 work.full.pop() 返回的。
 		w.init()
 		wbuf = w.wbuf1
 		// wbuf is empty at this point.
 	} else if wbuf.nobj == len(wbuf.obj) {
+		// w.wbuf1 满了
+		// 替换
 		w.wbuf1, w.wbuf2 = w.wbuf2, w.wbuf1
 		wbuf = w.wbuf1
+
 		if wbuf.nobj == len(wbuf.obj) {
+			// w.wbuf1 和 w.wbuf2 都满了
 			putfull(wbuf)
+			// wbuf 被冲刷到了全局工作列表中。
+			// gcMarkDone 函数中会将此值设置为false。
 			w.flushedWork = true
 			wbuf = getempty()
+			// w.wbuf1 重新申请一个空的 wbuf
 			w.wbuf1 = wbuf
 			flushed = true
 		}
@@ -148,14 +167,21 @@ func (w *gcWork) put(obj uintptr) {
 // putFast does a put and reports whether it can be done quickly
 // otherwise it returns false and the caller needs to call put.
 //
+// 如果 w.wbuf1 满足要求（非空，且有空间）添加至 wbuf1
+// 否则返回false。
+//
 //go:nowritebarrierrec
 func (w *gcWork) putFast(obj uintptr) bool {
 	wbuf := w.wbuf1
+	// w.wbuf1 未分配，或者已经满了。
+	// 直接返回false。
 	if wbuf == nil || wbuf.nobj == len(wbuf.obj) {
 		return false
 	}
 
+	// 放入 w.wbuf1 队列
 	wbuf.obj[wbuf.nobj] = obj
+	// 递增计数
 	wbuf.nobj++
 	return true
 }
@@ -317,7 +343,11 @@ func (w *gcWork) empty() bool {
 // avoid contending on the global work buffer lists.
 
 type workbufhdr struct {
+	// lfnode 的类型是个结构体类型，包含一个 int64 和一个uintptr，可以简单地认为它用来
+	// 构建链表，包含指向下一个节点的指针。
 	node lfnode // must be first
+	// nobj 用于记录obj数组使用了多少，实际上是个递增的下标，为0时表示缓冲区是空的，等于obj
+	// 表示缓冲区已满。
 	nobj int
 }
 
@@ -325,6 +355,9 @@ type workbuf struct {
 	_ sys.NotInHeap
 	workbufhdr
 	// account for the above fields
+	// 用来储存扫描过程中发现的指针。
+	// _WorkbufSize 的大小是2048，所以 obj的容量应该是253。
+	// (2048 - 24)/8 = 253
 	obj [(_WorkbufSize - unsafe.Sizeof(workbufhdr{})) / goarch.PtrSize]uintptr
 }
 

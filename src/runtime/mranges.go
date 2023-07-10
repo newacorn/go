@@ -109,11 +109,19 @@ func (a addrRange) removeGreaterEqual(addr uintptr) addrRange {
 var (
 	// minOffAddr is the minimum address in the offset space, and
 	// it corresponds to the virtual address arenaBaseOffset.
+	//
+	// 0xffff800000000000
 	minOffAddr = offAddr{arenaBaseOffset}
 
 	// maxOffAddr is the maximum address in the offset address
 	// space. It corresponds to the highest virtual address representable
 	// by the page alloc chunk and heap arena maps.
+	//
+	// (0x0000FFFFFFFFFFFF + 0xFFFF800000000000)&0xFFFFFFFFFFFFFFFF
+	// (((1 << heapAddrBits) - 1) + arenaBaseOffset) & uintptrMask
+	// maxOffAddr = 0x00007FFFFFFFFFFF
+	// unint(maxOffAddr) - arenaBaseOffset = 281474976710655 = 0x0000FFFFFFFFFFFF
+	// 无符号相减得到的是正数
 	maxOffAddr = offAddr{(((1 << heapAddrBits) - 1) + arenaBaseOffset) & uintptrMask}
 )
 
@@ -207,6 +215,9 @@ func (b *atomicOffAddr) StoreMin(addr uintptr) {
 // replace it with newAddr. markedAddr must be a marked address
 // returned by Load. This function will not store newAddr if the
 // box no longer contains markedAddr.
+//
+// 将负数的odladdr转换过来的正的markAddr替换新的newaddr
+// 替换时需要将markAddr 转换回去。
 func (b *atomicOffAddr) StoreUnmark(markedAddr, newAddr uintptr) {
 	b.a.CompareAndSwap(-int64(markedAddr-arenaBaseOffset), int64(newAddr-arenaBaseOffset))
 }

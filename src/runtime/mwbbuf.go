@@ -46,17 +46,29 @@ type wbBuf struct {
 	//
 	// This is a pointer rather than an index to optimize the
 	// write barrier assembly.
+	//
+	// next 指向缓冲区可用的位置，每次写入时向后移动两个指针大小。
 	next uintptr
 
 	// end points to just past the end of buf. It must not be a
 	// pointer type because it points past the end of buf and must
 	// be updated without write barriers.
+	//
+	// end 刚好指向缓冲区之后，可以理解为右开区间的坐标值，当 next 等于 end
+	// 时，表示 缓冲区满了。 runtime.gcWriteBarrier 函数里会在写入之后
+	// 比较 next与end，如果相等会调用 runtime.wbBufFlush 函数。
 	end uintptr
 
 	// buf stores a series of pointers to execute write barriers
 	// on. This must be a multiple of wbBufEntryPointers because
 	// the write barrier only checks for overflow once per entry.
+	//
+	// wbBufEntryPointers 256 wbBufEntries 2
+	// buf 是个指针数组， 因为是删除加插入的混合写屏障，所以每次会向缓冲区中写入
+	// 两个指针，而缓存区总共可供这样写入256次，写入256次后便会写满。
 	buf [wbBufEntryPointers * wbBufEntries]uintptr
+	// *p = i // p是指针的指针，i是源指针，*p 是目标指针。
+	// 先入buf的是i，后入的是*p。
 }
 
 const (

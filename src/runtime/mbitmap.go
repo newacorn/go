@@ -102,8 +102,13 @@ func subtract1(p *byte) *byte {
 // We maintain one set of mark bits for allocation and one for
 // marking purposes.
 type markBits struct {
+	// object 对应的 gcmarkBits 位是 bytep 指向位置
+	// 的起始位。
 	bytep *uint8
+	// mask 是个掩码，可以与 *bytep 进行按位与
+	// 如果不等于0，说明此位别设置了。
 	mask  uint8
+	// index 字段表示 object 在 mspan 中的索引。
 	index uintptr
 }
 
@@ -118,6 +123,7 @@ func (s *mspan) allocBitsForIndex(allocBitIndex uintptr) markBits {
 // can be used. It then places these 8 bytes into the cached 64 bit
 // s.allocCache.
 func (s *mspan) refillAllocCache(whichByte uintptr) {
+	// 将allocBits的值+ whichByte的值作为[8]uint8的地址
 	bytes := (*[8]uint8)(unsafe.Pointer(s.allocBits.bytep(whichByte)))
 	aCache := uint64(0)
 	aCache |= uint64(bytes[0])
@@ -128,51 +134,131 @@ func (s *mspan) refillAllocCache(whichByte uintptr) {
 	aCache |= uint64(bytes[5]) << (5 * 8)
 	aCache |= uint64(bytes[6]) << (6 * 8)
 	aCache |= uint64(bytes[7]) << (7 * 8)
+	//
+	// 取反，让1变成0，让0变成1。在 allocBits 中bit位为0表示未分配
+	// 而 allocCache 中却相反，又因为从低位开始填充 allocCache,所
+	// 以s.allocCache 低位可能会出现连续的0，高位是连续的1。
 	s.allocCache = ^aCache
 }
 
+// nextFreeIndex()
+// 返回 s 中下一个空闲 obj 的索引。
+// 可能返回 mspan.nelems ,表示 s 已经没有空闲索引可用。
+//
 // nextFreeIndex returns the index of the next free object in s at
 // or after s.freeindex.
+//
 // There are hardware instructions that can be used to make this
 // faster if profiling warrants it.
 func (s *mspan) nextFreeIndex() uintptr {
 	sfreeindex := s.freeindex
 	snelems := s.nelems
 	if sfreeindex == snelems {
+		// 当 freeindex 等于 nelems 时，表明当前 span中
+		// 已经没有空闲的空间了。
 		return sfreeindex
 	}
 	if sfreeindex > snelems {
+		// freeindex 是不可能大于 nelems 的，如果大于
+		// 就意味着堆已经被破坏了。
 		throw("s.freeindex > s.nelems")
 	}
 
+	// 寻找下个空闲索引，利用 allocCache 批量缓存 allocBits 能
+	// 够提升效率。
+	//
+	// 需要注意，allocCache 中用0表示已分配，用1来表示未分配，这点
+	// 与 allocBits 是相反的，主要是为了方便通过 Ctz64()函数统计
+	// 尾端为0的二进制位数量。
+	//
+	// 如果 TrailingZeros64() 函数返回值是64，说明 allocCache 中缓存的索引
+	// 都被分配了，那就向后移动 freeindex,并通过 refillAllocCache
+	// 方法重新填充 allocCache，这个填充是按64位对其的。
+	//
+	// 通过 freeindex 和对应的二进制位在 allocCache 中的偏移相加，就可以
+	// 得到下个空闲索引，但是一定要判断有没有越界。
+	//
+	// allocBits 因为要和 allocCache 配合，所以是按照64位整数倍来分配的
+	// ，但是 nelems 不一定能被64整除，allocBits的位是在
+	// nelems 的基础上基于64做向上对齐，所以尾部可能有一部分二进制位是无效的。
 	aCache := s.allocCache
 
+	// sys.TrailingZeros64(8) = 3       //  11111000
+	// 低位0的个数，从低位向高位填充bit。
 	bitIndex := sys.TrailingZeros64(aCache)
 	for bitIndex == 64 {
 		// Move index to start of next cached bits.
+		//
+		// 将 sfreeindex 向上对齐到64，对齐之后，新的 sfreeindex 开始
+		// 对应的 obj 可能有使用过的，但会是连续的。
 		sfreeindex = (sfreeindex + 64) &^ (64 - 1)
 		if sfreeindex >= snelems {
+			// 纠正
+			// 此 mspan 已经用完了。
 			s.freeindex = snelems
 			return snelems
 		}
+		// whichByte 表示 将 allocBits 看作元素为uint8的数组时，从
+		// 从第几个元素开始用来填充 allocCache。
 		whichByte := sfreeindex / 8
 		// Refill s.allocCache with the next 64 alloc bits.
 		s.refillAllocCache(whichByte)
 		aCache = s.allocCache
+		// 返回新填充的 alloCache，低为0的个数。
 		bitIndex = sys.TrailingZeros64(aCache)
 		// nothing available in cached bits
 		// grab the next 8 bytes and try again.
 	}
+	// sfreeindex + allocCache低位0的个数就是当前 mspan
+	// 中第一个空闲 obj 的索引。
+	// allocCache 的填充值是从 sfreeindex 指向的obj对应的
+	// allocBits 中的位开始取值填充的。
 	result := sfreeindex + uintptr(bitIndex)
 	if result >= snelems {
+		// 越界，因为allocCache每一次都填充64位，但 allocBits 中
+		// 的取值的bit位是有对应的obj，但不能保证后面的63位都有对应
+		// 的obj。
+		//
+		// 纠正
 		s.freeindex = snelems
 		return snelems
 	}
 
+	// 第三部分是分配后的调整工作，需要把 freeindex 指向分配后的下一个位置
+	// allocCache 也要相应地进行位移处理。
+	//
+	// 如果此时 freeindex 能够被64整除，说明allocCache缓存的二进制
+	// 位都已经用完了，如果 freeindex 不等于nelems，也就是说当前 span
+	// 还有剩余空间，此时需要重新填充 allocCache。
+	// 最后找到空闲索引，函数返回后该索引也就被分配了。
+	//
+	// 例：
+	// 分配之前allocCache = 11111111 1111111 11111111 11111100
+	// Ctz64(allocCache) = 2
+	// 分配之后，新的 allocCache = allocCache>>3 = 00011111 11111111 11111111 11111111
+	//
+	// allocCache 可以看成环状的，所有为0的位个数表示从分配之后，从span中分配了多少对象。
+	// 所以 allocCache 并不是缓存了 freeindex开始的64位(因为之后的sfreeindex和allocCache都进行了微量更新)，
+	// 只有重新填充的allocCache才是。
+	//
+	// 微量更新，移除前面刚刚分配的obj对应的bit位(为1)。
+	// 因为 bitIndex 从0开始所以需要+1
 	s.allocCache >>= uint(bitIndex + 1)
+	// sfreeindex设置为下一个空闲对象的索引。
+	// 微量更新，更新 sfreeindex。
 	sfreeindex = result + 1
 
+	// 移动之后出现 sfreeindex%64，才能说明allocCache的缓存的二进制
+	// 位都用完了。
+	//
+	// 因为 sfreeindex 起始值是对齐到64的，而与之一起填充的 allocCache也只是
+	// 从 allocBits 中填充了64位，所以sfreeindex再次变成64的倍数说明allocCahce
+	// 中的缓存位已经用完了。
 	if sfreeindex%64 == 0 && sfreeindex != snelems {
+		// 如果此时 freeindex 能够被64整除，就说明allocCache缓存的
+		// 二进制位都已经用完了，如果 freeindex 不等于 nelems，也就
+		// 是说当前 span 还有剩余空间，此时需要重新填充 allocCache。
+		//
 		// We just incremented s.freeindex so it isn't 0.
 		// As each 1 in s.allocCache was encountered and used for allocation
 		// it was shifted away. At this point s.allocCache contains all 0s.
@@ -226,6 +312,9 @@ func markBitsForAddr(p uintptr) markBits {
 }
 
 func (s *mspan) markBitsForIndex(objIndex uintptr) markBits {
+	// objIndex对应的object在gcmarkBits中对应的位作为bytep的对应字节
+	// 的起始位。
+	// mask 是个掩码用来按位与确定该位是否设置。
 	bytep, mask := s.gcmarkBits.bitp(objIndex)
 	return markBits{bytep, mask, objIndex}
 }
@@ -327,6 +416,18 @@ func badPointer(s *mspan, p, refBase, refOff uintptr) {
 //
 // It is nosplit so it is safe for p to be a pointer to the current goroutine's stack.
 // Since p is a uintptr, it would not be adjusted if the stack were to move.
+//
+// 如果p指向的内存块属于一个有效的 mspan 返回相关信息。
+// 参数
+// refBase elem或者oblet的起始地址
+// refOff  为相对于refBase的偏移量。
+// p 表示这个偏移量上存储的值，这个偏移地址解释为(*uintptr)
+// p就是这个 uintptr的值。
+//
+// 返回值：
+// base p指向的内存块所在object的起始地址
+// s p指向的内存块所在的mspan
+// objIndex p指向的内存块所在object在mspan中的索引。
 //
 //go:nosplit
 func findObject(p, refBase, refOff uintptr) (base uintptr, s *mspan, objIndex uintptr) {
@@ -745,6 +846,8 @@ func (s *mspan) initHeapBits(forceClear bool) {
 
 // countAlloc returns the number of objects allocated in span s by
 // scanning the allocation bitmap.
+//
+// 统计 gcMarkBits 中设置为1的位，并返回。
 func (s *mspan) countAlloc() int {
 	count := 0
 	bytes := divRoundUp(s.nelems, 8)
@@ -921,6 +1024,7 @@ func readUintptr(p *byte) uintptr {
 // (The number of values is given by dataSize / typ.size.)
 // If dataSize < size, the fragment [x+dataSize, x+size) is
 // recorded as non-pointer data.
+//
 // It is known that the type has pointers somewhere;
 // malloc does not call heapBitsSetType when there are no pointers,
 // because all free objects are marked as noscan during

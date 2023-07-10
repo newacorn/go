@@ -107,13 +107,17 @@ type gcControllerState struct {
 	//
 	// When there is a very small live set but a lot of allocation, simply
 	// collecting when the heap reaches GOGC*live results in many GC
-	// cycles and high total per-GC overhead. This minimum amortizes this
+	// cycles and high total per-GC overhead.
+	//
+	// This minimum amortizes this
 	// per-GC overhead while keeping the heap reasonably small.
 	//
 	// During initialization this is set to 4MB*GOGC/100. In the case of
 	// GOGC==0, this will set heapMinimum to 0, resulting in constant
 	// collection even when the heap size is small, which is useful for
 	// debugging.
+	//
+	// heapMinimum 初始值为4MB*GOGC/100，为了缓解当存活的堆很小，但分配比较频繁的情况。
 	heapMinimum uint64
 
 	// runway is the amount of runway in heap bytes allocated by the
@@ -134,6 +138,8 @@ type gcControllerState struct {
 	// cycle, divided by the CPU time spent on each activity.
 	//
 	// Updated at the end of each GC cycle, in endCycle.
+	//
+	// 测试了下，应该总是越小越好：1.299068e-002
 	consMark float64
 
 	// lastConsMark is the computed cons/mark value for the previous GC
@@ -145,6 +151,17 @@ type gcControllerState struct {
 	// from gcPercent.
 	//
 	// Set to ^uint64(0) if gcPercent is disabled.
+	//
+	// 最小值为: 4MB*GOGC/100 (gcControllerState.heapMinimum)。
+	// 在每次GC标记终止阶段更新：
+	// gcPercentHeapGoal = c.heapMarked + (c.heapMarked+c.lastStackScan.Load()+c.globalsScan.Load())*uint64(gcPercent)/100
+	// 是下一次heap Trigger 触发添加的判断依据。
+	//
+	// 初始值在 gcControllerState.init , isSweepDone = true 以此为参数来调用 commit 函数，在其中更新。
+	// 因为初始时，其它几项数据都是0，所以结果为 c.globalsScan.Load()*uint64(gcPercent)/100
+	// 而 c.globalsScan 的值为所有模块的 data 和 bass 区间大小的和。
+	//
+	// 在 gcMarkTermination 中更新。
 	gcPercentHeapGoal atomic.Uint64
 
 	// sweepDistMinTrigger is the minimum trigger to ensure a minimum
@@ -158,12 +175,21 @@ type gcControllerState struct {
 	// will be chosen to always give the sweeper enough headroom. However,
 	// such a change might dramatically and suddenly move up the trigger,
 	// in which case we need to ensure the sweeper still has enough headroom.
+	//
+	// 在函数 HeapGoalInternal 中读取，在 commit 函数中修改。
+	// gcControllerState.init , isSweepDone = true 调用链中重置为0
+	//  gcControllerCommit , isSweepDone = false 调用链中：
+	//  GC标记结束时还未START THE WORLD 时，被设置为 GC标记的字节数 + sweepMinHeapDistance (1MB)
 	sweepDistMinTrigger atomic.Uint64
 
 	// triggered is the point at which the current GC cycle actually triggered.
 	// Only valid during the mark phase of a GC cycle, otherwise set to ^uint64(0).
 	//
 	// Updated while the world is stopped.
+	// startCycle 方法中设置为有效值，在 resetLive 中设置为 ^uint64(0)
+	// 在清扫终止阶段设置为 heapLive。
+	// triggered 是上一次GC开始时，GC扫描终止阶段的 heapLive 的大小。[ startCycle 函数中]
+	// 在标记结束时 triggered 会被设置为 ^uint64(0) [ resetLive 函数中]
 	triggered uint64
 
 	// lastHeapGoal is the value of heapGoal at the moment the last GC
@@ -171,6 +197,12 @@ type gcControllerState struct {
 	// because it could change if e.g. gcPercent changes.
 	//
 	// Read and written with the world stopped or with mheap_.lock held.
+	//
+	// 在 endCycle() 函数调用中赋值为 heapGoal()函数的返回结果，
+	// 因为 endCycle() 函数在 commit 函数(更新 gcPercentHeapGoal 的唯一地方)调用之前，
+	// 所以记录的是上一轮GC标记结束时的 goal 值(大概率为： gcPercentHeapGoal)。
+	// 也是本轮 GC heap Trigger 的比对 trigger 的计算来源 ( goal 和 trigger 往往所差无几)
+	//
 	lastHeapGoal uint64
 
 	// heapLive is the number of bytes considered live by the GC.
@@ -211,6 +243,23 @@ type gcControllerState struct {
 
 	// lastStackScan is the number of bytes of stack that were scanned
 	// last GC cycle.
+	//
+	// 只在 resetLive 函数中设置，设置为字段 stackScanWork 的值。不清零。
+	// 是最近一次GC标记终止阶段时扫描的所有g的栈大小之和。(字节)。
+	/*
+		// scannedSize is the amount of work we'll be reporting.
+		//
+		// It is less than the allocated size (which is hi-lo).
+		var sp uintptr
+		if gp.syscallsp != 0 {
+			sp = gp.syscallsp // If in a system call this is the stack pointer (gp.sched.sp can be 0 in this case on Windows).
+		} else {
+			sp = gp.sched.sp
+		}
+		scannedSize := gp.stack.hi - sp
+	*/
+	// 所有 _Grunnable 、 _Gwaiting 和 _Gsyscall 状态的g按上面计数到的
+	// scannedSize 的总和。
 	lastStackScan atomic.Uint64
 
 	// maxStackScan is the amount of allocated goroutine stack space in
@@ -225,6 +274,21 @@ type gcControllerState struct {
 
 	// globalsScan is the total amount of global variable space
 	// that is scannable.
+	//0  0x000000000101d614 in runtime.(*gcControllerState).addGlobals
+	//   at /Users/acorn/workspace/gosource/src/runtime/mgcpacer.go:918
+	//1  0x000000000104dec9 in runtime.modulesinit
+	//   at /Users/acorn/workspace/gosource/src/runtime/symtab.go:561
+	//2  0x00000000010367bf in runtime.schedinit
+	//   at /Users/acorn/workspace/gosource/src/runtime/proc.go:747
+	//3  0x000000000105e15e in runtime.rt0_go
+	//   at /Users/acorn/workspace/gosource/src/runtime/asm_amd64.s:371
+	//
+	// 只在模块初始化时为此字段添加值，每个模块将其 bss区间和 data 地址返回添加到此字段。
+	//
+	// 在计算 gcPercentHeapGoal 等时用到此字段的值:
+	// 1. gcPercentHeapGoal = c.heapMarked + (c.heapMarked+c.lastStackScan.Load()+c.globalsScan.Load())*uint64(gcPercent)/100
+	// 2. scanWorkExpected := int64(c.lastHeapScan + c.lastStackScan.Load() + c.globalsScan.Load())
+	// 3. maxScanWork := int64(scan + maxStackScan + c.globalsScan.Load())
 	globalsScan atomic.Uint64
 
 	// heapMarked is the number of bytes marked by the previous
@@ -248,6 +312,20 @@ type gcControllerState struct {
 	// Note that stackScanWork includes only stack space scanned, not all
 	// of the allocated stack.
 	heapScanWork    atomic.Int64
+	/*
+		// scannedSize is the amount of work we'll be reporting.
+		//
+		// It is less than the allocated size (which is hi-lo).
+		var sp uintptr
+		if gp.syscallsp != 0 {
+			sp = gp.syscallsp // If in a system call this is the stack pointer (gp.sched.sp can be 0 in this case on Windows).
+		} else {
+			sp = gp.sched.sp
+		}
+		scannedSize := gp.stack.hi - sp
+	 */
+	// 所有 _Grunnable 、 _Gwaiting 和 _Gsyscall 状态的g按上面计数到的
+	// scannedSize 的总和。
 	stackScanWork   atomic.Int64
 	globalsScanWork atomic.Int64
 
@@ -382,6 +460,8 @@ func (c *gcControllerState) init(gcPercent int32, memoryLimit int64) {
 // startCycle resets the GC controller's state and computes estimates
 // for a new GC cycle. The caller must hold worldsema and the world
 // must be stopped.
+// startCycle()
+// 在 gcStart 函数中被调用，紧随 systemstack(stopTheWorldWithSema) 调用之后。
 func (c *gcControllerState) startCycle(markStartTime int64, procs int, trigger gcTrigger) {
 	c.heapScanWork.Store(0)
 	c.stackScanWork.Store(0)
@@ -403,7 +483,25 @@ func (c *gcControllerState) startCycle(markStartTime int64, procs int, trigger g
 	dedicatedMarkWorkersNeeded := int64(totalUtilizationGoal + 0.5)
 	utilError := float64(dedicatedMarkWorkersNeeded)/totalUtilizationGoal - 1
 	const maxUtilError = 0.3
+	// GOMAXPROCS    dedicatedMarkWorkersNeeded  totalUtilizationGoal
+	//   1                 0                         0.25
+	//   2                 0                         0.25
+	//   3                 0                         0.25
+	//   4                 1					     0
+	//   5                 1                         0
+	//   6                 1                         0.083
+	//   7                 2                         0
+	//   8                 2                         0
+	//   9                 2                         0
+	//   10                3                         0
+	//   11                3                         0
+	//   12                3                         0
+	//   13                3                         0
+	//   14                4                         0
+	//   15                4                         0
+	//   16                4                         0
 	if utilError < -maxUtilError || utilError > maxUtilError {
+		// 修正后的worker数比原来大30%或小30%
 		// Rounding put us more than 30% off our goal. With
 		// gcBackgroundUtilization of 25%, this happens for
 		// GOMAXPROCS<=3 or GOMAXPROCS=6. Enable fractional
@@ -412,6 +510,7 @@ func (c *gcControllerState) startCycle(markStartTime int64, procs int, trigger g
 			// Too many dedicated workers.
 			dedicatedMarkWorkersNeeded--
 		}
+		// 至此 dedicatedMarkWorkersNeeded 肯定小于 totalUtilizationGoal
 		c.fractionalUtilizationGoal = (totalUtilizationGoal - float64(dedicatedMarkWorkersNeeded)) / float64(procs)
 	} else {
 		c.fractionalUtilizationGoal = 0
@@ -592,7 +691,9 @@ func (c *gcControllerState) revise() {
 	c.assistWorkPerByte.Store(assistWorkPerByte)
 	c.assistBytesPerWork.Store(assistBytesPerWork)
 }
-
+// 标记结束时执行。
+// 在 gcMarkDone 函数中执行 且于 gcMarkTermination 之前之前。
+//
 // endCycle computes the consMark estimate for the next cycle.
 // userForced indicates whether the current GC cycle was forced
 // by the application.
@@ -763,6 +864,8 @@ func (c *gcControllerState) findRunnableGCWorker(pp *p, now int64) (*g, int64) {
 		return nil, now
 	}
 
+	// decIfPositive 基于原子指令CAS实现一个正整数减一的操作，被用于分配
+	// dedicated 模式的worker，优先返回 dedicated 模式的worker。
 	decIfPositive := func(val *atomic.Int64) bool {
 		for {
 			v := val.Load()
@@ -775,6 +878,9 @@ func (c *gcControllerState) findRunnableGCWorker(pp *p, now int64) (*g, int64) {
 			}
 		}
 	}
+	// c.fractionalUtilizationGoal 和 c.dedicatedMarkWorkersNeeded
+	// 都是本轮GC开始时计算出来的，分别表示dedicated 、 fractional模式的
+	// worker会占用多少个P。
 
 	if decIfPositive(&c.dedicatedMarkWorkersNeeded) {
 		// This P is now dedicated to marking until the end of
@@ -789,6 +895,11 @@ func (c *gcControllerState) findRunnableGCWorker(pp *p, now int64) (*g, int64) {
 		// goal?
 		//
 		// This should be kept in sync with pollFractionalWorkerExit.
+		//
+		// delta 是从本轮开始标记已经过去的时间，用当前P的 gcFractionalMarkTime 除以 delta 得到
+		// 的是当前P运行 fractional worker 所花时间占总时间的百分比，这样可以把 fractional worker
+		// 分摊到所有P上去执行，尽量使每个P都均匀地分摊任务。如果当前P的执行时间
+		// 已经超过目标值就返回nil。
 		delta := now - c.markStartTime
 		if delta > 0 && float64(pp.gcFractionalMarkTime)/float64(delta) > c.fractionalUtilizationGoal {
 			// Nope. No need to run a fractional worker.
@@ -807,7 +918,8 @@ func (c *gcControllerState) findRunnableGCWorker(pp *p, now int64) (*g, int64) {
 	}
 	return gp, now
 }
-
+// resetLive 函数只在在 gcMark 函数中调用。在 commit 之前被调用。
+//
 // resetLive sets up the controller state for the next mark phase after the end
 // of the previous one. Must be called after endCycle and before commit, before
 // the world is started.
@@ -847,7 +959,12 @@ func (c *gcControllerState) markWorkerStop(mode gcMarkWorkerMode, duration int64
 		throw("markWorkerStop: unknown mark worker mode")
 	}
 }
-
+// update()
+//	gcController.update(int64(s.npages*pageSize)-int64(usedBytes), int64(c.scanAlloc))
+//
+// dHeapLive 是新申请的 mspan 中的空闲字节数。
+// dHeapScan mcache 中已分配的 scanalbe 类型的字节数。等于分配的 noscan span class 类的obj总共字节数。
+// 此函数调用之后， mcache.scanAlloc 会清零。
 func (c *gcControllerState) update(dHeapLive, dHeapScan int64) {
 	if dHeapLive != 0 {
 		live := gcController.heapLive.Add(dHeapLive)
@@ -889,12 +1006,22 @@ func (c *gcControllerState) heapGoal() uint64 {
 	goal, _ := c.heapGoalInternal()
 	return goal
 }
+// heapGoalInternal() 此函数在 heapGoal 和 trigger 函数中被调用。
+//
+// trigger()调用路线中：
+// 返回值：
+// goal: 大概率为 gcControllerState.gcPercentHeapGoal
+// minTrigger: gcControllerState.sweepDistMinTrigger
+// minTrigger <= goal
+func (c *gcControllerState) heapGoalInternal() (goal, minTrigger uint64) {
+	return HeapGoalInternal(c)
+}
 
 // heapGoalInternal is the implementation of heapGoal which returns additional
 // information that is necessary for computing the trigger.
 //
 // The returned minTrigger is always <= goal.
-func (c *gcControllerState) heapGoalInternal() (goal, minTrigger uint64) {
+func  HeapGoalInternal(c *gcControllerState) (goal, minTrigger uint64) {
 	// Start with the goal calculated for gcPercent.
 	goal = c.gcPercentHeapGoal.Load()
 
@@ -906,6 +1033,9 @@ func (c *gcControllerState) heapGoalInternal() (goal, minTrigger uint64) {
 		// adjustments that might move the goal forward in a variety of circumstances.
 
 		sweepDistTrigger := c.sweepDistMinTrigger.Load()
+		// 正常来说 goal 是大于 sweepDistTrigger， GOGC设置的非常小。
+		// 因为 sweepDistTrigger 的计算依赖GC标记的字节数 + sweepMinHeapDistance(1MB)，
+		// 而 goal 依赖于 GC标记字节数 + 一些统计量*GOGC。
 		if sweepDistTrigger > goal {
 			// Set the goal to maintain a minimum sweep distance since
 			// the last call to commit. Note that we never want to do this
@@ -932,6 +1062,10 @@ func (c *gcControllerState) heapGoalInternal() (goal, minTrigger uint64) {
 		// push the goal back in such a manner that it could cause us to exceed
 		// the memory limit.
 		const minRunway = 64 << 10
+		// c.triggered 是上一次GC开始时，扫描终止阶段的 c.heapLive 的大小。[startCycle函数中]
+		// 在标记结束时 c.triggered 会被设置为 ^uint64(0) [resetLive函数中]
+		//
+		// 所以验证heap GC触发是否满足时此字段值为 ^uint64(0)
 		if c.triggered != ^uint64(0) && goal < c.triggered+minRunway {
 			goal = c.triggered + minRunway
 		}
@@ -1062,7 +1196,16 @@ const (
 	// current constant has served us well over the years.
 	maxTriggerRatioNum = 61 // ~0.95
 )
-
+// trigger(),gcTrigger.test 函数所调用, gcControllerCommit 函数所调用。
+// 用于验证 gcTriggerHeap 类型的 gcTrigger 是否满足开始GC的条件。
+//
+// 返回值：
+// goal: 大概率为 gcControllerState.gcPercentHeapGoal
+// minTrigger: gcControllerState.sweepDistMinTrigger
+// minTrigger <= goal
+func (c *gcControllerState) trigger() (uint64, uint64) {
+	return  Trigger(c)
+}
 // trigger returns the current point at which a GC should trigger along with
 // the heap goal.
 //
@@ -1070,7 +1213,8 @@ const (
 // the GC should trigger. Thus, the GC trigger condition should be (but may
 // not be, in the case of small movements for efficiency) checked whenever
 // the heap goal may change.
-func (c *gcControllerState) trigger() (uint64, uint64) {
+func Trigger(c *gcControllerState) (uint64, uint64) {
+	// minTrigger < goal
 	goal, minTrigger := c.heapGoalInternal()
 
 	// Invariant: the trigger must always be less than the heap goal.
@@ -1079,6 +1223,8 @@ func (c *gcControllerState) trigger() (uint64, uint64) {
 	// but the live heap may grow beyond it.
 
 	if c.heapMarked >= goal {
+		// 一般不会出现这种情况。
+		//
 		// The goal should never be smaller than heapMarked, but let's be
 		// defensive about it. The only reasonable trigger here is one that
 		// causes a continuous GC cycle at heapMarked, but respect the goal
@@ -1091,23 +1237,30 @@ func (c *gcControllerState) trigger() (uint64, uint64) {
 	// heapMarked is our absolute minimum, and it's possible the trigger
 	// bound we get from heapGoalinternal is less than that.
 	if minTrigger < c.heapMarked {
+		// 一般不会出现这种情况。目前观察到只有第一个GC开始之前，minTrigger会是0。
 		minTrigger = c.heapMarked
 	}
 
 	// If we let the trigger go too low, then if the application
 	// is allocating very rapidly we might end up in a situation
 	// where we're allocating black during a nearly always-on GC.
+	//
 	// The result of this is a growing heap and ultimately an
 	// increase in RSS. By capping us at a point >0, we're essentially
 	// saying that we're OK using more CPU during the GC to prevent
 	// this growth in RSS.
+	//
+	// triggerRationDen = 65
+	// minTriggerRatioNum = 45
 	triggerLowerBound := uint64(((goal-c.heapMarked)/triggerRatioDen)*minTriggerRatioNum) + c.heapMarked
 	if minTrigger < triggerLowerBound {
+		// 大概率会发生
 		minTrigger = triggerLowerBound
 	}
 
 	// For small heaps, set the max trigger point at maxTriggerRatio of the way
-	// from the live heap to the heap goal. This ensures we always have *some*
+	// from the live heap to the heap goal.
+	// This ensures we always have *some*
 	// headroom when the GC actually starts. For larger heaps, set the max trigger
 	// point at the goal, minus the minimum heap size.
 	//
@@ -1115,6 +1268,11 @@ func (c *gcControllerState) trigger() (uint64, uint64) {
 	// to reflect the costs of a GC with no work to do. With a large heap but
 	// very little scan work to perform, this gives us exactly as much runway
 	// as we would need, in the worst case.
+	//
+	// defaultHeapMinimum: 4194304
+	// triggerRatioDen: 64
+	// maxTriggerRatioNum: 61; 61/64=0.95
+	// 如果GOGC为100堆不大的情况下，则 goal、maxTrigger 所差无几。
 	maxTrigger := uint64(((goal-c.heapMarked)/triggerRatioDen)*maxTriggerRatioNum) + c.heapMarked
 	if goal > defaultHeapMinimum && goal-defaultHeapMinimum > maxTrigger {
 		maxTrigger = goal - defaultHeapMinimum
@@ -1124,9 +1282,11 @@ func (c *gcControllerState) trigger() (uint64, uint64) {
 	}
 
 	// Compute the trigger from our bounds and the runway stored by commit.
+	// 通过 runway 、 miniTrigger 和 maxTrigger 来计算trigger。
 	var trigger uint64
 	runway := c.runway.Load()
 	if runway > goal {
+		// 正常GOGC的情况下 runway 不可能大于goal。
 		trigger = minTrigger
 	} else {
 		trigger = goal - runway
@@ -1142,6 +1302,8 @@ func (c *gcControllerState) trigger() (uint64, uint64) {
 		print("minTrigger=", minTrigger, " maxTrigger=", maxTrigger, "\n")
 		throw("produced a trigger greater than the heap goal")
 	}
+	// trigger < goal
+	// 大概率 trigger 是 maxTrigger，且与goal所差无几。
 	return trigger, goal
 }
 
@@ -1160,6 +1322,9 @@ func (c *gcControllerState) trigger() (uint64, uint64) {
 //
 // Callers must call gcControllerState.revise after calling this
 // function if the GC is enabled.
+// 被以下函数所调用：
+// 1. gcControllerCommit , isSweepDone = false
+// 2. gcControllerState.init , isSweepDone = true
 //
 // mheap_.lock must be held or the world must be stopped.
 func (c *gcControllerState) commit(isSweepDone bool) {
@@ -1175,6 +1340,10 @@ func (c *gcControllerState) commit(isSweepDone bool) {
 		// Concurrent sweep happens in the heap growth
 		// from gcController.heapLive to trigger. Make sure we
 		// give the sweeper some runway if it doesn't have enough.
+		//
+		// 此时 c.heapLive 是GC标记结束后但还未 START THE WORLD，
+		// GC标记的字节数。
+		// sweepMinHeapDistance = 1024 * 1024
 		c.sweepDistMinTrigger.Store(c.heapLive.Load() + sweepMinHeapDistance)
 	}
 
@@ -1184,9 +1353,16 @@ func (c *gcControllerState) commit(isSweepDone bool) {
 	gcPercentHeapGoal := ^uint64(0)
 	if gcPercent := c.gcPercent.Load(); gcPercent >= 0 {
 		gcPercentHeapGoal = c.heapMarked + (c.heapMarked+c.lastStackScan.Load()+c.globalsScan.Load())*uint64(gcPercent)/100
+		println(gcPercent)
+		println(c.heapMarked)
+		println(c.lastStackScan.Load())
+		println(c.globalsScan.Load())
+		println(gcPercentHeapGoal)
 	}
 	// Apply the minimum heap size here. It's defined in terms of gcPercent
 	// and is only updated by functions that call commit.
+	//
+	// c.heapMinimum 的值为4MB*GOGC/100
 	if gcPercentHeapGoal < c.heapMinimum {
 		gcPercentHeapGoal = c.heapMinimum
 	}
@@ -1196,7 +1372,8 @@ func (c *gcControllerState) commit(isSweepDone bool) {
 	// estimate of the cons/mark ratio.
 	//
 	// The idea is to take our expected scan work, and multiply it by
-	// the cons/mark ratio to determine how long it'll take to complete
+	// the cons/mark ratio to determine
+	// **how long it'll take to complete**
 	// that scan work in terms of bytes allocated. This gives us our GC's
 	// runway.
 	//
@@ -1205,10 +1382,12 @@ func (c *gcControllerState) commit(isSweepDone bool) {
 	// resources among the mutator and the GC.
 	//
 	// To summarize, we have B / cpu-ns, and we want B / ns. We get that
-	// by multiplying by our desired division of CPU resources. We choose
+	// by multiplying by our desired division of CPU resources.
+	// We choose
 	// to express CPU resources as GOMAPROCS*fraction. Note that because
 	// we're working with a ratio here, we can omit the number of CPU cores,
 	// because they'll appear in the numerator and denominator and cancel out.
+	//
 	// As a result, this is basically just "weighing" the cons/mark ratio by
 	// our desired division of resources.
 	//
@@ -1412,6 +1591,10 @@ func (c *gcControllerState) setMaxIdleMarkWorkers(max int32) {
 // Calls gcController.commit.
 //
 // The heap lock must be held, so this must be executed on the system stack.
+// 位于 resetLive 函数之后调用
+// gcControllerCommit 函数被 setGCPercent 、 setMemoryLimit 和 gcMarkTermination
+// 函数所调用。
+//
 //
 //go:systemstack
 func gcControllerCommit() {

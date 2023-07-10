@@ -102,7 +102,7 @@ type suspendGState struct {
 //
 //go:systemstack
 func suspendG(gp *g) suspendGState {
-	println("suspendG called.")
+	///*p*/rintln("suspendG called.")
 	if mp := getg().m; mp.curg != nil && readgstatus(mp.curg) == _Grunning {
 		// Since we're on the system stack of this M, the user
 		// G is stuck at an unsafe point. If another goroutine

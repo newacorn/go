@@ -1727,6 +1727,7 @@ TEXT ·sigpanic0(SB),NOSPLIT,$0-0
 TEXT runtime·gcWriteBarrier<ABIInternal>(SB),NOSPLIT,$112
 	// Save the registers clobbered by the fast path. This is slightly
 	// faster than having the caller spill these.
+	// 函数里会用到R12和R13这两个寄存器，现在栈上备份以下。
 	MOVQ	R12, 96(SP)
 	MOVQ	R13, 104(SP)
 	// TODO: Consider passing g.m.p in as an argument so they can be shared
@@ -1734,11 +1735,15 @@ TEXT runtime·gcWriteBarrier<ABIInternal>(SB),NOSPLIT,$112
 	MOVQ	g_m(R14), R13
 	MOVQ	m_p(R13), R13
 	MOVQ	(p_wbBuf+wbBuf_next)(R13), R12
+	// R12 现在存储的是 wbBuf.next 的值，将其增加16字节分配空间
 	// Increment wbBuf.next position.
 	LEAQ	16(R12), R12
+	// 将偏移16字节后地址存储到 wbBuf.next。作为新值。
 	MOVQ	R12, (p_wbBuf+wbBuf_next)(R13)
+	// 比较 wbBuf.next 与 wbBuf.end 看缓存是否已满。
 	CMPQ	R12, (p_wbBuf+wbBuf_end)(R13)
 	// Record the write.
+	// AX 存储的是指针赋值等号右边的新值，写入 wbBuf.buf中。
 	MOVQ	AX, -16(R12)	// Record value
 	// Note: This turns bad pointer writes into bad
 	// pointer reads, which could be confusing. We could avoid
@@ -1746,14 +1751,17 @@ TEXT runtime·gcWriteBarrier<ABIInternal>(SB),NOSPLIT,$112
 	// take care of the vast majority of these. We could
 	// patch this up in the signal handler, or use XCHG to
 	// combine the read and the write.
+	// DI 里是赋值等号左边变量的地址，取出旧值并存入R13。
 	MOVQ	(DI), R13
 	MOVQ	R13, -8(R12)	// Record *slot
 	// Is the buffer full? (flags set in CMPQ above)
+	// 前面的CMPQ指令用于判断 wbBuf.buf 是否已满，按需 flush。
 	JEQ	flush
 ret:
 	MOVQ	96(SP), R12
 	MOVQ	104(SP), R13
 	// Do the write.
+	// 把AX中的新值写入DI指向的位置，完成了指针赋值操作。
 	MOVQ	AX, (DI)
 	RET
 
@@ -1770,6 +1778,7 @@ flush:
 	//
 	// TODO: We could strike a different balance; e.g., saving X0
 	// and not saving GP registers that are less likely to be used.
+	// 备份处R12 R13 外的其它寄存器，wbBufFlush 函数可能会用到它们。
 	MOVQ	DI, 0(SP)	// Also first argument to wbBufFlush
 	MOVQ	AX, 8(SP)	// Also second argument to wbBufFlush
 	MOVQ	BX, 16(SP)
@@ -1787,9 +1796,11 @@ flush:
 	// R14 is g
 	MOVQ	R15, 88(SP)
 
+// 将 wbBuf.buf 中的指针冲刷到GC的工作队列中。
 	// This takes arguments DI and AX
 	CALL	runtime·wbBufFlush(SB)
 
+//  还原CALL之前备份的这些寄存器。
 	MOVQ	0(SP), DI
 	MOVQ	8(SP), AX
 	MOVQ	16(SP), BX

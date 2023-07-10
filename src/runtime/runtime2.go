@@ -658,6 +658,9 @@ type g struct {
 	// The assist ratio （决定 gcAssistBytes 到 扫描任务的映射)
 	// determines how this corresponds to scan work debt.
 	//
+	// 记录了当前协程通过辅助GC积累了多少字节的信用值，就像信用卡额度一样。
+	// 正数表示有结余，负数表示负债。
+	//
 	// 每个 goroutine 都有自己的 gcAssistBytes ，在这个值用光之前不用执行
 	// 辅助 GC。辅助GC机制能能够有效地避免程序过快地分配内存，从而造成GC工作
 	// 线程来不及标记的问题。
@@ -709,6 +712,8 @@ type m struct {
 	oldp          puintptr // the p that was attached before executing a syscall
 	// 用来暂存执行系统调用之前关联的P
 	id            int64    // M的唯一ID
+	// 分配内存阶段 mallocing = 1
+	// 分配内存结束时 mallocing = 0
 	mallocing     int32
 	throwing      throwType
 	preemptoff    string // if != "", keep curg running on this m
@@ -795,7 +800,9 @@ type p struct {
 	// 被监控线程用来存储上一次检查时的调度器时钟滴答，用以实现时间片
 	m           muintptr   // back-link to associated m (nil if idle)
 	// 本质上是一个指针，反向关联到P绑定的M
+
 	mcache      *mcache
+	// 页缓存
 	pcache      pageCache
 	raceprocctx uintptr
 

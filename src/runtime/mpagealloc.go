@@ -9,7 +9,9 @@
 //
 // Pages are managed using a bitmap that is sharded into chunks.
 // In the bitmap, 1 means in-use, and 0 means free. The bitmap spans the
-// process's address space. Chunks are managed in a sparse-array-style structure
+// process's address space.
+//
+// Chunks are managed in a sparse-array-style structure
 // similar to mheap.arenas, since the bitmap may be large on some systems.
 //
 // The bitmap is efficiently searched by using a radix tree in combination
@@ -33,16 +35,18 @@
 // with each subsequent level representing successively smaller subsections until we
 // reach the finest granularity at the leaves, a chunk.
 //
-// More specifically, each summary in each level (except for leaf summaries)
-// represents some number of entries in the following level. For example, each
+// **More specifically, each summary in each level (except for leaf summaries)
+// represents some number of entries in the following level.
+// For example, each
 // summary in the root level may represent a 16 GiB region of address space,
 // and in the next level there could be 8 corresponding entries which represent 2
 // GiB subsections of that 16 GiB region, each of which could correspond to 8
-// entries in the next level which each represent 256 MiB regions, and so on.
+// entries in the next level which each represent 256 MiB regions, and so on.**
 //
 // Thus, this design only scales to heaps so large, but can always be extended to
 // larger heaps by simply adding levels to the radix tree, which mostly costs
-// additional virtual address space. The choice of managing large arrays also means
+// additional virtual address space.
+// The choice of managing large arrays also means
 // that a large amount of virtual address space may be reserved by the runtime.
 
 package runtime
@@ -50,35 +54,48 @@ package runtime
 import (
 	"unsafe"
 )
-
+// 16GB -> 2GB -> 256MB -> 32MB ->4MB(leaf)
 const (
 	// The size of a bitmap chunk, i.e. the amount of bits (that is, pages) to consider
 	// in the bitmap at once.
+	//
+	// 一个chunk包含多少页
+	// 2^9 512页
 	pallocChunkPages    = 1 << logPallocChunkPages
+	// 一个chunk表示的页大大小为：4M
 	pallocChunkBytes    = pallocChunkPages * pageSize
+	//
 	logPallocChunkPages = 9
+	//
 	logPallocChunkBytes = logPallocChunkPages + pageShift
 
 	// The number of radix bits for each level.
 	//
 	// The value of 3 is chosen such that the block of summaries we need to scan at
 	// each level fits in 64 bytes (2^3 summaries * 8 bytes per summary), which is
-	// close to the L1 cache line width on many systems. Also, a value of 3 fits 4 tree
+	// close to the L1 cache line width on many systems.
+	// Also, a value of 3 fits 4 tree
 	// levels perfectly into the 21-bit pallocBits summary field at the root level.
 	//
+	// 16GB = 2^34  21bit+13bit 2^34字节。
+	//
 	// The following equation explains how each of the constants relate:
+	// 14 + (5-1)*3 + 22  = 48
 	// summaryL0Bits + (summaryLevels-1)*summaryLevelBits + logPallocChunkBytes = heapAddrBits
 	//
 	// summaryLevels is an architecture-dependent value defined in mpagealloc_*.go.
 	summaryLevelBits = 3
-	summaryL0Bits    = heapAddrBits - logPallocChunkBytes - (summaryLevels-1)*summaryLevelBits
+	// summaryL0Bits = 14
+	summaryL0Bits  = heapAddrBits - logPallocChunkBytes - (summaryLevels-1)*summaryLevelBits
 
 	// pallocChunksL2Bits is the number of bits of the chunk index number
 	// covered by the second level of the chunks map.
 	//
 	// See (*pageAlloc).chunks for more details. Update the documentation
 	// there should this change.
+	// 48 - 22 - 13 = 13
 	pallocChunksL2Bits  = heapAddrBits - logPallocChunkBytes - pallocChunksL1Bits
+	// 13
 	pallocChunksL1Shift = pallocChunksL2Bits
 )
 
@@ -102,17 +119,23 @@ type chunkIdx uint
 
 // chunkIndex returns the global index of the palloc chunk containing the
 // pointer p.
+//
+// 根据地址p，返回其所属的chunk的编号从0开始。
 func chunkIndex(p uintptr) chunkIdx {
+	// pallocChunkBytes 0x400000 2^22 4MB
 	return chunkIdx((p - arenaBaseOffset) / pallocChunkBytes)
 }
 
 // chunkBase returns the base address of the palloc chunk at index ci.
+// 这个chunk的起始地址。
 func chunkBase(ci chunkIdx) uintptr {
 	return uintptr(ci)*pallocChunkBytes + arenaBaseOffset
 }
 
 // chunkPageIndex computes the index of the page that contains p,
 // relative to the chunk which contains p.
+//
+// 在这个chunk中，p所在的页的偏移量，相对于这个chunk的起始页而言。
 func chunkPageIndex(p uintptr) uint {
 	return uint(p % pallocChunkBytes / pageSize)
 }

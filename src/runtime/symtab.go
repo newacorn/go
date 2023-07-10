@@ -559,6 +559,7 @@ func modulesinit() {
 			scanBSSSize := md.ebss - md.bss
 			md.gcbssmask = progToPointerMask((*byte)(unsafe.Pointer(md.gcbss)), scanBSSSize)
 			gcController.addGlobals(int64(scanDataSize + scanBSSSize))
+			println("scanDataSize+scanBSSSize: ",scanDataSize + scanBSSSize)
 		}
 	}
 

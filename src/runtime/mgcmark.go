@@ -93,6 +93,7 @@ func gcMarkRootPrepare() {
 	// Snapshot allArenas as markArenas. This snapshot is safe because allArenas
 	// is append-only.
 	mheap_.markArenas = mheap_.allArenas[:len(mheap_.allArenas):len(mheap_.allArenas)]
+	// arena的数量*(8192 / 512 = 16)
 	work.nSpanRoots = len(mheap_.markArenas) * (pagesPerArena / pagesPerSpanRoot)
 
 	// Scan stacks.
@@ -105,6 +106,10 @@ func gcMarkRootPrepare() {
 	work.nStackRoots = len(work.stackRoots)
 
 	work.markrootNext = 0
+
+	// fixedRootCount = 2 表示下面两个root
+	// fixedRootFinalizers  = 0 root0
+	// fixedRootFreeGStacks  = 0 root1
 	work.markrootJobs = uint32(fixedRootCount + work.nDataRoots + work.nBSSRoots + work.nSpanRoots + work.nStackRoots)
 
 	// Calculate base indexes of each root type
@@ -160,7 +165,7 @@ var oneptrmask = [...]uint8{1}
 //
 //go:nowritebarrier
 func markroot(gcw *gcWork, i uint32, flushBgCredit bool) int64 {
-	println("mark root")
+	//println("mark root")
 	// Note: if you add a case here, please also update heapdump.go:dumproots.
 	var workDone int64
 	var workCounter *atomic.Int64
@@ -190,6 +195,7 @@ func markroot(gcw *gcWork, i uint32, flushBgCredit bool) int64 {
 
 	case work.baseSpans <= i && i < work.baseStacks:
 		// mark mspan.specials
+		// 范围 [0,len([]arena)*16)
 		markrootSpans(gcw, int(i-work.baseSpans))
 
 	default:
@@ -319,6 +325,12 @@ func markrootFreeGStacks() {
 
 // markrootSpans marks roots for one shard of markArenas.
 //
+// shard 范围 [0,len([]arena;arena的总数)*16)
+// markrootSpans 处理所有mspan关联的specials（其实只处理了 finalizer special)。
+// 一次调用处理512个页面，对应一个 shard。
+// 根据 heapArena.pageSpecials 位图，来确定哪个页面包含设置了specials的mspan，栽进一步的
+// 找到这个 mspan，然后通过 mspan.specials ，找到 finalizer special。
+//
 //go:nowritebarrier
 func markrootSpans(gcw *gcWork, shard int) {
 	// Objects with finalizers have two GC-related invariants:
@@ -333,20 +345,30 @@ func markrootSpans(gcw *gcWork, shard int) {
 	sg := mheap_.sweepgen
 
 	// Find the arena and page index into that arena for this shard.
+	// shard / 16
+	// 16个shard 对应一个arena。
 	ai := mheap_.markArenas[shard/(pagesPerArena/pagesPerSpanRoot)]
 	ha := mheap_.arenas[ai.l1()][ai.l2()]
+	// arenaPage 是 0、512、1024... 15*512 (共16组)
+	// 每次处理 512个页面。
 	arenaPage := uint(uintptr(shard) * pagesPerSpanRoot % pagesPerArena)
 
 	// Construct slice of bitmap which we'll iterate over.
 	specialsbits := ha.pageSpecials[arenaPage/8:]
+	// 512/8 因为一个 specialsbits 元素对应8个页面。
 	specialsbits = specialsbits[:pagesPerSpanRoot/8]
+	// 现在 specialsbits 为512个连续页面对应的 specialsbits位图。
+	// 长度为64。
 	for i := range specialsbits {
 		// Find set bits, which correspond to spans with specials.
 		specials := atomic.Load8(&specialsbits[i])
+		// specials 对应8个页面的位图。
 		if specials == 0 {
 			continue
 		}
+		// 循环找到这8个页面哪个页面对应的special位设置了。
 		for j := uint(0); j < 8; j++ {
+			// 1<<j 掩码
 			if specials&(1<<j) == 0 {
 				continue
 			}
@@ -356,15 +378,20 @@ func markrootSpans(gcw *gcWork, shard int) {
 			// specials implies that the span is in-use, and since we're
 			// currently marking we can be sure that we don't have to worry
 			// about the span being freed and re-used.
+			//
+			// arenaPage+uint(i)*8+j表示当前页在mspan中的偏移量
 			s := ha.spans[arenaPage+uint(i)*8+j]
+			// s是页所在的mspan，此mspan包含special。
 
 			// The state must be mSpanInUse if the specials bit is set, so
 			// sanity check that.
 			if state := s.state.get(); state != mSpanInUse {
+				// mSpanInUse 类型的msapn才可能关联 specials。
 				print("s.state = ", state, "\n")
 				throw("non in-use span found with specials bit set")
 			}
 			// Check that this span was swept (it may be cached or uncached).
+			// 状态校验。
 			if !useCheckmark && !(s.sweepgen == sg || s.sweepgen == sg+3) {
 				// sweepgen was updated (+2) during non-checkmark GC pass
 				print("sweep ", s.sweepgen, " ", sg, "\n")
@@ -378,16 +405,35 @@ func markrootSpans(gcw *gcWork, shard int) {
 				if sp.kind != _KindSpecialFinalizer {
 					continue
 				}
+				// 只考虑 _KindSpecialFinalizer 类型的specials。
+				//
 				// don't mark finalized object, but scan it so we
 				// retain everything it points to.
+				//
+				// 将 *special 转换成具体的special类型。
 				spf := (*specialfinalizer)(unsafe.Pointer(sp))
 				// A finalizer can be set for an inner byte of an object, find object beginning.
 				p := s.base() + uintptr(spf.special.offset)/s.elemsize*s.elemsize
+				// p 是 finalizer 关联的对象的地址所在的object的起始地址。
+				// 可能是 runtime.SetFinalizer 函数的第一个参数的值。
+				// 因为有可能 runtime.SetFinalizer 监视的是一个 tiny分配的小对象，这时允许
+				// 这个对象的起始地址不是一个 maspan 的object的起始地址。
 
 				// Mark everything that can be reached from
 				// the object (but *not* the object itself or
 				// we'll never collect it).
 				if !s.spanclass.noscan() {
+					//
+					// 扫描p指向的对象。
+					// 但不标记p本身，因为想要将关联的 finalizer 得到调用，
+					// 必须不能在这里标记其监视的对象，如果这个对象别处没有被引用本轮GC标记结束，
+					// 它就不会被标记，其关联的finalizer函数就会得到处理，如果在这里标记了，
+					// GC会认为其还存在引用，所以不会处理 finalizer，所以此对象永远不会被回收。
+					// finalizer也不会得到执行。
+					//
+					// GC标记结束后在清扫阶段，发现被清扫的mspan有关联的finalizer specials时会构建finalizer执行体放入指定的
+					// goroutine中执行，在放入时会将object标记，因为finalizer内部可能会通过
+					// 参数取访问obj本身。
 					scanobject(p, gcw)
 				}
 
@@ -406,10 +452,14 @@ func markrootSpans(gcw *gcWork, shard int) {
 func gcAssistAlloc(gp *g) {
 	// Don't assist in non-preemptible contexts. These are
 	// generally fragile and won't allow the assist to block.
+	// 如果当前调用环境不可抢占，立刻返回。
 	if getg() == gp.m.g0 {
+		// 位于g0不可抢占。
 		return
 	}
 	if mp := getg().m; mp.locks > 0 || mp.preemptoff != "" {
+		// 当前m有锁不可抢占，或者 m.preemptoff 不为空
+		// 都不能被抢占。
 		return
 	}
 
@@ -427,12 +477,31 @@ retry:
 	// balance positive. When the required amount of work is low,
 	// we over-assist to build up credit for future allocations
 	// and amortize the cost of assisting.
+	//
+	// assistWorkPerByte和assistBytesPerWork 这两者表示的都是比率，
+	// 实际的内存分配和扫描不可能都是一字节一字节的。它们都是
+	// 在每轮GC开始时被计算好，并且会随着堆扫描的进度一起更新。
+	//
+	// 在 mallocgc 函数中，因为 gp.gcAssistBytes<0，所以调用了
+	// gcAssistAlloc，由此负责额度就是 gp.gcAssistBytes的绝对值。
+	// 预期扫描的大小等于 debtBytes*assistWorkPerByte，如果结果
+	// 小于 gcOverAssistWork，就取 gcOverAssistWork 的值，该值目前被
+	// 定义为64KB。也就是至少扫描64KB空间，这样可以避免多次执行而实际产出
+	// 过少，就像线程切换频繁造成整体的吞吐量底下。
+	//
+	// assistWorkPerByte 表示每分配一字节内存空间应该相应地做多少扫描工作。
 	assistWorkPerByte := gcController.assistWorkPerByte.Load()
+	// assistBytesPerWork 完成一字节的扫描工作后可以分配多大的内存空间。
 	assistBytesPerWork := gcController.assistBytesPerWork.Load()
+
 	debtBytes := -gp.gcAssistBytes
+	// debtBytes 现在是正值了，因为 gp.gcAssistBytes 小于0。
 	scanWork := int64(assistWorkPerByte * float64(debtBytes))
+	// scanWork 表示需要扫描的工作量。
 	if scanWork < gcOverAssistWork {
+		// 如果小于64KB，纠正为 gcOverAssistWork
 		scanWork = gcOverAssistWork
+		// 相应地更新 debtBytes
 		debtBytes = int64(assistBytesPerWork * float64(scanWork))
 	}
 
@@ -442,21 +511,35 @@ retry:
 	// will just cause steals to fail until credit is accumulated
 	// again, so in the long run it doesn't really matter, but we
 	// do have to handle the negative credit case.
+	//
+	// 后台工作协程执行扫描任务积累的信用值会被累加到 gcController.bgScanCredit
+	// 字段，如果该值的大小足够抵消本次 scanWork，则当前协程就不用
+	// 实际去执行扫描任务了。
 	bgScanCredit := gcController.bgScanCredit.Load()
 	stolen := int64(0)
 	if bgScanCredit > 0 {
+		// 可以窃取
 		if bgScanCredit < scanWork {
+			// 全部窃取
 			stolen = bgScanCredit
+			// gcAssistAlloc 现在应该还是个负值。
 			gp.gcAssistBytes += 1 + int64(assistBytesPerWork*float64(stolen))
 		} else {
+			// 部分窃取
 			stolen = scanWork
+			// gc.gcAssistBytes 现在应该等于0
+			// 如果向上对齐了gcOverAssistWork，gp.gcAssistBytes 就会是个正值
 			gp.gcAssistBytes += debtBytes
 		}
+		// 减去被窃取的
 		gcController.bgScanCredit.Add(-stolen)
 
+		// 使用窃取到的工作量来抵消scanWork，scanWork保存差值。
 		scanWork -= stolen
 
 		if scanWork == 0 {
+			// 完整窃取，不用执行辅助扫描了，直接返回。
+			//
 			// We were able to steal all of the credit we
 			// needed.
 			if traced {
@@ -473,6 +556,12 @@ retry:
 
 	// Perform assist work
 	systemstack(func() {
+		// 执行辅助标记任务，在g0栈上执行。
+		// 开始执行辅助标记时会将g的状态切换到 _Gwaiting，
+		// 设置等待原因 g.waitreson = waitReasonGCAssistMarking。
+		// 执行完成后回到用户g。
+		//
+		// scanWork 任务量。
 		gcAssistAlloc1(gp, scanWork)
 		// The user stack may have moved, so this can't touch
 		// anything on it until it returns from systemstack.
@@ -484,6 +573,7 @@ retry:
 		gcMarkDone()
 	}
 
+	// 辅助扫描并未完成 scanWork 指定的任务量。
 	if gp.gcAssistBytes < 0 {
 		// We were unable steal enough credit or perform
 		// enough work to pay off the assist debt. We need to
@@ -492,8 +582,12 @@ retry:
 		//
 		// If this is because we were preempted, reschedule
 		// and try some more.
+		//
+		// 如果g当前被抢占，则挂起然后放入全局队列中，
+		// 后执行schdule 。
 		if gp.preempt {
 			Gosched()
+			// 得到调度后继续这里执行。
 			goto retry
 		}
 
@@ -506,6 +600,10 @@ retry:
 		// there wasn't enough work to do anyway, so we might
 		// as well let background marking take care of the
 		// work that is available.
+		//
+		// 停靠到 assist queue，后台标记worker在将 credit 冲刷到
+		// gcController.bgScanCredit 前，
+		// 用 credit 给停靠的g的gcAssistBytes买单，试图唤醒队列中停靠的g。
 		if !gcParkAssist() {
 			goto retry
 		}
@@ -617,9 +715,15 @@ func gcWakeAllAssists() {
 	injectglist(&list)
 	unlock(&work.assistQueue.lock)
 }
-
-// gcParkAssist puts the current goroutine on the assist queue and parks.
+// gcParkAssist() 只被 gcAssistAlloc() 函数所调用。
+// 尝试停靠到 work.assistQueue，等待 gc work 帮其偿还assistBytes(此时为负值，因为从内存分配来到这里)并唤醒。
+// 以下情况会返回true：
+// 1. GC标记阶段已完成。
+// 2. 停靠到 work.assistQueue，被 work 唤醒之前会使用bgScanCredit帮其偿还 gp.assistBytes，唤醒后返回flase。
+// 以下情况会返回flase：
+// 1. 当检测到 gcController.bgScanCredit.Load() > 0 时说明 bgScanCredit 又有信用可窃取。
 //
+// gcParkAssist puts the current goroutine on the assist queue and parks.
 // gcParkAssist reports whether the assist is now satisfied. If it
 // returns false, the caller must retry the assist.
 func gcParkAssist() bool {
@@ -634,6 +738,8 @@ func gcParkAssist() bool {
 
 	gp := getg()
 	oldList := work.assistQueue.q
+	// 只在 oldList.tail != 0 的情况下下面的pushBack才会对
+	// oldList 产生影响。
 	work.assistQueue.q.pushBack(gp)
 
 	// Recheck for background credit now that this G is in
@@ -643,6 +749,8 @@ func gcParkAssist() bool {
 	if gcController.bgScanCredit.Load() > 0 {
 		work.assistQueue.q = oldList
 		if oldList.tail != 0 {
+			// 如果 oldList.tail 不等于0说明上面执行 pushBack(gp)的时候将
+			// gp 设置成了 odlList.tail.schedlink 所以需要清除。
 			oldList.tail.ptr().schedlink.set(nil)
 		}
 		unlock(&work.assistQueue.lock)
@@ -1215,11 +1323,17 @@ func gcDrainN(gcw *gcWork, scanWork int64) int64 {
 //
 // If stk != nil, possible stack pointers are also reported to stk.putPtr.
 //
+// 参数：
+// b0   起始地址
+// n0   从b0起应扫描的字节数
+// ptrmask 指针/标量 位图，一个位对应一个字节 （1表示是指针，0表示标量）
+//
 //go:nowritebarrier
 func scanblock(b0, n0 uintptr, ptrmask *uint8, gcw *gcWork, stk *stackScanState) {
 	// Use local copies of original parameters, so that a stack trace
 	// due to one of the throws below shows the original block
 	// base and extent.
+	//println("b0",*(*unsafe.Pointer)(unsafe.Pointer(b0)))
 	b := b0
 	n := n0
 
@@ -1227,22 +1341,36 @@ func scanblock(b0, n0 uintptr, ptrmask *uint8, gcw *gcWork, stk *stackScanState)
 		// Find bits for the next word.
 		bits := uint32(*addb(ptrmask, i/(goarch.PtrSize*8)))
 		if bits == 0 {
+			// 检视下8个word
 			i += goarch.PtrSize * 8
 			continue
 		}
+		// j < 8，因为bits只包含8个word的指针位图。
+		// i < n，有可能提前结束，下面的for循环开始时n-i 字节差不一定有64字节。
 		for j := 0; j < 8 && i < n; j++ {
 			if bits&1 != 0 {
+				// 当前word是指针。
+
+
 				// Same work as in scanobject; see comments there.
 				p := *(*uintptr)(unsafe.Pointer(b + i))
+				// p为word的值，即 b+i 地址之上存储的是个地址。
+				// 而我们要找的就是这个指针值。
 				if p != 0 {
+					// p不是一个空指针。
+					// 找到p指向的内存块所属的msapn。
 					if obj, span, objIndex := findObject(p, b, i); obj != 0 {
+						// 标记指针指向的内存块（mspan中的object）
 						greyobject(obj, b, i, span, gcw, objIndex)
 					} else if stk != nil && p >= stk.stack.lo && p < stk.stack.hi {
+						// p指针指向的内存块不属于heap。
 						stk.putPtr(p, false)
 					}
 				}
 			}
+			// 下一个位，右移高位补零。
 			bits >>= 1
+			// 下一个word。
 			i += goarch.PtrSize
 		}
 	}
@@ -1253,12 +1381,22 @@ func scanblock(b0, n0 uintptr, ptrmask *uint8, gcw *gcWork, stk *stackScanState)
 // scanobject consults the GC bitmap for the pointer mask and the
 // spans for the size of the object.
 //
+// b为内存块的起始地址或者oblet的起始地址。
+//
+// 这里b所指向的内存块一般都是已经被 greyobject 标记过的。
+// greyobject 对一个指针所指向的内存块进行标记，如果此内存块所属的mspan不是noscan
+// 会指针添加到 wbuf，然后 scanobject 负责扫描。
+//
+// scanobject 在扫描b所指向的内存块时，如果发现内存块的某处存储的是指针，会提取这个指针
+// 然后 用它来调用 findObject, 然后用 findObject 返回值调用 greyobject 进行标记。
+//
 //go:nowritebarrier
 func scanobject(b uintptr, gcw *gcWork) {
 	// Prefetch object before we scan it.
 	//
 	// This will overlap fetching the beginning of the object with initial
 	// setup before we start scanning the object.
+	// 指示CPU预加载地址处的内容到CPU高速缓存。
 	sys.Prefetch(b)
 
 	// Find the bits for b and the size of the object at b.
@@ -1267,6 +1405,7 @@ func scanobject(b uintptr, gcw *gcWork) {
 	// is the size of the object to scan, or it points to an
 	// oblet, in which case we compute the size to scan below.
 	s := spanOfUnchecked(b)
+	// s为b所指对象所在mspan
 	n := s.elemsize
 	if n == 0 {
 		throw("scanobject n == 0")
@@ -1278,14 +1417,29 @@ func scanobject(b uintptr, gcw *gcWork) {
 	}
 
 	if n > maxObletBytes {
+		// 大于 128KB，分割扫描。
+		//
 		// Large object. Break into oblets for better
 		// parallelism and lower latency.
 		if b == s.base() {
+			// It's possible this is a noscan object (not
+			// from greyobject, but from other code
+			// paths), in which case we must *not* enqueue
+			// oblets since their bitmaps will be
+			// uninitialized.
+			if s.spanclass.noscan() {
+				// Bypass the whole scan.
+				gcw.bytesMarked += uint64(n)
+				return
+			}
+
 			// Enqueue the other oblets to scan later.
 			// Some oblets may be in b's scalar tail, but
 			// these will be marked as "no more pointers",
 			// so we'll drop out immediately when we go to
 			// scan those.
+			//
+			// 不包括第一个 oblet，第一个下面会被扫描。
 			for oblet := b + maxObletBytes; oblet < s.base()+s.elemsize; oblet += maxObletBytes {
 				if !gcw.putFast(oblet) {
 					gcw.put(oblet)
@@ -1300,6 +1454,7 @@ func scanobject(b uintptr, gcw *gcWork) {
 		if n > maxObletBytes {
 			n = maxObletBytes
 		}
+		// n是oblet(分段)的大小128KB
 	}
 
 	hbits := heapBitsForAddr(b, n)
@@ -1319,11 +1474,17 @@ func scanobject(b uintptr, gcw *gcWork) {
 
 		// Work here is duplicated in scanblock and above.
 		// If you make changes here, make changes there too.
+		// bj 为地址b上存储的值，一个指针大小。
 		obj := *(*uintptr)(unsafe.Pointer(addr))
 
 		// At this point we have extracted the next potential pointer.
 		// Quickly filter out nil and pointers back to the current object.
+		//
+		// obj-b 是两个地址差，递增的。如果<n，表示obj指向这个要扫描的对象某个部分。
 		if obj != 0 && obj-b >= n {
+			// 排除 nil指针
+			// 排除指针指向了这个addr所在obj(mspan中的一个内存块)的某个位置。
+			//
 			// Test if obj points into the Go heap and, if so,
 			// mark the object.
 			//
@@ -1333,12 +1494,20 @@ func scanobject(b uintptr, gcw *gcWork) {
 			// heap. In this case, we know the object was
 			// just allocated and hence will be marked by
 			// allocation itself.
+			//
+			// 如果 obj 所指的位置属于一个mspn则返回相关信息。
 			if obj, span, objIndex := findObject(obj, b, addr-b); obj != 0 {
+				// 返回的obj 是参数obj所指的内容在其所在的mspn内的内存块(object)的起始地址。
+				// span 表示参数obj所指的内存块所在的 mspan。
+				// objIndex 表示参数obj所在内存块在mspan中的索引。
 				greyobject(obj, b, addr-b, span, gcw, objIndex)
 			}
 		}
 	}
+	// n为整个elemsize大小或者整个 oblet 大小。
 	gcw.bytesMarked += uint64(n)
+	// i表示扫描的字节数，因为某个字节对应的扫描/终止位暗示后面没有指针
+	// 会提前跳出。
 	gcw.heapScanWork += int64(scanSize)
 }
 
@@ -1458,9 +1627,14 @@ func shade(b uintptr) {
 //go:nowritebarrierrec
 func greyobject(obj, base, off uintptr, span *mspan, gcw *gcWork, objIndex uintptr) {
 	// obj should be start of allocation, and so must be at least pointer-aligned.
+	//
+	// 校验对象地址是不是按照指针对齐的，内存分配的时候已经知道各种 sizeclass的obsize都是8的
+	// 整数倍。
 	if obj&(goarch.PtrSize-1) != 0 {
 		throw("greyobject: obj not pointer-aligned")
 	}
+	// 通过对象内存块在mspan中的索引objIndex定位到在gcmarkBits中对应的二进制位，
+	// 如果已经标记过了就直接返回，如果未标记就进行标记。
 	mbits := span.markBitsForIndex(objIndex)
 
 	if useCheckmark {
@@ -1478,20 +1652,34 @@ func greyobject(obj, base, off uintptr, span *mspan, gcw *gcWork, objIndex uintp
 		}
 
 		// If marked we have nothing to do.
+		//
+		// 如果已经标记过了，直接返回。
+		// 此时这个obj就是一个黑色的了。
 		if mbits.isMarked() {
 			return
 		}
+
+		// 将此对象对应gcmarkBits中的位设置为1。
 		mbits.setMarked()
 
 		// Mark span.
 		arena, pageIdx, pageMask := pageIndexOf(span.base())
+		// arena 表示obj 所在的 arena 的元数据对象 heapArena
+		// pageIdx 表示obj所在页在 pageInUse 中对应的二进制位所属的
+		// 		   uint8 在 PageInUse 中的索引。
+		// pageMask 表示obj所在的页对应的位在uint8中的偏移。
 		if arena.pageMarks[pageIdx]&pageMask == 0 {
+			// obj所在的页对应的 pageMask 位 没有标记
+			// 所以在这里需要标记。
 			atomic.Or8(&arena.pageMarks[pageIdx], pageMask)
 		}
 
 		// If this is a noscan object, fast-track it to black
 		// instead of greying it.
+		// 如果 obj 所在的 mspan 归属的 spanclass 是 noscan
+		// 表示包含的都是标量，所以直接返回，不用再对其扫描。
 		if span.spanclass.noscan() {
+			// 更新全局的 bytesMarked
 			gcw.bytesMarked += uint64(span.elemsize)
 			return
 		}
@@ -1503,6 +1691,8 @@ func greyobject(obj, base, off uintptr, span *mspan, gcw *gcWork, objIndex uintp
 	// some benefit on platforms with inclusive shared caches.
 	sys.Prefetch(obj)
 	// Queue the obj for scanning.
+	// 因为obj所指的内存块包含指针，虽然已经完成了标记
+	// 但需要继续扫描。被放入到 gcw 的wbuf1 队列。
 	if !gcw.putFast(obj) {
 		gcw.put(obj)
 	}
