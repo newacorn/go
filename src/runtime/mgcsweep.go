@@ -226,6 +226,11 @@ func (a *activeSweep) reset() {
 //
 // The world must be stopped. This ensures there are no sweeps in
 // progress.
+// finishsweep_m() 函数目前只被 gcStart 函数调用。
+// 此函数在 STW 状态下被调用。
+// 1. 执行上一轮GC清扫任务，如果有的话。此函数返回后可以确定上一轮GC清扫任务肯定全部完成。
+// 2. 重置 mcentral 中的 unSwept spanSet 数据结构。
+// 3. 唤醒 scavenger 。
 //
 //go:nowritebarrier
 func finishsweep_m() {
@@ -234,15 +239,24 @@ func finishsweep_m() {
 	// Sweeping must be complete before marking commences, so
 	// sweep any unswept spans. If this is a concurrent GC, there
 	// shouldn't be any spans left to sweep, so this should finish
-	// instantly. If GC was forced before the concurrent sweep
+	// instantly.
+	//
+	// force GC 在执行到这里之前在gcStart函数入口处也会进行下面这样的循环。
+	// 不过当时如果上一轮的清扫工作还未开始呢？那个循环之后整个循环之前开始了，
+	// 就会出现这种情况。
+	// If GC was forced before the concurrent sweep
 	// finished, there may be spans to sweep.
+	//
+	// 因为此时处于STW状态，所以当工作队列中没有任务时便是所有的清扫任务都完成了。
+	// 前提是正在执行 sweepone 的协程不能被抢占。下面的断言也验证了这点。
 	for sweepone() != ^uintptr(0) {
 		sweep.npausesweep++
 	}
 
 	// Make sure there aren't any outstanding sweepers left.
 	// At this point, with the world stopped, it means one of two
-	// things. Either we were able to preempt a sweeper, or that
+	// things.
+	// Either we were able to preempt a sweeper, or that
 	// a sweeper didn't call sweep.active.end when it should have.
 	// Both cases indicate a bug, so throw.
 	if sweep.active.sweepers() != 0 {
@@ -253,9 +267,17 @@ func finishsweep_m() {
 	// Do this in sweep termination as opposed to mark termination
 	// so that we can catch unswept spans and reclaim blocks as
 	// soon as possible.
+	//
+	// ------------- unSwept spanSet 数据结构重置 -----------
+	// 因为这种 spanSet 中的 mspan 已经在上一轮 sweep 清扫中全部取出[而执行到这里上一轮GC清扫任务肯定全部完成了]，所以这个 spnSet 数据结构可以被安全的重置。
+	// 见 gcStart -> finishsweep_m 函数调用。
+	// GC 还未执行时，也没关系，因为并不向 unSwept spanSet 中存储 mspan ，所以第一轮GC也可以安全重置 unSwept 的 spanSet 数据结构。
+	// -----------------------------------------------------
 	sg := mheap_.sweepgen
 	for i := range mheap_.central {
 		c := &mheap_.central[i].mcentral
+		// 下面两个函数执行之后，它们对应的2个spanset都处于初始状态，
+		// 不包含任何msapn.
 		c.partialUnswept(sg).reset()
 		c.fullUnswept(sg).reset()
 	}
@@ -263,6 +285,8 @@ func finishsweep_m() {
 	// Sweeping is done, so if the scavenger isn't already awake,
 	// wake it up. There's definitely work for it to do at this
 	// point.
+	//
+	// 唤醒 scavenger 协程，按需清理页归还操作系统。
 	scavenger.wake()
 
 	nextMarkBitArenaEpoch()

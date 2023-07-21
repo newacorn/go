@@ -26,7 +26,9 @@ type spanSet struct {
 	//
 	// The spine and all blocks are allocated off-heap, which
 	// allows this to be used in the memory manager and avoids the
-	// need for write barriers on all of these. spanSetBlocks are
+	// need for write barriers on all of these.
+	//
+	// spanSetBlocks are
 	// managed in a pool, though never freed back to the operating
 	// system. We never release spine memory because there could be
 	// concurrent lock-free access and we're likely to reuse it
@@ -48,6 +50,15 @@ type spanSet struct {
 	// span in the heap were stored in this set, and each span were
 	// the minimum size (1 runtime page, 8 KiB), then roughly the
 	// smallest heap which would be unrepresentable is 32 TiB in size.
+	//
+	// 2^32*8KB = 2^45 = 32TiB
+	// 前32位表示head,后32位表示tail。
+	//
+	// 一个 index 索引对应一个 atomicMSpanPointer，通过其可以找到一个mspan的指针。可以认为对应到一个mspan。
+	// 而spine长度中的一个单元指针一个 spanSetBlock 指针【其最多可以包含512个mspan】。也可以认为对应到512个 mspan.
+	//
+	// index 中head和tail表示的区间有多大就对应着多少个 mspan。
+	// spineLen 长度对应 spinLen*512 个mspan。
 	index atomicHeadTailIndex
 }
 
@@ -233,10 +244,14 @@ func (b *spanSet) reset() {
 		print("head = ", head, ", tail = ", tail, "\n")
 		throw("attempt to clear non-empty span set")
 	}
+	// 一个index对应一个atomicMSpanPointer，通过其可以找到一个mspan的指针。
+	// 而spine长度中的一个单元指针一个spanSetBlock指针。
 	top := head / spanSetBlockEntries
 	if uintptr(top) < b.spineLen.Load() {
 		// If the head catches up to the tail and the set is empty,
+		//
 		// we may not clean up the block containing the head and tail
+		//
 		// since it may be pushed into again. In order to avoid leaking
 		// memory since we're going to reset the head and tail, clean
 		// up such a block now, if it exists.
@@ -264,6 +279,7 @@ func (b *spanSet) reset() {
 			spanSetBlockPool.free(block)
 		}
 	}
+	// head 和 tail 都设置为0。
 	b.index.reset()
 	b.spineLen.Store(0)
 }
@@ -272,6 +288,7 @@ func (b *spanSet) reset() {
 //
 // It has the same semantics as atomic.UnsafePointer.
 type atomicSpanSetSpinePointer struct {
+	// a 中可以获取 spanSetSpinePointer.p 的只。
 	a atomic.UnsafePointer
 }
 
@@ -290,6 +307,7 @@ func (s *atomicSpanSetSpinePointer) StoreNoWB(p spanSetSpinePointer) {
 }
 
 // spanSetSpinePointer represents a pointer to a contiguous block of atomic.Pointer[spanSetBlock].
+// 一段连续内存的起始地址，每个指针大小的内存块上都存储着 spanSetBlock 类型的指针。
 type spanSetSpinePointer struct {
 	p unsafe.Pointer
 }

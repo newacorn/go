@@ -1279,6 +1279,8 @@ func D(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	// 让GC标记新分配的对象。
 	if gcphase != _GCoff {
 		// 只有在GC标记阶段才能标记新分配的对象。
+		// gcmarknewobject marks a newly allocated object black. obj must
+		// not contain any non-nil pointers.
 		gcmarknewobject(span, uintptr(x), size)
 	}
 
@@ -1344,10 +1346,12 @@ func D(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	}
 
 	if shouldhelpgc {
+		/*
 		if dataSize==8&&size==16&&typ.string()=="main.B"{
 			//println(typ.kind)
 			Shouldhelp.Add(1)
 		}
+		 */
 		// 如果内存是从mcentral 处申请的，或者直接从分配的是页shouldhelpgc 为true。
 		// 执行检测操作如果达到GC触发条件就发起GC。
 		if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {

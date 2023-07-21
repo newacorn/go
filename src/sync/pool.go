@@ -46,6 +46,12 @@ import (
 // a call to Get returning that same value x.
 // Similarly, a call to New returning x “synchronizes before”
 // a call to Get returning that same value x.
+//
+// 每个 Pool 实例关联一个 local pool 和 victim pool 缓存池。 通过 Pool.New 函数创建的对象会放在
+// local pool 缓存池中，但取对象从 victim pool 缓冲池取缓存对象。
+// 在每轮 GC 开始，标记终止阶段STW阶段 victim pool 中的一些字段重置， local pool 中的对应字段值会
+// 赋值给 victim pool 中对应的字段。这样一来在标记阶段原本victim pool中的缓存对象因为没有了引用而不
+// 会被标记，在清扫阶段会被清扫。
 type Pool struct {
 	noCopy noCopy
 
@@ -232,7 +238,9 @@ func (p *Pool) pinSlow() (*poolLocal, int) {
 	runtime_StoreReluintptr(&p.localSize, uintptr(size))     // store-release
 	return &local[pid], pid
 }
-
+// poolCleanup，
+// 使用 local pool 替换 victim pool。 victim pool 中的一些字段被重置。
+// 此函数被赋值给 runtime.poolcleanup ，并只在 runtime.clearpools 函数中调用。
 func poolCleanup() {
 	// This function is called with the world stopped, at the beginning of a garbage collection.
 	// It must not allocate and probably should not call any runtime functions.
@@ -282,8 +290,11 @@ func indexLocal(l unsafe.Pointer, i int) *poolLocal {
 }
 
 // Implemented in runtime.
+// runtime.sync_runtime_registerPoolCleanup
 func runtime_registerPoolCleanup(cleanup func())
+// runtime.sync_runtime_procPin
 func runtime_procPin() int
+// runtime.sync_runtime_procUnpin
 func runtime_procUnpin()
 
 // The below are implemented in runtime/internal/atomic and the

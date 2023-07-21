@@ -76,12 +76,19 @@ const (
 
 	// The minimum stack size to allocate.
 	// The hackery here rounds FixedStack0 up to a power of 2.
+	// 2048
 	_FixedStack0 = _StackMin + _StackSystem
+	// 2047
 	_FixedStack1 = _FixedStack0 - 1
+	// 2047
 	_FixedStack2 = _FixedStack1 | (_FixedStack1 >> 1)
+	// 2047
 	_FixedStack3 = _FixedStack2 | (_FixedStack2 >> 2)
+	// 2047
 	_FixedStack4 = _FixedStack3 | (_FixedStack3 >> 4)
+	// 2047
 	_FixedStack5 = _FixedStack4 | (_FixedStack4 >> 8)
+	// 2047
 	_FixedStack6 = _FixedStack5 | (_FixedStack5 >> 16)
 	_FixedStack  = _FixedStack6 + 1 // 2048
 
@@ -90,6 +97,17 @@ const (
 	// in case SP - framesize wraps below zero.
 	// This value can be no bigger than the size of the unmapped
 	// space at zero.
+	//
+	// 第二种栈增长形式的检测，栈大于128小于等于4096字节。
+	// SP - (framesize - _StackSmall <= gp.stackguard0 {
+	//  	goto morestack
+	// }
+	// 减去 _StackSmall 是因为 stackguard0 以下128字节是可以安全使用的。
+	//
+	// 第三种栈增长形式的检测，栈大小大于4096
+	// SP + _StackGuard - gp.stackguard0 < = framesize + _StackGuard - _StackSmall
+	// 两边都加 _StackGuard 是为了防止 SP < gp.stackguard0 时无符号减法地正数的情况。
+	// SP最多之比gp.stackGuard0小于128，而 _StackGuard 是928，左右两边都是正值。
 	_StackBig = 4096
 
 	// The stack guard is a pointer this many bytes above the
@@ -104,6 +122,11 @@ const (
 	// After a stack split check the SP is allowed to be this
 	// many bytes below the stack guard. This saves an instruction
 	// in the checking sequence for tiny frames.
+	//
+	// 第一种形式的栈增长检测形式针对函数栈帧大小不超过 _StackSmall 时，属于较小
+	// 栈帧的情况。只有栈指针SP的位置没有超过 stackguard0 的界限，就不用进行栈
+	// 增长。
+	// SP <= gp.stackguard0 时跳转到栈增长。
 	_StackSmall = 128
 
 	// The maximum number of bytes that a chain of NOSPLIT
@@ -122,6 +145,7 @@ const (
 	stackFromSystem  = 0 // allocate stacks from system memory instead of the heap
 	stackFaultOnFree = 0 // old stacks are mapped noaccess to detect use after free
 	stackPoisonCopy  = 0 // fill stack that should not be accessed with garbage, to detect bad dereferences during copy
+	// runtime 构建时关闭了 stackcache。
 	stackNoCache     = 0 // disable per-P small stack caches
 
 	// check the BP links during traceback.
@@ -157,33 +181,90 @@ const (
 //	order = log_2(size/FixedStack)
 //
 // There is a free list for each order.
+//
+// _NumStackOrders 在Linux平台下位4.
+// 4个数组元素分别用来分配大小为 2KB、4KB、8KB和16KB的栈，更大的栈空间由 stackLarge 来分配。
+// 其链表中的 mspan 通过 mheap.allocManual 从堆中直接分配的一个32KB大小的 mspan。
+// 如果 mspan 用完了，通过 mheap.freeManual 函数回收。
 var stackpool [_NumStackOrders]struct {
+	// item.span 虽然是个链表，但是每次分配时(为空时，或者链表中的mspan已经用完了)，只会从堆
+	// 上请求一个 32KB的 mspan，没有空闲obj的msapn会被回收。所以正常情况下这个链表只会有一个
+	// mspan。
+	// 但当 stackpoolfree 函数被调用时，它会在头部插入一些没有空闲obj的mspan到链表中，然后更新那个
+	// msapn.manualFreeList = 回收栈的起始地址。也就是这样被插入的 msapn 只有一个空闲obj可
+	// 用。且整个回收的mspan不一定是32kB。
 	item stackpoolItem
+	// 用于内存对齐的填充空间。
+	// 填充空间的作用是把整个结构体的大小对齐到平台 Cache Line 的大小，以便最大限度地优化存取速度。
 	_    [(cpu.CacheLinePadSize - unsafe.Sizeof(stackpoolItem{})%cpu.CacheLinePadSize) % cpu.CacheLinePadSize]byte
 }
 
 type stackpoolItem struct {
 	_    sys.NotInHeap
 	mu   mutex
+	// mSpanList 是一个由 mspan 构成的双向链表， mutex 用来保护整个链表，真正的栈内存由链表中的 mspan 来提供。
+	// span 链表中的 mspan 并不是obj为2KB、4KB、8KB和16KB的mspan，而是大小都为32KB的 mspan,然后使用
+	// mspan.manualFreeList 链接。 gclinkptr 可以转换为 gclink 类型，其有一个 gclink.next 字段用于链接下个一个
+	// 内存块。
+	//
+	// 如果链表 span 中不只一个元素的话，只有最后一个 mspan 是手动从堆分配的32KB大小。其他都是通过
+	// stackpoolfree 函数回收的，且只有一个空闲obj被 mspan.manualFreeList 引用。
 	span mSpanList
 }
 
 // Global pool of large stack spans.
+//
+// 在申请栈空间时如果在 stackLarge 对应链表
+// 如果为空，不会像从 stackpool 那样填充后再分配，
+// 而是直接从堆中申请连续的页构成整个mspan。
+//
+// 在栈收缩时或者GC markrootFreeGStacks() ，
+// 回收的栈内存如果大于16KB会被填充到 stackLarge，
+// 这是填充 stackLarge 的唯一方方式。
+//
+// mSpanList 中的每个mspan的 nelems = 1，用整个mspan表示一个栈。
+// 不会像 stackpool 分割成内存块。
 var stackLarge struct {
+	// 由于在实际运行中对大于16KB的栈需求较少，所以这些针对不同大小的链表共用一把锁
+	// 就可以了。
+	// 像 stackpoll 则不然，因为使用频率较高，所以要为每个链表分配一个锁。
 	lock mutex
+	// linux 平台下 heapAddrBits 是48 , pageShit 是13，所以
+	// free字段就是长度为25的 mSpanList 数组。
+	// 下标为0的链表对应_PageSize，用来分配8KB的空间，后续依次翻倍。
+	// 最大支持 2^27KB大小mspan 链表。
+	//
+	// 链表中的都是只有一个obj的mspan，在分配stack时不像其他几种栈缓存
+	// 链表，在链表为空时会进行填充，会先填充再分配。当需要大于等于32KB的
+	// 大小的栈时直接从堆中分配一个mspan返回。
+	//
+	// 其链表的填充来自于 stacfree 函数调用。
 	free [heapAddrBits - pageShift]mSpanList // free lists by log_2(s.npages)
 }
-
+// stackinit() 函数被 schedinit() 函数调用。
+// 此函数会初始化两个用于栈分配的全局对象，一个是栈缓冲池 stackpool ，另一个是专门用来分配大栈
+// 的 stackLarge 。
 func stackinit() {
+	// 校验了 _StackCacheSzie 必须被定义为 _PageSize 的整数倍，并把 stackpool 和 stackLarge
+	// 中的链表都初始化为空链表。
+	// _StackCacheSize 目前大小为 32768
 	if _StackCacheSize&_PageMask != 0 {
 		throw("cache size must be a multiple of page size")
 	}
+	// 小于32KB的栽缓存池。
+	// 数组stackpoll的大小4
 	for i := range stackpool {
+		// 用nil初始化初始双向链表的first和last字段。
 		stackpool[i].item.span.init()
+		// 为每个 stackpoolItem 初始化锁。
 		lockInit(&stackpool[i].item.mu, lockRankStackpool)
 	}
+	// 大于等于32KB的栈缓冲池。
 	for i := range stackLarge.free {
+		// 用nil初始化初始双向链表的first和last字段。
 		stackLarge.free[i].init()
+		// stackLarge 不同大小的栈链表公用一把锁。
+		// 因为大于16KB的栈比较少用。
 		lockInit(&stackLarge.lock, lockRankStackLarge)
 	}
 }
@@ -200,12 +281,21 @@ func stacklog2(n uintptr) int {
 
 // Allocates a stack from the free pool. Must be called with
 // stackpool[order].item.mu held.
+//
+// 先尝试从 stackpool 中取得与目标大小对应的链表，如果链表为空，就从堆上分配一个
+// 大小等于 _StackCacheSize 的maspan，手动将其划分成目标大小的内存块，添加到
+// manualFreeList中，然后把新的 mspan 添加到 stackpool 对应的链表中。
+// 最终栈是从 mspan 中分配的，实际上就是从 manualFreeList 中取出一个内存块，
+// 并增加 allocCount 计数，如果 mspan 已经没有空间了，就把它从 stackpool 中
+// 移除。
 func stackpoolalloc(order uint8) gclinkptr {
 	list := &stackpool[order].item.span
 	s := list.first
 	lockWithRankMayAcquire(&mheap_.lock, lockRankMheap)
 	if s == nil {
 		// no free stacks. Allocate another span worth.
+		//
+		// 分配 32KB>>13 4页大小的mspan
 		s = mheap_.allocManual(_StackCacheSize>>_PageShift, spanAllocStack)
 		if s == nil {
 			throw("out of memory")
@@ -216,42 +306,79 @@ func stackpoolalloc(order uint8) gclinkptr {
 		if s.manualFreeList.ptr() != nil {
 			throw("bad manualFreeList")
 		}
+		// openBsd 平台需要，其它平台此函数为空。
 		osStackAlloc(s)
+		// 2KB << order，就是要申请的栈空间大小。
+		// mspan 按此分割。
 		s.elemsize = _FixedStack << order
 		for i := uintptr(0); i < _StackCacheSize; i += s.elemsize {
+			// x为每个obj起始地址，用每个内存块的第一个字节存储下一个obj的起始地址将
+			// 它们连接起来。
+			// 从地址高的内存块链向地址地的内存块。
+			// s.manualFreeList 执行最后一个内存块的起始地址。
 			x := gclinkptr(s.base() + i)
+			// x.prt().next 设置为上一个内存的起始地址。
 			x.ptr().next = s.manualFreeList
 			s.manualFreeList = x
 		}
+		// 将span插入对应的链表list的头部。
 		list.insert(s)
 	}
 	x := s.manualFreeList
 	if x.ptr() == nil {
 		throw("span has no free stacks")
 	}
+	// 更新 s.manualFreeList，因为我们马上要取出第一个元素。
 	s.manualFreeList = x.ptr().next
 	s.allocCount++
 	if s.manualFreeList.ptr() == nil {
 		// all stacks in s are allocated.
+		// s(mspan)中所有的obj都使用了，可以将其从链表中移除了。
 		list.remove(s)
 	}
 	return x
 }
 
 // Adds stack x to the free pool. Must be called with stackpool[order].item.mu held.
+// stackpoolfree()
+// 目的：
+// 1. 将x所在obj从其所在 mspan 中的计数 mspan.allocCount 中减去。
+// 更新 mspan.manualFreeList = x; x.ptr().next = mspan.manualFreeList
+// ---可能会做的---
+// 2. 如果检测到 mspan.manualFreeList=nil，将其插入到 stackpool 相应的order列表。
+// 3. 如果当前处于 _GCoff 阶段且 mspan.allocCount = 0，将其所占的页回收到堆中。
+//
+// 参数：x: 要回收栈的起始地址，order: 应该被放入数组元素链表时的元素索引。
+// stackpoolfree()函数目前只在系统栈上被调用。
+// 回收的只是一个mspan中的一个obj，其它obj的状态未知。
+// 所以我们只能处理这个obj。
 func stackpoolfree(x gclinkptr, order uint8) {
+	// 计算x地址归属的 mspan。
 	s := spanOfUnchecked(uintptr(x))
+	// 用于给栈分配内存的 mspan state必是 mSpanManual
 	if s.state.get() != mSpanManual {
 		throw("freeing stack not in a stack span")
 	}
 	if s.manualFreeList.ptr() == nil {
+		// s的所有obj都被分配完了，可以将其安全地插入到span。
 		// s will now have a free stack
 		stackpool[order].item.span.insert(s)
 	}
+	// 因为接下来我们会将x表示的栈重用所以需要更新 s.manualFreeList = x
+	// 以便下次分配stack的时候直接使用。
 	x.ptr().next = s.manualFreeList
 	s.manualFreeList = x
+	// 分配计数减一
 	s.allocCount--
 	if gcphase == _GCoff && s.allocCount == 0 {
+		// gcphase必须处于_GCoff 阶段，与栈关联的sudog扫描相关。
+		//
+		// 这里检测是gcphase为_GCoff，在此函数返回之前肯定都是_GCoff，
+		// 因为此函数目前都是在系统栈中执行了，所以不会发生抢占已开启GC。
+		//
+		// 如果x所在obj是最后一个被清除的obj，那么在清除整个obj之后
+		// 整个 mspan 便没有再被任何栈使用了，可以归还给堆了。
+		//
 		// Span is completely free. Return it to the heap
 		// immediately if we're sweeping.
 		//
@@ -274,6 +401,15 @@ func stackpoolfree(x gclinkptr, order uint8) {
 	}
 }
 
+// stackcacherefill()，目前只被 stackalloc 函数所调用。
+// 目的：
+// 用于初始化p stack cache。
+// 给 mcache.stackcache[order] 赋值的链表总大小为16KB。
+//
+// 参数：
+// c: 链表赋值的目标所在的 mcache。
+// order: 定位到list对应的栈链表种类。
+//
 // stackcacherefill/stackcacherelease implement a global pool of stack segments.
 // The pool is required to prevent unlimited growth of per-thread caches.
 //
@@ -299,6 +435,9 @@ func stackcacherefill(c *mcache, order uint8) {
 	c.stackcache[order].size = size
 }
 
+// stackcacherelease()函数目前只在 stackfree()函数中被调用。
+//
+// 链表中全部栈的大小不能超过16KB，多余的栈释放到 stackpool 中。
 //go:systemstack
 func stackcacherelease(c *mcache, order uint8) {
 	if stackDebug >= 1 {
@@ -342,6 +481,12 @@ func stackcache_clear(c *mcache) {
 // stackalloc must run on the system stack because it uses per-P
 // resources and must not split the stack.
 //
+// stackalloc()函数在 gfget 、 malg 和 copystack 中被调用。
+//
+// 参数：
+// n: 表示要分配的栈空间大小，它必须是2的幂。返回的 stack 结构用来表示
+// 分配的栈空间， hi 字段是告地状，也就是栈空间的上界，lo表示空间下界。
+//
 //go:systemstack
 func stackalloc(n uint32) stack {
 	// Stackalloc must be called on scheduler stack, so that we
@@ -351,6 +496,7 @@ func stackalloc(n uint32) stack {
 	if thisg != thisg.m.g0 {
 		throw("stackalloc not on scheduler stack")
 	}
+	// n必须是2的整数幂运算后的结果。
 	if n&(n-1) != 0 {
 		throw("stack size not a power of 2")
 	}
@@ -370,58 +516,99 @@ func stackalloc(n uint32) stack {
 	// Small stacks are allocated with a fixed-size free-list allocator.
 	// If we need a stack of a bigger size, we fall back on allocating
 	// a dedicated span.
+	//
+	// v 存储的是分配栈的起始地址
 	var v unsafe.Pointer
 	if n < _FixedStack<<_NumStackOrders && n < _StackCacheSize {
+		// n < (2048<<4=32KB) && n < 32KB
+		// order 为数组的索引，对应的元素是包含n大小栈的链表。
 		order := uint8(0)
 		n2 := n
+		// order = log2(n2/_FixedStack)
+		// 2kB order=0
+		// 4KB order=1
+		// 8KB order=2
+		// 16KB order=3
 		for n2 > _FixedStack {
 			order++
 			n2 >>= 1
 		}
+
+		// 分配栈的起始地址。
 		var x gclinkptr
+		// 下面几种情况不允许使用 p.stackcache，转而从stackpool中分配，会产生并发问题：
+		// 1. runtime 构建时关闭了 stackNoCache。
+		// 2. this.m.p 没有p自然无法使用stachCache。
+		// 3. GC正在运行时。
 		if stackNoCache != 0 || thisg.m.p == 0 || thisg.m.preemptoff != "" {
 			// thisg.m.p == 0 can happen in the guts of exitsyscall
 			// or procresize. Just get a stack from the global pool.
 			// Also don't touch stackcache during gc
 			// as it's flushed concurrently.
 			lock(&stackpool[order].item.mu)
+			// 从全局 stackpool 中分配。
 			x = stackpoolalloc(order)
 			unlock(&stackpool[order].item.mu)
 		} else {
+			// 从 p.mcache.stackcace 中分配。
 			c := thisg.m.p.ptr().mcache
 			x = c.stackcache[order].list
 			if x.ptr() == nil {
+				// 第一次就会是nil。
+				//
+				// 如果本地缓存为空，从全局 stackpool 分配 (16KB/2048<<order)个栈，然后将其链接
+				// 起来赋值给 c.stackcache[order].list。
+				//
+				// 不同order链表中包含的栈数量：
+				// order=0，分配8个
+				// order=1，分配4个
+				// order=2,分配2个
+				// order=3,分配1个
 				stackcacherefill(c, order)
+				// x为链表的首部
 				x = c.stackcache[order].list
 			}
+			// 移动链表的起始位置。
+			// 即x指向的内存块的第地址大小内存块上存储的值
 			c.stackcache[order].list = x.ptr().next
+			// 更新链表还剩多少字节。
 			c.stackcache[order].size -= uintptr(n)
 		}
 		v = unsafe.Pointer(x)
 	} else {
+		// 栈大小大于等于32KB
 		var s *mspan
+		// _PageShift = 13
 		npage := uintptr(n) >> _PageShift
+		// npage 表示n的大小是 pageSize(8KB) 的几倍。
 		log2npage := stacklog2(npage)
-
+		// log2npage 表示 stackLarge 中n大小的内存块链表所在的索引。
+		// 0-25 索引0处存储的8KB链表，索引log2npage处存储的是 2^log2npage * 8KB 大小内存块的链表。
 		// Try to get a stack from the large stack cache.
 		lock(&stackLarge.lock)
 		if !stackLarge.free[log2npage].isEmpty() {
+			// stackLarge 对应大小的栈链不为空。
 			s = stackLarge.free[log2npage].first
 			stackLarge.free[log2npage].remove(s)
 		}
 		unlock(&stackLarge.lock)
 
+		// 空函数。
 		lockWithRankMayAcquire(&mheap_.lock, lockRankMheap)
 
 		if s == nil {
+			// 对应链表为空
 			// Allocate a new stack from the heap.
+			// 尝试直接从 arena 中分配。
 			s = mheap_.allocManual(npage, spanAllocStack)
 			if s == nil {
 				throw("out of memory")
 			}
 			osStackAlloc(s)
+			// 整个mspan表表示一个栈空间。
 			s.elemsize = uintptr(n)
 		}
+		// v就是mspan的起始地址。
 		v = unsafe.Pointer(s.base())
 	}
 
@@ -437,19 +624,27 @@ func stackalloc(n uint32) stack {
 	if stackDebug >= 1 {
 		print("  allocated ", v, "\n")
 	}
+	// 左和右开
 	return stack{uintptr(v), uintptr(v) + uintptr(n)}
 }
 
 // stackfree frees an n byte stack allocation at stk.
+// 只有权回收 stk 表示内存块，而不是其所在的整个 mspan。
 //
+// 根据栈大小和GC状态，分别回收到 mcache.stackcache 、 stackpool 和
+// stackLarge 或者释放到堆。
+// 参数：stk，包含了栈的起始和结束地址信息，左闭右开区间。
 // stackfree must run on the system stack because it uses per-P
 // resources and must not split the stack.
 //
 //go:systemstack
 func stackfree(stk stack) {
 	gp := getg()
+	// v 要回收的内存块(obj)起始地址。
 	v := unsafe.Pointer(stk.lo)
+	// n 要回收的内存块(obj)的大小。
 	n := stk.hi - stk.lo
+	// 大小必须是2的整数幂的结果。
 	if n&(n-1) != 0 {
 		throw("stack not a power of 2")
 	}
@@ -475,19 +670,24 @@ func stackfree(stk stack) {
 		asanpoison(v, n)
 	}
 	if n < _FixedStack<<_NumStackOrders && n < _StackCacheSize {
+		// n< 2048<<4 && n<32KB = n<32KB
+		// 这个大小的 stk 要么回收到 p.stackcache，要么回收到 stackpool中。
 		order := uint8(0)
 		n2 := n
 		for n2 > _FixedStack {
 			order++
 			n2 >>= 1
 		}
+		// n2 = order
 		x := gclinkptr(v)
 		if stackNoCache != 0 || gp.m.p == 0 || gp.m.preemptoff != "" {
+			// p.stackcache 不可用。回收到 stackpool。
 			lock(&stackpool[order].item.mu)
 			stackpoolfree(x, order)
 			unlock(&stackpool[order].item.mu)
 		} else {
 			c := gp.m.p.ptr().mcache
+			// 链表中的栈总大小大于等于32KB，则回收。
 			if c.stackcache[order].size >= _StackCacheSize {
 				stackcacherelease(c, order)
 			}
@@ -496,12 +696,19 @@ func stackfree(stk stack) {
 			c.stackcache[order].size += n
 		}
 	} else {
+		// 被回收的栈是大于或等于32KB，这样的栈所在的mspan都只是
+		// 单obj的，所以栈的回收等于整个mspan的回收。
 		s := spanOfUnchecked(uintptr(v))
 		if s.state.get() != mSpanManual {
 			println(hex(s.base()), v)
 			throw("bad span state")
 		}
 		if gcphase == _GCoff {
+			// 如果g关联了sudog，在GC标记阶段进行mspan的堆回收可能造成错误。
+			// 参见: stackpoolfree()函数的注释。
+			//
+			// 可以安全的回收掉整个mspan。
+			//
 			// Free the stack immediately if we're
 			// sweeping.
 			osStackFree(s)
@@ -512,8 +719,12 @@ func stackfree(stk stack) {
 			// reused as a heap span, and this state
 			// change would race with GC. Add it to the
 			// large stack cache instead.
+			//
+			// 直接插入到链表中不用其它处理，因为整个mspan就是一个栈大小。
+			// 这里也是唯一向 stackLarge.free 链表插入元素的地方。
 			log2npage := stacklog2(s.npages)
 			lock(&stackLarge.lock)
+			// 插入表头。
 			stackLarge.free[log2npage].insert(s)
 			unlock(&stackLarge.lock)
 		}

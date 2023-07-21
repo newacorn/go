@@ -154,7 +154,7 @@ type gcControllerState struct {
 	//
 	// 最小值为: 4MB*GOGC/100 (gcControllerState.heapMinimum)。
 	// 在每次GC标记终止阶段更新：
-	// gcPercentHeapGoal = c.heapMarked + (c.heapMarked+c.lastStackScan.Load()+c.globalsScan.Load())*uint64(gcPercent)/100
+	// gcPercentHeapGoal = c.heapMarked + (gcControllerState.heapMarked+ gcControllerState.lastStackScan+gcControllerState.globalsScan)*uint64(gcPercent)/100
 	// 是下一次heap Trigger 触发添加的判断依据。
 	//
 	// 初始值在 gcControllerState.init , isSweepDone = true 以此为参数来调用 commit 函数，在其中更新。
@@ -190,6 +190,9 @@ type gcControllerState struct {
 	// 在清扫终止阶段设置为 heapLive。
 	// triggered 是上一次GC开始时，GC扫描终止阶段的 heapLive 的大小。[ startCycle 函数中]
 	// 在标记结束时 triggered 会被设置为 ^uint64(0) [ resetLive 函数中]
+	//
+	// 在标记清扫阶段STW被重置为0进行以下赋值：
+	// c.triggered = c.heapLive.Load()
 	triggered uint64
 
 	// lastHeapGoal is the value of heapGoal at the moment the last GC
@@ -224,6 +227,8 @@ type gcControllerState struct {
 	//
 	// Whenever this is updated, call traceHeapAlloc() and
 	// this gcControllerState's revise() method.
+	//
+	// 在 update 函数中增加，在 resetLive 函数中进行覆盖设置(设置为标记终止阶段总标记字节数)。
 	heapLive atomic.Uint64
 
 	// heapScan is the number of bytes of "scannable" heap. This is the
@@ -232,6 +237,9 @@ type gcControllerState struct {
 	//
 	// This value is fixed at the start of a GC cycle. It represents the
 	// maximum scannable heap.
+	// 起始值是：每上一轮标记终止阶段，会在 resetLive 函数中设置为 heapScanWork 的值。
+	// 然后在运行阶段会无论有没有在进行GC，每当分配了可扫描内存时，都会类型的 _type.ptrData，
+	// 添加到这个字段计数。
 	heapScan atomic.Uint64
 
 	// lastHeapScan is the number of bytes of heap that were scanned
@@ -311,6 +319,7 @@ type gcControllerState struct {
 	//
 	// Note that stackScanWork includes only stack space scanned, not all
 	// of the allocated stack.
+	// 在标记清扫阶段STW被重置为0。
 	heapScanWork    atomic.Int64
 	/*
 		// scannedSize is the amount of work we'll be reporting.
@@ -326,13 +335,18 @@ type gcControllerState struct {
 	 */
 	// 所有 _Grunnable 、 _Gwaiting 和 _Gsyscall 状态的g按上面计数到的
 	// scannedSize 的总和。
+	// 在标记清扫阶段STW被重置为0。
 	stackScanWork   atomic.Int64
+	// 在标记清扫阶段STW被重置为0。
 	globalsScanWork atomic.Int64
 
 	// bgScanCredit is the scan work credit accumulated by the concurrent
 	// background scan. This credit is accumulated by the background scan
 	// and stolen by mutator assists.  Updates occur in bounded batches,
 	// since it is both written and read throughout the cycle.
+	// 在标记清扫阶段STW被重置为0。
+	//
+	// 存储的扫描的内存大小总和
 	bgScanCredit atomic.Int64
 
 	// assistTime is the nanoseconds spent in mutator assists
@@ -340,21 +354,25 @@ type gcControllerState struct {
 	// be updated atomically even during a STW, because it is read
 	// by sysmon. Updates occur in bounded batches, since it is both
 	// written and read throughout the cycle.
+	// 在标记清扫阶段STW被重置为0。
 	assistTime atomic.Int64
 
 	// dedicatedMarkTime is the nanoseconds spent in dedicated mark workers
 	// during this cycle. This is updated at the end of the concurrent mark
 	// phase.
+	// 在标记清扫阶段STW被重置为0。
 	dedicatedMarkTime atomic.Int64
 
 	// fractionalMarkTime is the nanoseconds spent in the fractional mark
 	// worker during this cycle. This is updated throughout the cycle and
 	// will be up-to-date if the fractional mark worker is not currently
 	// running.
+	// 在标记清扫阶段STW被重置为0。
 	fractionalMarkTime atomic.Int64
 
 	// idleMarkTime is the nanoseconds spent in idle marking during this
 	// cycle. This is updated throughout the cycle.
+	// 在标记清扫阶段STW被重置为0。
 	idleMarkTime atomic.Int64
 
 	// markStartTime is the absolute start time in nanoseconds
@@ -364,6 +382,8 @@ type gcControllerState struct {
 	// dedicatedMarkWorkersNeeded is the number of dedicated mark workers
 	// that need to be started. This is computed at the beginning of each
 	// cycle and decremented as dedicated mark workers get started.
+	//
+	// 在标记终止阶段STW状态下被设置， gcStart -> startCycle
 	dedicatedMarkWorkersNeeded atomic.Int64
 
 	// idleMarkWorkers is two packed int32 values in a single uint64.
@@ -398,12 +418,20 @@ type gcControllerState struct {
 	// nothing left to do, ensuring the GC makes progress.
 	//
 	// See github.com/golang/go/issues/44163 for more details.
+	//
+	// 低32位存储当前 idleMarkWorker 的数量，高32位存储 idleMarkWorker 允许的最大值。
+	//
+	// idleMarkWorkers 的最大值在GC的扫描终止阶段STW中被设置， startCycle 函数中被设置。
+	// 对于非 gcTriggerTimer 类型的 trigger 设置为 goMaxProcs - dedicatedMarkWorkersNeeded
+	// gcTriggerTimer 类型的 trigger 当 dedicatedMarkWorkersNeeded > 0 时设置为0，否则设置为1.
 	idleMarkWorkers atomic.Uint64
 
 	// assistWorkPerByte is the ratio of scan work to allocated
 	// bytes that should be performed by mutator assists. This is
 	// computed at the beginning of each cycle and updated every
 	// time heapScan is updated.
+	//
+	// 与 assistBytesPerWork 字段的值互为倒数。
 	assistWorkPerByte atomic.Float64
 
 	// assistBytesPerWork is 1/assistWorkPerByte.
@@ -460,8 +488,14 @@ func (c *gcControllerState) init(gcPercent int32, memoryLimit int64) {
 // startCycle resets the GC controller's state and computes estimates
 // for a new GC cycle. The caller must hold worldsema and the world
 // must be stopped.
+//
 // startCycle()
 // 在 gcStart 函数中被调用，紧随 systemstack(stopTheWorldWithSema) 调用之后。
+// 主要目的：
+// 1. 重置 gcControllerState 中一些记录GC相关统计信息的字段。
+// 2. 并计数一些GC需要的数值。比如 dedicatedWorker的数量 和 fractinal work 运行时间的占比等。
+// 3. 调用 revise
+//
 func (c *gcControllerState) startCycle(markStartTime int64, procs int, trigger gcTrigger) {
 	c.heapScanWork.Store(0)
 	c.stackScanWork.Store(0)
@@ -574,7 +608,9 @@ func (c *gcControllerState) startCycle(markStartTime int64, procs int, trigger g
 // The result of this race is that the two assist ratio values may not line
 // up or may be stale. In practice this is OK because the assist ratio
 // moves slowly throughout a GC cycle, and the assist ratio is a best-effort
-// heuristic anyway. Furthermore, no part of the heuristic depends on
+// heuristic anyway.
+//
+// Furthermore, no part of the heuristic depends on
 // the two assist ratio values being exact reciprocals of one another, since
 // the two values are used to convert values from different sources.
 //
@@ -587,6 +623,29 @@ func (c *gcControllerState) startCycle(markStartTime int64, procs int, trigger g
 // It should only be called when gcBlackenEnabled != 0 (because this
 // is when assists are enabled and the necessary statistics are
 // available).
+//
+// revise()
+// 下列字段更新时，会调用此函数：
+// gcControllerState.heapScan
+// gcControllerState.heapLive
+// any inputs to gcControllerState.heapGoal
+//
+// 此函数更新 assistWorkPerByte 和 assistBytesPerWork。
+//
+// 下面的辅助GC机制会用到这两个比率。
+// 记申请的内存大小为size。
+// 协程在申请堆内存时，在进行赋值运算：g.gcAssistBytes -= size后，如果 g.gcAssistBytes 为值，
+// 则需要进入辅助GC逻辑:
+// 通过 (-g.gcAssistBytes)*assistWorkPerByte 计算出要扫描的内存大小记size2并向上对齐到最小扫描内存大小[ gcOverAssistWork]。
+// 尝试从 gcControllerState.bgScanCredit 中窃取size2大小的值:
+// 1. 如果其比size2小就完全窃取。并进行以下更新：gcAssistBytes:=size2*assistBytesPerWork gcControllerState.bgScanCredit-=size2。
+//    返回继续内存分配。
+// 2. 否则就部分窃取。并进行以下更新：size2-=gcControllerState.bgScanCredit;gcAssistBytes:=gcControllerState.bgScanCredit*assistBytesPerWork;gcControllerState.bgScanCredit=0
+//    带着 size2 作为应扫描内存大小在系统栈执行辅助GC。
+//
+// 辅助GC的目的:
+// 是为了防止在进行GC标记时，协程不断地申请堆内存使堆越来越大而GC标记却迟迟不能结束(因为新sheng'c。
+// 从而影响到最重要的GC清扫阶段的到来的时间。
 func (c *gcControllerState) revise() {
 	gcPercent := c.gcPercent.Load()
 	if gcPercent < 0 {
@@ -594,28 +653,58 @@ func (c *gcControllerState) revise() {
 		// act like GOGC is huge for the below calculations.
 		gcPercent = 100000
 	}
+	// live 动态变化，只会增加。
+	//
+	// 起始值： 上一轮GC标记结束时被设置为标记的字节数
+	// 动态增长：在运行时从堆中分配的字节数。
 	live := c.heapLive.Load()
+	// scan 动态变化，只会增加
+	//
+	// 起始值： 上一轮GC标记结束时被设置为 heapScanWork 的值。
+	// 动态增长： 在运行时每当为变量分配内存时，会将变量类型元数据的 ptrData 字段的值累加到此字段。
 	scan := c.heapScan.Load()
+	// 动态变化，只会增加
+	//
+	// 起始值：0+0+模块的bss和data区间大小。
+	// 动态增长：heapScanWork 和 stackScanWork 会随着GC标记而增加。
 	work := c.heapScanWork.Load() + c.stackScanWork.Load() + c.globalsScanWork.Load()
 
 	// Assume we're under the soft goal. Pace GC to complete at
 	// heapGoal assuming the heap is in steady-state.
+	//
+	// 起始值：上一轮GC标记结束时，被标记的字节数 + 协程栈使用区间总和 + 模块bss和data区间之和。
+	// 动态更新：在运行中不会动态更新。
 	heapGoal := int64(c.heapGoal())
 
 	// The expected scan work is computed as the amount of bytes scanned last
 	// GC cycle (both heap and stack), plus our estimate of globals work for this cycle.
+	//
+	// 上一轮标记结束时的：heapScanWork + stackScanWork + 模块bss和data区间之和。
+	// 动态更新：在运行中不会动态更新。
 	scanWorkExpected := int64(c.lastHeapScan + c.lastStackScan.Load() + c.globalsScan.Load())
 
 	// maxScanWork is a worst-case estimate of the amount of scan work that
 	// needs to be performed in this GC cycle. Specifically, it represents
 	// the case where *all* scannable memory turns out to be live, and
 	// *all* allocated stack space is scannable.
+	//
+	// 起始值：没有起始值，不会被重置。
+	// 动态更新：每当有协程被创时，会将其 g.stack.hi - g.stack.lo 添加到此字段，每当
+	//         协程退出时会减去 g.stack.hi-g.stack.lo ，每当协程的栈被复制时减去旧
+	//         栈的大小。
 	maxStackScan := c.maxStackScan.Load()
+	// maxStackScan
+	// 最多被扫描的字节数，实际扫描到的字节数肯定会比这个少。
+	// 随着 scan 和 maxStackSan 的动态更新而更新。
 	maxScanWork := int64(scan + maxStackScan + c.globalsScan.Load())
+	//
+	// 本轮目前扫描的工作量已经大于上一轮GC扫描的任务量。
 	if work > scanWorkExpected {
 		// We've already done more scan work than expected. Because our expectation
 		// is based on a steady-state scannable heap size, we assume this means our
-		// heap is growing. Compute a new heap goal that takes our existing runway
+		// heap is growing.
+		//
+		// Compute a new heap goal that takes our existing runway
 		// computed for scanWorkExpected and extrapolates it to maxScanWork, the worst-case
 		// scan work. This keeps our assist ratio stable if the heap continues to grow.
 		//
@@ -1353,11 +1442,13 @@ func (c *gcControllerState) commit(isSweepDone bool) {
 	gcPercentHeapGoal := ^uint64(0)
 	if gcPercent := c.gcPercent.Load(); gcPercent >= 0 {
 		gcPercentHeapGoal = c.heapMarked + (c.heapMarked+c.lastStackScan.Load()+c.globalsScan.Load())*uint64(gcPercent)/100
+		/*
 		println(gcPercent)
 		println(c.heapMarked)
 		println(c.lastStackScan.Load())
 		println(c.globalsScan.Load())
 		println(gcPercentHeapGoal)
+		 */
 	}
 	// Apply the minimum heap size here. It's defined in terms of gcPercent
 	// and is only updated by functions that call commit.

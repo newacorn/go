@@ -45,13 +45,26 @@ type mcentral struct {
 	// sweeper and mcentral that do consume from the unswept list may
 	// encounter swept spans, and these should be ignored.
 	//
-	// partial 和 full 是两个 spanSet 数组， spanSet 有自己的锁，是个并发安全地支持 push
-	// 和pop的 *mspan 集合。
-	// partial 中都是还没有分配完的 span，每个span至少包含一个空闲单元， full 中都是没有空闲
-	// 空间的 span。
-	// 数组中的两个 spanSet，有一个包含的是已清扫的 span，另一个包含的是未清扫的 sapn。
-	// 并且它们在每轮 GC 中会互换角色。
+	// partial 和 full 是两个 spanSet 数组， spanSet 有自己的锁，是个并发安全地支持 push和pop的 *mspan 集合。
+	// 数组中的两个 spanSet，有一个包含的是已清扫的 mspan，另一个包含的是未清扫的 mspan。对应索引并不固定。
+	// 它们在每轮 GC 中会互换角色。
+	//
+	// ------------- unSwept spanSet 数据结构重置 -----------
+	// partial 和 full 中的 unsweept spanSet 会在清扫终止阶段[具体时间为上一轮的sweep已经结束，STW状态中]被重置。
+	// 因为这种 spanSet 中的 mspan 已经在上一轮 sweep 清扫中全部取出，所以 这个 spnSet 数据结构可以被安全的重置。
+	// 见 gcStart -> finishsweep_m 函数调用。
+	// GC 还未执行时，也没关系，因为并不向 unSwept spanSet 中存储 mspan ，所以第一轮GC也可以安全重置 unSwept 的 spanSet 数据结构。
+	// -----------------------------------------------------
+	//
+	// 每轮 sweep 开始时，随之 mheap.sweepgen 的递增 2，unSweept spanSet 就会变成
+	// sweept spanSet。
+	//
+	// 因为通过调用 partialUnswept 和 fullUnswept 函数来决定 partial 和 full 这两个数组中哪个是 unSwept spanSet 哪个不是。
+	// 而这两个函数在计算数组索引时依赖 mheap.sweepgen 的值。
+	//
+	// partial 中都是还没有分配完的 mspan，每个 mspan 至少包含一个未使用的 obj。
 	partial [2]spanSet // list of spans with a free object
+	//  full 中都是obj都已经使用过的 mspan 。
 	full    [2]spanSet // list of spans with no free objects
 }
 

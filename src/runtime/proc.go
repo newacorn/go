@@ -541,6 +541,7 @@ var (
 // Readers that cannot take the lock may (carefully!) use the atomic
 // variables below.
 allglock mutex
+// 不包括g0
 allgs    []*g
 
 // allglen and allgptr are atomic variables that contain len(allgs) and
@@ -1503,7 +1504,7 @@ gp := getg()
 // m0:65432，其它M:524288
 //
 osStack := gp.stack.lo == 0
-// 无论是否启用CGO，osStac都为0，除了了M0
+// 无论是否启用CGO，osStack都为0，除了了M0
 if osStack {
     // Initialize stack bounds from system stack.
     // Cgo may have left stack size in stack.hi.
@@ -1513,6 +1514,7 @@ if osStack {
     // We set hi to &size, but there are things above
     // it. The 1024 is supposed to compensate this,
     // but is somewhat arbitrary.
+    //
     // 未使用CGO时 size = 524288，使用时 size = 8388608
     size := gp.stack.hi
     if size == 0 {
@@ -1912,10 +1914,8 @@ if sched.freem != nil {
     for freem := sched.freem; freem != nil; {
         wait := freem.freeWait.Load()
         if wait == freeMWait {
-            // freeMWait 表示这个freem已经在使用中，
-            //
-            // 遍历结束后，以newList为链表头倒序连接所有处于
-            // freeMWait状态的M
+            // freeMWait 表示这个freem仍在使用中，
+            // 遍历结束后，以newList为链表头倒序连接所有处于 freeMWait 状态的M
             //
             next := freem.freelink
             freem.freelink = newList
@@ -1938,7 +1938,7 @@ if sched.freem != nil {
         }
         freem = freem.freelink
     }
-    // newList为剔除掉处于freeMStack和freeMRef状态的M后的链表
+    // newList为剔除掉处于 freeMStack 和 freeMRef 状态的M后的链表
     sched.freem = newList
     unlock(&sched.lock)
 }
@@ -1954,9 +1954,10 @@ mcommoninit(mp, id)
 // In case of cgo or Solaris or illumos or Darwin, pthread_create will make us a stack.
 // Windows and Plan 9 will layout sched stack on OS stack.
 if iscgo || mStackIsSystemAllocated() {
-    // 系统为我们分配g0栈
+    // iscgo windows linux: 系统为我们分配g0栈
     mp.g0 = malg(-1)
 } else {
+    // linux
     // 否则自己分配g0栈
     mp.g0 = malg(8192 * sys.StackGuardMultiplier)
 }
@@ -4806,7 +4807,7 @@ func saveAncestors(callergp *g) *[]ancestorInfo {
 }
 // gfput(pp *p, gp *g)
 // 如果参数gp的栈大小不是 startingStackSize，则先将其栈回收
-// 然后再将其放入到 p.gFree 链表。
+// 然后再将其放入到 p.gFree 链表(此时已经没有栈了)。
 //
 // 如果 p.gFree 链表长度大于等于64，则只保留前31个g。剩余
 // 的根据有没有栈迁移到 sched.gFree.noStack 或者 sched.gFree.Stack
@@ -4858,6 +4859,10 @@ func gfput(pp *p, gp *g) {
 
 // Get from gfree list.
 // If local list is empty, grab a batch from global list.
+//
+// gfget()
+// 返回一个带有2048栈大小的g，如果整个g是没有栈的会再这里为其申请并赋值，
+// 如果整个g的栈超过2048，则会调用 stackfree 回收。并重新分配一个2048栈给它。
 func gfget(pp *p) *g {
 retry:
 	if pp.gFree.empty() && (!sched.gFree.stack.empty() || !sched.gFree.noStack.empty()) {
@@ -4914,7 +4919,8 @@ retry:
 	}
 	return gp
 }
-
+// gfpurge()函数目前只被 p.destroy 方法所调用。
+//
 // Purge all cached G's from gfree list to the global list.
 func gfpurge(pp *p) {
 	var (

@@ -405,6 +405,12 @@ func (s *scavengerState) ready() {
 	s.sysmonWake.Store(1)
 }
 
+// 唤醒 scavenger ，按需进页归还给操作系统。
+// 会被以下3种机制唤醒：
+// 1. sysmon
+// 2. 每轮GC在完成上一轮GC清扫工作后会调用此函数， gcStart -> finishsweep_m()
+// 3. scavenger 自己睡眠一段时间后，会在关联的 timer.f 中调用此函数。
+//
 // wake immediately unparks the scavenger if necessary.
 //
 // Safe to run without a P.

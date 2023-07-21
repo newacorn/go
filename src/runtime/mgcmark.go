@@ -53,12 +53,16 @@ const (
 // gcMarkRootPrepare queues root scanning jobs (stacks, globals, and
 // some miscellany) and initializes scanning-related state.
 //
+// gcMarkRootPrepare()，只被 gcStart 函数调用。
+// 在STW状态下记录当下不同根任务的状态，用于接下来标记阶段的起点。这些信息都保存在work相应的字段上。
+//
 // The world must be stopped.
 func gcMarkRootPrepare() {
 	assertWorldStopped()
 
 	// Compute how many data and BSS root blocks there are.
 	nBlocks := func(bytes uintptr) int {
+		// rootBlockBytes 256KB
 		return int(divRoundUp(bytes, rootBlockBytes))
 	}
 
@@ -113,6 +117,7 @@ func gcMarkRootPrepare() {
 	work.markrootJobs = uint32(fixedRootCount + work.nDataRoots + work.nBSSRoots + work.nSpanRoots + work.nStackRoots)
 
 	// Calculate base indexes of each root type
+	// 在标记时根据索引区间就可以确定是哪种跟任务，在根据具体的索引就可以找到具体的根任务了。
 	work.baseData = uint32(fixedRootCount)
 	work.baseBSS = work.baseData + uint32(work.nDataRoots)
 	work.baseSpans = work.baseBSS + uint32(work.nBSSRoots)
@@ -295,6 +300,9 @@ func markrootBlock(b0, n0 uintptr, ptrmask0 *uint8, gcw *gcWork, shard int) int6
 //
 // This does not free stacks of dead Gs cached on Ps, but having a few
 // cached stacks around isn't a problem.
+//
+// markrootFreeGStacks()，遍历sched.gFree中g将g中的栈调用 stackfree 进行回收，
+// 并将没有栈的g链表放到 sched.gFree.nostack 中。
 func markrootFreeGStacks() {
 	// Take list of dead Gs with stacks.
 	lock(&sched.gFree.lock)

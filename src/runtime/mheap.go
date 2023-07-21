@@ -356,6 +356,8 @@ type heapArena struct {
 	// 起始页面对应的二进制位来标记整个 mspan。 在GC标记阶段会原子性地修改这
 	// 个位图，标记结束之后就不会再进行改动了。
 	// 清扫阶段如果发现某个 mspan 不存在被标记的对象，就可以释放整个 mspan 了。
+	// **和 g.gcAssistBytes(详见) 在同一个地方进行重置(每轮GC开始时，上一轮清扫结束STW之前)**
+	// 1024大小的数组
 	pageMarks [pagesPerArena / 8]uint8
 
 	// pageSpecials is a bitmap that indicates which spans have
@@ -1957,7 +1959,7 @@ func (list *mSpanList) remove(span *mspan) {
 func (list *mSpanList) isEmpty() bool {
 	return list.first == nil
 }
-
+// 向span插入到链表list头部。
 func (list *mSpanList) insert(span *mspan) {
 	if span.next != nil || span.prev != nil || span.list != nil {
 		println("runtime: failed mSpanList.insert", span, span.next, span.prev, span.list)
@@ -2448,20 +2450,33 @@ func newAllocBits(nelems uintptr) *gcBits {
 //
 // All current spans have been swept.
 // During that sweep each span allocated room for its gcmarkBits in
-// gcBitsArenas.next block. gcBitsArenas.next becomes the gcBitsArenas.current
+// gcBitsArenas.next block.
+//
+// gcBitsArenas.next becomes the gcBitsArenas.current
 // where the GC will mark objects and after each span is swept these bits
 // will be used to allocate objects.
+//
 // gcBitsArenas.current becomes gcBitsArenas.previous where the span's
 // gcAllocBits live until all the spans have been swept during this GC cycle.
+//
 // The span's sweep extinguishes all the references to gcBitsArenas.previous
 // by pointing gcAllocBits into the gcBitsArenas.current.
+//
 // The gcBitsArenas.previous is released to the gcBitsArenas.free list.
+//
+// nextMarkBitArenaEpoch()，此函数只被 finishsweep_m() 函数调用。
+// 作用待定，目前看与 mspan.gcmarkBits 字段分配相关。
+//
 func nextMarkBitArenaEpoch() {
 	lock(&gcBitsArenas.lock)
+	// 第一轮GC时， gcBitsArenas.previous 为nil。
 	if gcBitsArenas.previous != nil {
+		// 回收 gcBitsArenas.previous
 		if gcBitsArenas.free == nil {
 			gcBitsArenas.free = gcBitsArenas.previous
 		} else {
+			// 将 gcBitsArenas.free 链表接到 gcBitsArenas.previous 后面，并
+			// 将 gcBitsArenas.free 设置为 gcBitsArenas.previous，这样便回收了 gcBitsArenas.previous。
 			// Find end of previous arenas.
 			last := gcBitsArenas.previous
 			for last = gcBitsArenas.previous; last.next != nil; last = last.next {
@@ -2470,6 +2485,7 @@ func nextMarkBitArenaEpoch() {
 			gcBitsArenas.free = gcBitsArenas.previous
 		}
 	}
+	// gcBitsArenas.next 是上一轮 sweep 为下一轮GC准备的。
 	gcBitsArenas.previous = gcBitsArenas.current
 	gcBitsArenas.current = gcBitsArenas.next
 	atomic.StorepNoWB(unsafe.Pointer(&gcBitsArenas.next), nil) // newMarkBits calls newArena when needed

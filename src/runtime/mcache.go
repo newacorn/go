@@ -75,10 +75,16 @@ type mcache struct {
 
 	// stackcache 是用来为 goroutine 分配栈的缓存。
 	// _NumStackOrders = 4
-	// 当本地 stackcache 中某个链表空了的时候，stackcacherefill() 函数
-	// 会循环调用 stackpollalloc() 函数重 stackpool 中对应的链表中取一些
-	// 节点过来不是按个数，而是按照空间大小为 _StackCacheSize的一半，也就是
-	// 每次16KB。
+	// 当本地 stackcache 中某个链表空了的时候， stackcacherefill()函数
+	// 会循环调用 stackpoolalloc() 函数从 stackpool 中对应的链表中取一些
+	// 节点过来不是按个数，这些节点大小总和为 _StackCacheSize 的一半，也就是每次16KB。
+	// 所以 stackcache 链表中的栈并不是一定属于一个 mspan。
+	//
+	// 对应 2KB、4KB、8KB和16KB的栈链表。
+	//
+	// stackfreelist 链表中全部栈的大小不会超过32KB，当在 stackfree 函数中回收栈时，
+	// 如果发现 stackfreelist 大小已经大于或等于32KB，会调用 stackcacherelease()
+	// 进行释放只保留16KB大小总量，多余的栈释放到 stackpool 中。
 	stackcache [_NumStackOrders]stackfreelist
 
 	// flushGen indicates the sweepgen during which this mcache
@@ -118,15 +124,19 @@ func (p gclinkptr) ptr() *gclink {
 // 因为栈最小也有2KB，所以list字段可以很安全地基于 gclinkptr 把它们
 // 连成一个链表，size字段用来标记链表的长度。
 // 当本地 stackcache 中某个链表空了的时候，stackcacherefill() 函数
-// 会循环调用 stackpollalloc() 函数重 stackpool 中对应的链表中取一些
+// 会循环调用 stackpollalloc() 函数从 stackpool 中对应的链表中取一些
 // 节点过来不是按个数，而是按照空间大小为 _StackCacheSize的一半，也就是
 // 每次16KB。
 type stackfreelist struct {
-	// 链表的头内存块的地址。
-	// 每次分配栈时都会向后移动要分配的栈的大小。
+	// 链表的头内存块的地址。其串联的是mspan中的obj，这些obj不一定属于同
+	// 一个mspan，因为它们是一次一个从stackpool中申请的。
+	//
+	// 在 stackfree 函数中检测到链表总大小大于等于32KB，会调用 stackcacherelease()，
+	// 将多余的栈释放到 stackpool 中，只保留16KB。
 	list gclinkptr // linked list of free stacks
 	// 链表的大小字节。
 	// 每次分配栈时都会减少栈的大小。
+	// 所以整个size是整个链表元素大小的整数倍。
 	size uintptr   // total size of stacks in list
 }
 

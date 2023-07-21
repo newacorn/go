@@ -578,6 +578,7 @@ type g struct {
 	asyncSafePoint bool
 
 	paniconfault bool // panic (instead of crash) on unexpected fault address
+	// 与 gcAssistBytes 字段在同一个地方被重置。
 	gcscandone   bool // g has scanned stack; protected by _Gscan bit in status
 	throwsplit   bool // must not split stack
 	// activeStackChans indicates that there are unlocked channels
@@ -657,6 +658,9 @@ type g struct {
 	//
 	// The assist ratio （决定 gcAssistBytes 到 扫描任务的映射)
 	// determines how this corresponds to scan work debt.
+	//
+	// **每轮GC开始时此字段会被重置为0[ gcStart函数调用中上一轮的清扫已经完成还未STW之前
+	// 在 gcResetMarkState 函数调用中被重置]**
 	//
 	// 记录了当前协程通过辅助GC积累了多少字节的信用值，就像信用卡额度一样。
 	// 正数表示有结余，负数表示负债。
@@ -840,6 +844,15 @@ type p struct {
 
 	// Available G's (status == Gdead)
 	// 用来缓存已经退出的G，方便再次分配时进行使用
+	// 来源：
+	// 1. 在 gfget 调用中如果检测到 p.gFree 为空且 sched.gFree.stack或者sched.gFree.nostack不为空，
+	//    则在 gFree 中填充31个栈。
+	// 2. gfput 函数调用中，回收的g会被放入到 gFree 中。
+	//
+	// 移除：
+	// 1. 当p别销毁时，会将 gFree 中的所有栈移到sched.gFree中。
+	// 2. gfget 函数中会从 gFree 取出g。
+	// 3. 当 gFree 链表过长大于 31 时，在某些情况下会移动到 sched.gFree 中。
 	gFree struct {
 		gList
 		n int32
@@ -849,6 +862,7 @@ type p struct {
 	sudogbuf   [128]*sudog
 
 	// Cache of mspan objects from the heap.
+	// 缓存的是 mspan 结构体，没有对应的页。 mspan.state = mSpanDead
 	mspancache struct {
 		// We need an explicit length here because this field is used
 		// in allocation codepaths where write barriers are not allowed,
@@ -901,7 +915,9 @@ type p struct {
 	timerModifiedEarliest atomic.Int64
 
 	// Per-P GC state
+	// 在标记清扫阶段STW被重置为0。
 	gcAssistTime         int64 // Nanoseconds in assistAlloc
+	// 在标记清扫阶段STW被重置为0。
 	gcFractionalMarkTime int64 // Nanoseconds in fractional mark worker (atomic)
 
 	// limiterEvent tracks events for the GC CPU limiter.
@@ -1052,12 +1068,19 @@ type schedt struct {
 
 	// Global cache of dead G's.
 	// 用来缓存已退出运行的G，lock 是本结构单独的锁，避免争用 sched.lock。 stack
-	// 和 noStacK 这两个列表分别用来存储有栈和没有栈的G，因为在G结束运行被回收的时
+	// 和 noStack 这两个列表分别用来存储有栈和没有栈的G，因为在G结束运行被回收的时
 	// 候，如果栈大小超过了标准大小，就会被释放，所以有一部分G是没有栈的。变量n是两个
 	// 列表长度之和，也就是总共缓冲了多少个G。
+	//
+	// 1. p.destroy 时将 p.gFree 链表全局移到全局的 sched.gFree 中。
+	// 2. markrootFreeGStacks 函数调用中会将 stack 中的g的栈回收然后全部移动到 noStack 中。
+	// 3. gfput 调用时，如果检测到 p.gFree.n 大于等于 64 时，只保留其中最开的32个。剩余的移到
+	//    到 shced.gFree 中。
 	gFree struct {
 		lock    mutex
+		// 来源于 p.gFree
 		stack   gList // Gs with stacks
+		// 来源于 p.gFree
 		noStack gList // Gs without stacks
 		n       int32
 	}
@@ -1065,11 +1088,16 @@ type schedt struct {
 	// Central cache of sudog structs.
 	// 构成了sudog结构的中央缓存，供各个P存取
 	sudoglock  mutex
+
+	// 全局 sudog 缓冲，是个链表。
+	// 此字段在 gcStart -> clearPools [标记终止阶段，STW] 函数中被重置为nil，且链表中的 sudog 通过将其next字段设置为nil来打断它们之间联系。
 	sudogcache *sudog
 
 	// Central pool of available defer structs.
-	// 构成一个 _defer 结构的中央缓存
 	deferlock mutex
+
+	// 构成一个 _defer 结构的中央缓存
+	// 此字段在 gcStart -> clearPools [标记终止阶段，STW] 函数中被重置为nil，且链表中的 sudog 通过将其next字段设置为nil来打断它们之间联系。
 	deferpool *_defer
 
 	// freem is the list of m's waiting to be freed when their

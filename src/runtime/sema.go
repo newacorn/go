@@ -151,6 +151,10 @@ const (
 )
 
 // Called from runtime.
+// semacquire()
+// 在使用 addr ，一般来说现将 *addr 设置成1。
+// 这样 acquire->release，可以在同一个协程中顺序进行，否则只能两个协程，因为
+// 开始执行 acquire 信号量的会被阻塞。
 func semacquire(addr *uint32) {
 	semacquire1(addr, false, 0, 0, waitReasonSemacquire)
 }
