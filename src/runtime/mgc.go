@@ -212,6 +212,7 @@ const (
 	_GCmark                   // GC marking roots and workbufs: allocate black, write barrier ENABLED
 	_GCmarktermination        // GC mark termination: allocate black, P's help GC, write barrier ENABLED
 )
+
 // setGCPhase()函数，在 gcMarkTermination 和 gcStart 函数中被调用。
 //
 //go:nosplit
@@ -521,7 +522,7 @@ func GC() {
 	// Now we're really done with sweeping, so we can publish the
 	// stable heap profile. Only do this if we haven't already hit
 	// another mark termination.
-    //
+	//
 	mp := acquirem()
 	// 获取mp(便不能被抢占)是为了阻塞 STOP THE WORLD 的完成。
 	//
@@ -583,9 +584,9 @@ const (
 		dedicatedMarkWorkersNeeded = int64(procs)
 		c.fractionalUtilizationGoal = 0
 	}
-	 */
-	gcForceMode                    // stop-the-world GC now, concurrent sweep
-	gcForceBlockMode               // stop-the-world GC now and STW sweep (forced by user)
+	*/
+	gcForceMode      // stop-the-world GC now, concurrent sweep
+	gcForceBlockMode // stop-the-world GC now and STW sweep (forced by user)
 )
 
 // A gcTrigger is a predicate for starting a GC cycle. Specifically,
@@ -618,15 +619,12 @@ const (
 	// 主要用于强制执行GC。
 	gcTriggerCycle
 )
-func (t gcTrigger) test() bool {
-	return  TTest(t)
-}
 
 // test reports whether the trigger condition is satisfied, meaning
 // that the exit condition for the _GCoff phase has been met. The exit
 // condition should be tested when allocating.
 // test() 用于检测当前有没有达到GC出发条件。
-func  TTest(t gcTrigger) bool {
+func (t gcTrigger) test() bool {
 	if !memstats.enablegc || panicking.Load() != 0 || gcphase != _GCoff {
 		return false
 	}
@@ -677,7 +675,9 @@ func  TTest(t gcTrigger) bool {
 //
 // Go 的GC共有3种触发方式:
 // 第1种: 是被runtime初始化阶段创建的 sysmon 线程和 forcegchelper
-//       协程发起的，触发条件是基于时间的周期性触发。
+//
+//	协程发起的，触发条件是基于时间的周期性触发。
+//
 // 第2种: 是被 mallocgc() 函数发起的，触发条件是堆大小达到或超过了临界值。
 // 第3种: 是被开发者通过 runtime.GC() 函数强制触发。
 //
@@ -791,7 +791,6 @@ func gcStart(trigger gcTrigger) {
 			throw("p mcache not flushed")
 		}
 	}
-
 
 	// 创建 goMaxProcs 个 gcBgMarkWorker 协程并停靠，在GC标记阶段按需唤醒执行标记任务。
 	gcBgMarkStartWorkers()
@@ -1627,7 +1626,6 @@ func gcBgMarkWorker() {
 // 1. p 不为nil，且与 p 关联的gcWork不为空。
 // 2. 全局gcWork 不为空。
 // 3. 根任务标记还未完成。
-//
 func gcMarkWorkAvailable(p *p) bool {
 	if p != nil && !p.gcw.empty() {
 		return true
@@ -1848,6 +1846,7 @@ func sync_runtime_registerPoolCleanup(f func()) {
 func boring_registerCache(p unsafe.Pointer) {
 	boringCaches = append(boringCaches, p)
 }
+
 // clearpools 此函数只在 gcStart 中被调用，且在标记终止阶段的 STW状态下。
 // 它会清理一些全局的对象缓冲池：
 // 1. schedt.sudogcache

@@ -1315,6 +1315,7 @@ func GCTestPointerClass(p unsafe.Pointer) string {
 	return gcTestPointerClass(p)
 }
 
+const Raceenabled = raceenabled
 
 const (
 	GCBackgroundUtilization     = gcBackgroundUtilization

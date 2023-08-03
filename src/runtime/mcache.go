@@ -27,7 +27,6 @@ import (
 // 在Go的GMP模型中， mcache 是一个 per-P 的小对象缓存，因为每个P都有自己的一个本地
 // mcache 所以不需要再加锁。mcache 结构也是在堆之外由专门的分配器分配的，所以不会被
 // GC 扫描。
-//
 type mcache struct {
 	_ sys.NotInHeap
 
@@ -44,7 +43,7 @@ type mcache struct {
 	//  refill 函数返回之前，此字段会重置为0：
 	// 	gcController.update(int64(s.npages*pageSize)-int64(usedBytes), int64(c.scanAlloc))
 	// 	c.scanAlloc = 0
-	scanAlloc  uintptr // bytes of scannable heap allocated
+	scanAlloc uintptr // bytes of scannable heap allocated
 
 	// Allocator cache for tiny objects w/o pointers.
 	// See "Tiny allocator" comment in malloc.go.
@@ -60,7 +59,7 @@ type mcache struct {
 	// by the P that owns this mcache.
 	// tiny和tinyoffset 用来实现针对 noscan 型小对象的 tiny allocator，
 	// tiny 指向一个16字节大小的内存单元
-	tiny       uintptr
+	tiny uintptr
 	// tinyoffset 记录的是这个内存单元中空闲的偏移量。
 	tinyoffset uintptr
 
@@ -137,7 +136,7 @@ type stackfreelist struct {
 	// 链表的大小字节。
 	// 每次分配栈时都会减少栈的大小。
 	// 所以整个size是整个链表元素大小的整数倍。
-	size uintptr   // total size of stacks in list
+	size uintptr // total size of stacks in list
 }
 
 // dummy mspan that contains no free objects.
@@ -374,7 +373,6 @@ func (c *mcache) releaseAll() {
 			gcController.totalAlloc.Add(slotsUsed * int64(s.elemsize))
 
 			if s.sweepgen != sg+1 {
-				print("----")
 				// refill conservatively counted unallocated slots in gcController.heapLive.
 				// Undo this.
 				//

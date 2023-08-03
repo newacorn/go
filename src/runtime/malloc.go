@@ -379,6 +379,7 @@ var (
 	physHugePageSize  uintptr
 	physHugePageShift uint
 )
+
 // 初始化堆分配。
 func mallocinit() {
 	if class_to_size[_TinySizeClass] != _TinySize {
@@ -842,12 +843,13 @@ retry:
 
 // base address for all 0-byte allocations
 var zerobase uintptr
+
 // nextFreeFast()
 // 不返还0的条件：
-// 1. s.allocCache中还有不为0的位且这些不为0的位对应了obj。
-// 2. 在分配完这个obj之后，需满足下列条件之一：
-//    2.1 s.allocCache没有有效位且s中没有空闲ojb了。
-//    2.2 s.allocCache中还有有效位。
+//  1. s.allocCache中还有不为0的位且这些不为0的位对应了obj。
+//  2. 在分配完这个obj之后，需满足下列条件之一：
+//     2.1 s.allocCache没有有效位且s中没有空闲ojb了。
+//     2.2 s.allocCache中还有有效位。
 //
 // nextFreeFast returns the next free object if one is quickly available.
 // Otherwise it returns 0.
@@ -887,6 +889,7 @@ func nextFreeFast(s *mspan) gclinkptr {
 	// 当前 allocCache 已经用完
 	return 0
 }
+
 // nextFree()，从c中返回符合spc规格的 msapn 中的第一个空闲对象。
 // 如果 mspan 中有空闲对象，则从 mcentral 那里申请这个规格的含有空闲obj的 mspan 。
 // 并赋值给 c.alloc[spc]。
@@ -950,27 +953,23 @@ func (c *mcache) nextFree(spc spanClass) (v gclinkptr, s *mspan, shouldhelpgc bo
 	}
 	return
 }
-// runtime 中的 new系列函数和 make系列函数都依赖于此函数。
-//
-// mallocgc() 函数的主要逻辑按照代码的先后顺序可以分成如下几部分：
-// 1. 检查当前 g.gcAssistBytes 的值，如果减去本次要分配的内存大小后结果为负值，就需要
-// 	  先调用 gcAssistAlloc() 函数辅助GC完成一些标记任务。
-// 2. 根据此次要分配的空间大小，以及是否需要分配 noscan 类型空间，选用不同的分配策略，即 tiny
-//    、sizeclass 和 large。
-// 3. 如果分配的不是 noscan 类型的空间，就需要调用 heapBitsSetType() 函数，该函数会根据传入的
-//    类型元数据对 heapArena 中的位图进行标记。
-// 4. 调用 publicationBarrier 、GC标记新分配的对象、 memory profile 采样、更新 gcAssistBytes
-//    的值，按需发起 GC等一系列收尾操作。
-func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
-	type _ int
-	return D(size,typ,needzero)
-}
-
 
 // Allocate an object of size bytes.
 // Small objects are allocated from the per-P cache's free lists.
 // Large objects (> 32 kB) are allocated straight from the heap.
-func D(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+//
+// runtime 中的 new系列函数和 make系列函数都依赖于此函数。
+//
+// mallocgc() 函数的主要逻辑按照代码的先后顺序可以分成如下几部分：
+//  1. 检查当前 g.gcAssistBytes 的值，如果减去本次要分配的内存大小后结果为负值，就需要
+//     先调用 gcAssistAlloc() 函数辅助GC完成一些标记任务。
+//  2. 根据此次要分配的空间大小，以及是否需要分配 noscan 类型空间，选用不同的分配策略，即 tiny
+//     、sizeclass 和 large。
+//  3. 如果分配的不是 noscan 类型的空间，就需要调用 heapBitsSetType() 函数，该函数会根据传入的
+//     类型元数据对 heapArena 中的位图进行标记。
+//  4. 调用 publicationBarrier 、GC标记新分配的对象、 memory profile 采样、更新 gcAssistBytes
+//     的值，按需发起 GC等一系列收尾操作。
+func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	if gcphase == _GCmarktermination {
 		throw("mallocgc called with gcphase == _GCmarktermination")
 	}
@@ -1183,7 +1182,6 @@ func D(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			span = c.alloc[spc]
 			v := nextFreeFast(span)
 
-
 			if v == 0 {
 				v, span, shouldhelpgc = c.nextFree(spc)
 			}
@@ -1347,11 +1345,11 @@ func D(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 
 	if shouldhelpgc {
 		/*
-		if dataSize==8&&size==16&&typ.string()=="main.B"{
-			//println(typ.kind)
-			Shouldhelp.Add(1)
-		}
-		 */
+			if dataSize==8&&size==16&&typ.string()=="main.B"{
+				//println(typ.kind)
+				Shouldhelp.Add(1)
+			}
+		*/
 		// 如果内存是从mcentral 处申请的，或者直接从分配的是页shouldhelpgc 为true。
 		// 执行检测操作如果达到GC触发条件就发起GC。
 		if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
@@ -1451,8 +1449,8 @@ func memclrNoHeapPointersChunked(size uintptr, x unsafe.Pointer) {
 // compiler (both frontend and SSA backend) knows the signature
 // of this function.
 func newobject(typ *_type) unsafe.Pointer {
-	//t:=reflect.TypeOf(0)
-	//println(typ.string())
+	// t:=reflect.TypeOf(0)
+	// println(typ.string())
 	return mallocgc(typ.size, typ, true)
 }
 
