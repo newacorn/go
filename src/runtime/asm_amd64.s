@@ -2173,8 +2173,8 @@ TEXT runtime·retpolineR15(SB),NOSPLIT,$0; RETPOLINE(15)
 
 
 // func OutputField(a uintptr)(r int)
-TEXT ·OutputField(SB),$0-16
-    MOVQ a+0(FP),AX
-    MOVQ g(AX),BX
-    MOVQ BX,r+8(FP)
-    RET
+// TEXT ·OutputField(SB),$0-16
+//     MOVQ a+0(FP),AX
+//     MOVQ g(AX),BX
+//     MOVQ BX,r+8(FP)
+//     RET

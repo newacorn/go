@@ -1263,6 +1263,7 @@ func parsePostForm(r *Request) (vs url.Values, err error) {
 
 // ParseForm populates r.Form and r.PostForm.
 //
+// 解析所有请求方法的的url中的query和post方法中content-type 为 application/x-www-form-urlencoded 的请求体。
 // For all requests, ParseForm parses the raw query from the URL and updates
 // r.Form.
 //
