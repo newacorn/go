@@ -450,7 +450,7 @@ type moduledata struct {
 	covctrs, ecovctrs     uintptr
 	end, gcdata, gcbss    uintptr
 	// 类型元数据在二进制文件中是存放在一起的，单独占据一段空间， types 字段和 etypes 字段就是这段空间
-	// 的起始地址和结束地址。
+	// 的起始地址和结束地址。 typeOff 表示的就是目标类型的元数据距离起始地址types的偏移。
 	// [types,etypes)
 	types, etypes         uintptr
 	rodata                uintptr

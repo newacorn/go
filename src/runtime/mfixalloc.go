@@ -54,9 +54,11 @@ type mlink struct {
 // Initialize f to allocate objects of the given size,
 // using the allocator to obtain chunks of memory.
 func (f *fixalloc) init(size uintptr, first func(arg, p unsafe.Pointer), arg unsafe.Pointer, stat *sysMemStat) {
+	// 16KB
 	if size > _FixAllocChunk {
 		throw("runtime: fixalloc size too large")
 	}
+	// 8byte
 	if min := unsafe.Sizeof(mlink{}); size < min {
 		size = min
 	}

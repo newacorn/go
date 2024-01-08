@@ -194,9 +194,14 @@ func (t *_type) pkgpath() string {
 //
 // Entries are created by reflect.addReflectOff.
 var reflectOffs struct {
+	// lock用来保护整个struct中的其他字段。
 	lock mutex
+	// next 表示下一个可分配的typeOff值。
+	// 初始值是-1，下一个值是-2。
 	next int32
+	// m 是从typeOff值到类型元数据地址的映射。
 	m    map[int32]unsafe.Pointer
+	// minv 是m的逆映射。
 	minv map[unsafe.Pointer]int32
 }
 
@@ -247,7 +252,8 @@ func resolveNameOff(ptrInModule unsafe.Pointer, off nameOff) name {
 func (t *_type) nameOff(off nameOff) name {
 	return resolveNameOff(unsafe.Pointer(t), off)
 }
-
+// 运行阶段如何根据typeOff定位元数据的地址，以及在存在多个模块时是如何利用各个
+// 模块的typemap实现唯一化的，主要逻辑在runtime.resolveTypeOff函数中。
 func resolveTypeOff(ptrInModule unsafe.Pointer, off typeOff) *_type {
 	if off == 0 || off == -1 {
 		// -1 is the sentinel value for unreachable code.
@@ -567,7 +573,10 @@ func typelinksinit() {
 	}
 	// 用来收集所有模块中的类型信息，用类型的`hash`作为`map`的key，收集的类型元数据
 	// _type结构的地址，把hash相同类型的地址放到同一个slice中。
+	//
+	// 只是用于去重。
 	typehash := make(map[uint32][]*_type, len(firstmoduledata.typelinks))
+	
     // activeModules 函数得到当前活动模块的列表，也就是所有能够正常使用的Go
 	// 二进制模块，然后从第二个模块开始向后遍历。
 	modules := activeModules()
@@ -579,6 +588,7 @@ func typelinksinit() {
 		for _, tl := range prev.typelinks {
 			var t *_type
 			if prev.typemap == nil {
+				// 模块不包含typemap时，使用偏移量获取模块中包含的_type。
 				t = (*_type)(unsafe.Pointer(prev.types + uintptr(tl)))
 			} else {
 				t = prev.typemap[typeOff(tl)]
@@ -597,6 +607,8 @@ func typelinksinit() {
 			// typsehash 这里存储着hash形同但类型地址不同的_type。
 			// 因为hash相同不能代表_type是相同的，所以这里都要收集，用于下
 			// 一步深度去重做准备。
+			//
+			// 没有在一维数组中进行遍历去重，而是使用hash构建二维数组是为了提高比对效率。
 			typehash[t.hash] = append(tlist, t)
 		}
 
@@ -618,12 +630,15 @@ func typelinksinit() {
 				// hash 相同只是去重的第一步
 				for _, candidate := range typehash[t.hash] {
 					seen := map[_typePair]struct{}{}
-					// 在哈希相同的情况下，还需深度比较，因为hash会发生碰撞。
+					// 不同模块的类型元数据type，不能直接通过地址进行比价，所以使用
+					// typesEqual进行深度比较。
 					if typesEqual(t, candidate, seen) {
 						t = candidate
 						break
 					}
 				}
+				// t表示的元数据类型别模块md使用，但t不一定是在模块本身定义的那个，为了在所有模块同一个类型
+				// 对应同一个_type实例，可能存储在之前模块中。
 				md.typemap[typeOff(tl)] = t
 			}
 		}

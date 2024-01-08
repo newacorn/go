@@ -84,6 +84,7 @@ func badsystemstack() {
 // memmove for more details.
 //
 // The (CPU-specific) implementations of this function are in memclr_*.s.
+// 从ptr指向内存开始到第n个字节全部清零。适用于刚分配的内存初始化。
 //
 //go:noescape
 func memclrNoHeapPointers(ptr unsafe.Pointer, n uintptr)

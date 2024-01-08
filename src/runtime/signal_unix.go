@@ -372,10 +372,12 @@ func sigpipe() {
 	}
 	dieFromSignal(_SIGPIPE)
 }
-// doSigPreempt() 函数被 sighandler() 函数调用
-//
 // doSigPreempt handles a preemption signal on gp.
+//
+// 处理异步抢占信号的函数。
+// doSigPreempt() 函数被 sighandler() 函数调用。
 func doSigPreempt(gp *g, ctxt *sigctxt) {
+	// println("doSigPreempt in gsignal:",getg()==getg().m.gsignal)
 	// Check if this G wants to be preempted and is safe to
 	// preempt.
 	if wantAsyncPreempt(gp) {
@@ -640,6 +642,9 @@ var testSigusr1 func(gp *g) bool
 //
 // The garbage collector may have stopped the world, so write barriers
 // are not allowed.
+// 参数gp是g0或者用户g(接收到信号时,getg()返回的值)，
+// 在此函数中getg()返回的是gp.gsignal(在 sigtrampgo 中设置的)。
+// 此函数运行在 alternate signal stack 中(在 minitSignalStack 函数中设置的)。
 //
 //go:nowritebarrierrec
 func sighandler(sig uint32, info *siginfo, ctxt unsafe.Pointer, gp *g) {

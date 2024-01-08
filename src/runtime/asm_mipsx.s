@@ -334,13 +334,13 @@ TEXT NAME(SB),WRAPPER,$MAXSIZE-28;	\
 	JAL	(R4);	\
 	/* copy return values back */		\
 	MOVW	stackArgsType+0(FP), R5;	\
-	MOVW	stackArgs+8(FP), R1;	\
-	MOVW	stackArgsSize+12(FP), R2;	\
-	MOVW	stackRetOffset+16(FP), R4;	\
+	MOVW	stackArgs+8(FP), R1;	\     // 参数起始地址。
+	MOVW	stackArgsSize+12(FP), R2;	\ // 参数和返回值占用总内存大小
+	MOVW	stackRetOffset+16(FP), R4;	\ // 返回值占用内存大小
 	ADDU	$4, R29, R3;	\
-	ADDU	R4, R3;	\
-	ADDU	R4, R1;	\
-	SUBU	R4, R2;	\
+	ADDU	R4, R3;	\ // 被调用函数的返回值的起始地址。
+	ADDU	R4, R1;	\ // 原本返回值的起始地址。
+	SUBU	R4, R2;	\ // 原本返回值占用的内存大小。
 	JAL	callRet<>(SB);		\
 	RET
 

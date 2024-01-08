@@ -123,7 +123,7 @@ func (s *mspan) allocBitsForIndex(allocBitIndex uintptr) markBits {
 // can be used. It then places these 8 bytes into the cached 64 bit
 // s.allocCache.
 func (s *mspan) refillAllocCache(whichByte uintptr) {
-	// 将allocBits的值+ whichByte的值作为[8]uint8的地址
+	// 将 s.allocBits.x的地址+whichByte的值的结果解引用为uint64类型的值即这里的aCache。
 	bytes := (*[8]uint8)(unsafe.Pointer(s.allocBits.bytep(whichByte)))
 	aCache := uint64(0)
 	aCache |= uint64(bytes[0])
@@ -134,10 +134,8 @@ func (s *mspan) refillAllocCache(whichByte uintptr) {
 	aCache |= uint64(bytes[5]) << (5 * 8)
 	aCache |= uint64(bytes[6]) << (6 * 8)
 	aCache |= uint64(bytes[7]) << (7 * 8)
-	//
-	// 取反，让1变成0，让0变成1。在 allocBits 中bit位为0表示未分配
-	// 而 allocCache 中却相反，又因为从低位开始填充 allocCache,所
-	// 以s.allocCache 低位可能会出现连续的0，高位是连续的1。
+	// 取反，让1变成0，让0变成1。在allocBits中bit位为0表示未分配
+	// 而allocCache中却相反。所以需要对aCache取反。
 	s.allocCache = ^aCache
 }
 
@@ -312,9 +310,10 @@ func markBitsForAddr(p uintptr) markBits {
 }
 
 func (s *mspan) markBitsForIndex(objIndex uintptr) markBits {
-	// objIndex对应的object在gcmarkBits中对应的位作为bytep的对应字节
-	// 的起始位。
-	// mask 是个掩码用来按位与确定该位是否设置。
+	// objIndex对应的object在gcmarkBits中对应的位在bytep的对应字节
+	// 中。
+	// mask 是个掩码用来按位与确定该位是否设置。起始mask中只有一位是1，
+	// 其它位都是0，这个为1的位在mask中的偏移量就是bytep中objIndex对应的位在bytep中的偏移量。
 	bytep, mask := s.gcmarkBits.bitp(objIndex)
 	return markBits{bytep, mask, objIndex}
 }

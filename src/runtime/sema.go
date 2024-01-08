@@ -223,11 +223,22 @@ func semacquire1(addr *uint32, lifo bool, profile semaProfileFlags, skipframes i
 		root.nwait.Add(1)
 		// Check cansemacquire to avoid missed wakeup.
 		// 进入等待队列之前再试一次。
+		//
+		// *下面的检查不是必须只是为了减少不必要的休眠。
 		if cansemacquire(addr) {
 			root.nwait.Add(-1)
 			unlock(&root.lock)
 			break
 		}
+		// *释放和获取者对add和root.nwant的读取修改相对顺序很重要。
+		// canacquire(addr) // 获取者
+		// atomic.Xadd(addr,1)//释放者
+		// atomic.Load(&root.nwant)==0，直接返回。//释放者
+		// atomic.Xadd(&root.nwait,1)，进入休眠。//获取者
+		// 从而存在一个永远不会被唤醒的等待者。
+		//
+		// 同样如果释放者调整addr和root.nwant的顺序也会出现不会被唤醒的休眠者。
+		//
 		// Any semrelease after the cansemacquire knows we're waiting
 		// (we set nwait above), so go to sleep.
 		// 获取失败，将关联的sudog入队列
@@ -283,6 +294,8 @@ func semrelease1(addr *uint32, handoff bool, skipframes int) {
 	// 在获得锁之前等待着虽然增加了 root.nwait 计数，但在进入
 	// 等待队列之前的尝试获取计数成功了，然后释放了锁，就会产生
 	// 下面 root.nwait.load()=0 的情况。
+	//
+	// 下面的检查，可以避免不必要的唤醒，但不是必须的。
 	if root.nwait.Load() == 0 {
 		// 在有锁的情况下，能观察到 root.nwait=0
 		// 说明等待队列中肯定没有成员。

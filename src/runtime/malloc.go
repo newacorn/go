@@ -266,9 +266,9 @@ const (
 	logHeapArenaBytes = (6+20)*(_64bit*(1-goos.IsWindows)*(1-goarch.IsWasm)*(1-goos.IsIos*goarch.IsArm64)) + (2+20)*(_64bit*goos.IsWindows) + (2+20)*(1-_64bit) + (2+20)*goarch.IsWasm + (2+20)*goos.IsIos*goarch.IsArm64
 
 	// heapArenaBitmapWords is the size of each heap arena's bitmap in uintptrs.
-	// 64MB/8/8(unix)=1024；每个bit对应一个指针大小的内存，一个bit表示 指针/标量位，或每个bit一个表示 扫描/终止。
-	// 即这个内存上存储的是否是指针和这个内存之后是否需要再扫描（限定在一个obj中）。
-	// 8MB/8/8 = 131072
+	// heapArenaWords=8MB
+	// 8MB/8/8 = 131072 = 128KB
+	// bitmap words 的位图，存储在uintptrs类型的值中。
 	heapArenaBitmapWords = heapArenaWords / (8 * goarch.PtrSize)
 
 	pagesPerArena = heapArenaBytes / pageSize
@@ -361,6 +361,8 @@ const (
 //
 // This must be set by the OS init code (typically in osinit) before
 // mallocinit.
+//
+// amd linux 4906
 var physPageSize uintptr
 
 // physHugePageSize is the size in bytes of the OS's default physical huge
@@ -377,6 +379,7 @@ var physPageSize uintptr
 // performance critical functions.
 var (
 	physHugePageSize  uintptr
+	// 2MB 2^21
 	physHugePageShift uint
 )
 
@@ -392,11 +395,12 @@ func mallocinit() {
 		throw("heapArenaBitmapWords not a power of 2")
 	}
 
-	// Check physPageSize.
 	if physPageSize == 0 {
+		// amd64 4096
 		// The OS init code failed to fetch the physical page size.
 		throw("failed to get system page size")
 	}
+	   // maxPhysPageSize 512KB
 	if physPageSize > maxPhysPageSize {
 		print("system page size (", physPageSize, ") is larger than maximum page size (", maxPhysPageSize, ")\n")
 		throw("bad system page size")
@@ -409,10 +413,12 @@ func mallocinit() {
 		print("system page size (", physPageSize, ") must be a power of 2\n")
 		throw("bad system page size")
 	}
+	// phyHungePageSize 2048KB amd64 linux
 	if physHugePageSize&(physHugePageSize-1) != 0 {
 		print("system huge page size (", physHugePageSize, ") must be a power of 2\n")
 		throw("bad system huge page size")
 	}
+	// maxPhysHungPageSize 4096KB
 	if physHugePageSize > maxPhysHugePageSize {
 		// physHugePageSize is greater than the maximum supported huge page size.
 		// Don't throw here, like in the other cases, since a system configured
@@ -427,17 +433,22 @@ func mallocinit() {
 			physHugePageShift++
 		}
 	}
+	// 8192/512=16
 	if pagesPerArena%pagesPerSpanRoot != 0 {
 		print("pagesPerArena (", pagesPerArena, ") is not divisible by pagesPerSpanRoot (", pagesPerSpanRoot, ")\n")
 		throw("bad pagesPerSpanRoot")
 	}
+	// 8192/512=16
 	if pagesPerArena%pagesPerReclaimerChunk != 0 {
 		print("pagesPerArena (", pagesPerArena, ") is not divisible by pagesPerReclaimerChunk (", pagesPerReclaimerChunk, ")\n")
 		throw("bad pagesPerReclaimerChunk")
 	}
 
 	// Initialize the heap.
+	// 初始化各种堆管理结构分配器，比如mspan/mcache/heapHint等，这些分配器在堆外为这个类型的值分配的内存。
 	mheap_.init()
+	// 在p的mcache没有初始化前，用于分配msapn。
+	// 主要再初始阶段使用，待p初始化后会将此值设置为nil。
 	mcache0 = allocmcache()
 	lockInit(&gcBitsArenas.lock, lockRankGcBitsArenas)
 	lockInit(&profInsertLock, lockRankProfInsert)
@@ -491,7 +502,10 @@ func mallocinit() {
 		//
 		// In race mode we have no choice but to just use the same hints because
 		// the race detector requires that the heap be mapped contiguously.
+		// 0x7f=0111 1111
+		// 0x7f=127
 		for i := 0x7f; i >= 0; i-- {
+			// 128 iteration ,127-0
 			var p uintptr
 			switch {
 			case raceenabled:
@@ -514,6 +528,8 @@ func mallocinit() {
 				}
 				p = uintptr(i)<<40 | uintptrMask&(0xa0<<52)
 			default:
+				// p=0x[00-0x7F]c000000000
+				// p=0x[0x7F-0x00]c000000000
 				p = uintptr(i)<<40 | uintptrMask&(0x00c0<<32)
 			}
 			// Switch to generating hints for user arenas if we've gone
@@ -521,6 +537,11 @@ func mallocinit() {
 			// a quarter; we don't have very much space to work with.
 			hintList := &mheap_.arenaHints
 			if (!raceenabled && i > 0x3f) || (raceenabled && i > 0x5f) {
+				// race disabled
+				// [64-127] for userArena
+				// [0-63] for normalArean
+				// race endabled
+				// [96-127]=31 for userArena
 				hintList = &mheap_.userArena.arenaHints
 			}
 			hint := (*arenaHint)(mheap_.arenaHintAlloc.alloc())
@@ -602,6 +623,7 @@ func mallocinit() {
 		userArenaHint.addr = p
 		userArenaHint.next, mheap_.userArena.arenaHints = mheap_.userArena.arenaHints, userArenaHint
 	}
+	// println(mheap_.arenaHints.addr)
 }
 
 // sysAlloc allocates heap arena space for at least n bytes. The
@@ -620,17 +642,32 @@ func mallocinit() {
 // be transitioned to Prepared and then Ready before use.
 //
 // h must be locked.
+//
+// 返回值：
+// v 是这段地址空间的起始地址。
+// size 为64MB*正整数，n向上对齐64MB的结果。
+//
+// 参数：
+// n需向上对齐64MB，表示申请多少字节的地址空间。
+// hintList 指示申请的n字节申请的起始地址。
+// register 是否将此段地址区间对应的 arena 注册到mheap_.allArenas中。
+//
+// 影响：
+// 对[v,v+size)地址空间执行map _PROT_NONE， reversed状态。
 func (h *mheap) sysAlloc(n uintptr, hintList **arenaHint, register bool) (v unsafe.Pointer, size uintptr) {
 	assertLockHeld(&h.lock)
 
+	// n=64MB
+	// heapArenaBytes=64MB
 	n = alignUp(n, heapArenaBytes)
-
 	if hintList == &h.arenaHints {
 		// First, try the arena pre-reservation.
 		// Newly-used mappings are considered released.
 		//
 		// Only do this if we're using the regular heap arena hints.
 		// This behavior is only for the heap.
+		//
+		// amd64第一次调用，v = nil
 		v = h.arena.alloc(n, heapArenaBytes, &gcController.heapReleased)
 		if v != nil {
 			size = n
@@ -649,12 +686,15 @@ func (h *mheap) sysAlloc(n uintptr, hintList **arenaHint, register bool) (v unsa
 			// We can't use this, so don't ask.
 			v = nil
 		} else if arenaIndex(p+n-1) >= 1<<arenaBits {
+			// >=2^22
 			// Outside addressable heap. Can't use.
 			v = nil
 		} else {
+			// 对[p,p+n)地址空间执行map _PROT_NONE
 			v = sysReserve(unsafe.Pointer(p), n)
 		}
 		if p == uintptr(v) {
+			// p等于map返回的起始地址。
 			// Success. Update the hint.
 			if !hint.down {
 				p += n
@@ -669,13 +709,20 @@ func (h *mheap) sysAlloc(n uintptr, hintList **arenaHint, register bool) (v unsa
 		// told to only return the requested address. In
 		// particular, this is already how Windows behaves, so
 		// it would simplify things there.
+		//
+		// windows要么返回所请求的起始地址，要么返回nil。
+		// 其它平台可能会另谋它处位我们的请求分配n字节大小的地址空间，并返回新的起始地址。
 		if v != nil {
+			// 不是我们想要的起始地址，则释放这段内存区域。
+			// 使用munmap释放[v,v+n)区间地址空间。
 			sysFreeOS(v, n)
 		}
+		// 尝试下一个arenaHint。
 		*hintList = hint.next
+		// 释放这个hint，这个hint位于堆外。
 		h.arenaHintAlloc.free(unsafe.Pointer(hint))
 	}
-
+	// 地址空间已经被 map _PROT_NONE
 	if size == 0 {
 		if raceenabled {
 			// The race detector assumes the heap lives in
@@ -721,15 +768,19 @@ func (h *mheap) sysAlloc(n uintptr, hintList **arenaHint, register bool) (v unsa
 		}
 	}
 
+	// (正整数*64MB)&(64MB-1)=0
 	if uintptr(v)&(heapArenaBytes-1) != 0 {
 		throw("misrounded allocation in sysAlloc")
 	}
 
 mapped:
 	// Create arena metadata.
+	// v的是(正整数*64MB)所以其地址区间可能跨越多个arena。
 	for ri := arenaIndex(uintptr(v)); ri <= arenaIndex(uintptr(v)+size-1); ri++ {
 		l2 := h.arenas[ri.l1()]
 		if l2 == nil {
+			//
+			//
 			// Allocate an L2 arena map.
 			//
 			// Use sysAllocOS instead of sysAlloc or persistentalloc because there's no
@@ -738,6 +789,9 @@ mapped:
 			// is paged in is too expensive. Trying to account for the whole region means
 			// that it will appear like an enormous memory overhead in statistics, even though
 			// it is not.
+			//
+			// amd64 unsafe.Sizeof(*l2)=2^22=4MB
+			// sysAllocOs mmap(nil, n, _PROT_READ|_PROT_WRITE, _MAP_ANON|_MAP_PRIVATE, -1, 0)
 			l2 = (*[1 << arenaL2Bits]*heapArena)(sysAllocOS(unsafe.Sizeof(*l2)))
 			if l2 == nil {
 				throw("out of memory allocating heap arena map")
@@ -751,6 +805,7 @@ mapped:
 		var r *heapArena
 		r = (*heapArena)(h.heapArenaAlloc.alloc(unsafe.Sizeof(*r), goarch.PtrSize, &memstats.gcMiscSys))
 		if r == nil {
+			// amd64 上面的r是nil。
 			r = (*heapArena)(persistentalloc(unsafe.Sizeof(*r), goarch.PtrSize, &memstats.gcMiscSys))
 			if r == nil {
 				throw("out of memory allocating heap arena metadata")
@@ -760,10 +815,12 @@ mapped:
 		// Register the arena in allArenas if requested.
 		if register {
 			if len(h.allArenas) == cap(h.allArenas) {
+				// 第一次调用等于len(h.allArenas)=cap(h.allArenas)=0
 				size := 2 * uintptr(cap(h.allArenas)) * goarch.PtrSize
 				if size == 0 {
 					size = physPageSize
 				}
+				// 第一次调用 size=4096
 				newArray := (*notInHeap)(persistentalloc(size, goarch.PtrSize, &memstats.gcMiscSys))
 				if newArray == nil {
 					throw("out of memory allocating allArenas")
@@ -1025,6 +1082,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	// GC is not currently active.
 	/*********************辅助GC****************************/
 	// 1. 辅助GC
+	// assistG是用来偿还此次内存分配的用户g。
 	assistG := deductAssistCredit(size)
 	// gcBlackenEnabled 在GC标记开始的时候被设置为1，在标记结束的
 	// 时候被清零，也就是只有在GC标记阶段才能执行辅助GC。
@@ -1040,6 +1098,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	mp.mallocing = 1
 
 	shouldhelpgc := false
+	// dataSize: 分配的内存原始大小(调用此函数size的值)。因为size在下面会进行修正。
 	dataSize := userSize
 	c := getMCache(mp)
 	if c == nil {
@@ -1411,7 +1470,9 @@ func deductAssistCredit(size uintptr) *g {
 			// This G is in debt. Assist the GC to correct
 			// this before allocating. This must happen
 			// before disabling preemption.
+			// println("assistG.gcAssistBytes",assistG.gcAssistBytes,size)
 			gcAssistAlloc(assistG)
+			// println("assistG.gcAssistBytes",assistG.gcAssistBytes,size,"end")
 		}
 	}
 	/*********************辅助GC End****************************/
@@ -1449,8 +1510,9 @@ func memclrNoHeapPointersChunked(size uintptr, x unsafe.Pointer) {
 // compiler (both frontend and SSA backend) knows the signature
 // of this function.
 func newobject(typ *_type) unsafe.Pointer {
-	// t:=reflect.TypeOf(0)
+	println(typ)
 	// println(typ.string())
+	// t:=reflect.TypeOf(0)
 	return mallocgc(typ.size, typ, true)
 }
 
@@ -1708,7 +1770,12 @@ func (l *linearAlloc) init(base, size uintptr, mapMemory bool) {
 	l.mapMemory = mapMemory
 }
 
+// size 字节大小
+// align 比如arena大小64MB
+// sysStat 统计
 func (l *linearAlloc) alloc(size, align uintptr, sysStat *sysMemStat) unsafe.Pointer {
+	// amd64，第一次调用p=0
+	// size=64MB
 	p := alignUp(l.next, align)
 	if p+size > l.end {
 		return nil

@@ -102,6 +102,7 @@ type mheap struct {
 	// the slope, it would create a discontinuity in debt if any
 	// progress has already been made.
 	pagesInUse         atomic.Uintptr // pages of spans in stats mSpanInUse
+	// 只要对msapn执行了sweep操作，无论清理结果如何。都会将 mspan.npages 增加到此值。
 	pagesSwept         atomic.Uint64  // pages swept this cycle
 	pagesSweptBasis    atomic.Uint64  // pagesSwept to use as the origin of the sweep ratio
 	sweepHeapLiveBasis uint64         // value of gcController.heapLive to use as the origin of sweep ratio; written with lock, read without
@@ -162,6 +163,14 @@ type mheap struct {
 	// actual heap arena ranges.
 	//
 	// arena 内存分配的起始地址列表。
+	// p=0x[00-0x7F]c000000000
+	// mallocinit
+	// 在 mallocinit 函数中初始化，共初始化128个arenaHint实例，它们使用arenaHint.next串联。
+	// 起始的 arenaHint.addr 是0x00c000000000，其next的addr是0x00c100000000一直到0x7f0000000000。
+	//
+	// 没有开启race检测的话：
+	// 0x[40-7F]c000000000 for userArena
+	// 0x[0-3F]c000000000 for normalArean
 	arenaHints *arenaHint
 
 	// arena is a pre-reserved space for allocating heap arenas
@@ -179,6 +188,8 @@ type mheap struct {
 	// then release mheap_.lock.
 	//
 	// 已经映射的 arena 索引切片。
+	// amd64: 初始大小为 cap(allArenas)=4096(phyicpagesize/8)=512
+	// 在 sysAlloc 调用中初始化。
 	allArenas []arenaIdx
 
 	// sweepArenas is a snapshot of allArenas taken at the
@@ -358,6 +369,8 @@ type heapArena struct {
 	// 清扫阶段如果发现某个 mspan 不存在被标记的对象，就可以释放整个 mspan 了。
 	// **和 g.gcAssistBytes(详见) 在同一个地方进行重置(每轮GC开始时，上一轮清扫结束STW之前)**
 	// 1024大小的数组
+	//
+	// 每轮GC开始时此字段在gcstart函数调用中被清空。
 	pageMarks [pagesPerArena / 8]uint8
 
 	// pageSpecials is a bitmap that indicates which spans have
@@ -395,10 +408,13 @@ type heapArena struct {
 	//
 	// Read atomically and written with an atomic CAS.
 	//
-	// zeroedBase 记录的是当前 arena 中下个还未被使用的页的位置，相对于 arena
-	// 的起始地址的偏移量。页面分配器会安装地址顺序分配页面，所以 zeroedBase 之
+	// zeroedBase 记录的是当前 arena 中下个还未被使用的页的位置，相对于arena
+	// 的起始地址的偏移量。
+	// 页面分配器会安装地址顺序分配页面，所以 zeroedBase 之
 	// 后的页面都还没有被用到，因此还都保持着清零的状态。通过它可以快速判断分配的
 	// 内存是否还需要进行清零。
+	//
+	// 绝对地址为: 此arnea在mheap中的索引*64MB+zeroedBase。
 	zeroedBase uintptr
 }
 
@@ -514,7 +530,7 @@ type mspan struct {
 	// list 指向双链表的链表头
 	list *mSpanList // For debugging. TODO: Remove.
 
-	// 指向当前 mspan 的起始地址。
+	// 指向当前 mspan 的第一个对象/第一个页的起始地址。
 	startAddr uintptr // address of first byte of span aka s.base()
 	// 记录的是当前 mspan 中有几个页面，乘以页面的大小就可以得出 mspan 空间的大小。
 	npages    uintptr // number of pages in span
@@ -561,7 +577,7 @@ type mspan struct {
 	//
 	// allocCache 缓存了 allocBits 中从 freeindex 开始的64个二进制位，
 	// 这样一来在实际分配时更高效。
-	// 假设 allocCache 中n个位为1，就表示在从新填充allocCache之前，在区间[freeindex,freeindex+n)范围内
+	// 假设 allocCache 中n个位为1，就表示在重新填充allocCache之前，在区间[freeindex,freeindex+n)范围内
 	// 的索引都对应一个有效未使用过的obj，但索引最大值能超过 nelems 的值。
 	allocCache uint64
 
@@ -648,6 +664,7 @@ type mspan struct {
 	// goroutine 的栈分配的就是 mSpanManual状态的span。
 	state                 mSpanStateBox // mSpanInUse etc; accessed atomically (get/set methods)
 	// 表明分配之前需要对内存进行清零。
+	// 在清扫一个msapn时，如果存在被清理的对象(分配未标记)。则此值会设置为1。
 	needzero              uint8         // needs to be zeroed before allocation
 	isUserArenaChunk      bool          // whether or not this span represents a user arena
 	// 记录 mcache 从 mcentral 中申请这个 mspan 时它的 allocCount 字段。
@@ -742,6 +759,9 @@ func recordspan(vh unsafe.Pointer, p unsafe.Pointer) {
 // collector.
 //
 // 取值范围：[0-135]
+//
+// 编号为0的spanClass表示其对应的mspan管理的是大对象超过32KB。这样的mspan只包含一个
+// 对象。
 // sizeClass 有68种，编号为0-67
 // 每个编号向左移一位，空位为0表示scan，为1表示noscan。
 // 这样 spanClass 就有了136种。
@@ -898,6 +918,11 @@ func spanOf(p uintptr) *mspan {
 		if ri.l2() >= uint(len(mheap_.arenas[0])) {
 			return nil
 		}
+		// 上面的if已经包含了 arenaL1Bits==0&&l2==nil的情况。
+		// 如果l2==nil，则ri.l2()肯定会大于等于uint(len(mheap_.arenas[0]))=0。
+		// if arenaL1Bits != 0 && l2 == nil { // Should never happen if there's no L1.
+		// 	return nil
+		// }
 	} else {
 		// If there's an L1, then ri.l1() can be out of bounds but ri.l2() can't.
 		// Windows 平台下，ri中表示第一维索引的值大于 2^6-1 了。
@@ -1000,6 +1025,8 @@ func (h *mheap) init() {
 // reclaim implements the page-reclaimer half of the sweeper.
 //
 // h.lock must NOT be held.
+//
+// npage 要scavenged的页数，不过最少需要scavenged 512页。
 func (h *mheap) reclaim(npage uintptr) {
 	// TODO(austin): Half of the time spent freeing spans is in
 	// locking/unlocking the heap (even with low contention). We
@@ -1076,6 +1103,16 @@ func (h *mheap) reclaim(npage uintptr) {
 // h.lock must be held and the caller must be non-preemptible. Note: h.lock may be
 // temporarily unlocked and re-locked in order to do sweeping or if tracing is
 // enabled.
+//
+// GC Sweep阶段执行。清扫：即将在 heapArena.pageInUse 中对应位为1，在 heapArena.pageMarks
+// 中对应位为1的msapn的
+//
+// 参数：
+// arenas mheap.sweepArenas 的快照。
+// pageIdx 从此页开始清扫。
+// n 最有可能是512 要清扫的页数。
+// 返回值：
+// 已清扫的页数。
 func (h *mheap) reclaimChunk(arenas []arenaIdx, pageIdx, n uintptr) uintptr {
 	// The heap lock must be held because this accesses the
 	// heapArena.spans arrays using potentially non-live pointers.
@@ -1211,6 +1248,7 @@ func (h *mheap) allocManual(npages uintptr, typ spanAllocType) *mspan {
 // setSpans()
 // 将根据 base 找到对应的 arena 的元数据描述 heapArena，
 // 然后将页和s的关系添加到 heapArena.spans 中。
+// [base,base+npages*pageSize)可能跨越多个arena。
 //
 // setSpans modifies the span map so [spanOf(base), spanOf(base+npage*pageSize))
 // is s.
@@ -1248,9 +1286,13 @@ func (h *mheap) setSpans(base, npage uintptr, s *mspan) {
 // critical for future page allocations.
 //
 // There are no locking constraints on this method.
+//
+// 检查 [base, base+npage*pageSize) 这段地址空间是否需要清零，并更其所在的arena.zeroedBase字段。
+// mheap.sysAlloc
 func (h *mheap) allocNeedsZero(base, npage uintptr) (needZero bool) {
 	for npage > 0 {
 		ai := arenaIndex(base)
+		// ha在mheap.sysAlloc函数调用中进行分配，此函数只将其地址空间设置为reversed状态。
 		ha := h.arenas[ai.l1()][ai.l2()]
 
 		zeroedBase := atomic.Loaduintptr(&ha.zeroedBase)
@@ -1275,11 +1317,13 @@ func (h *mheap) allocNeedsZero(base, npage uintptr) (needZero bool) {
 		// at heapArenaBytes.
 		arenaLimit := arenaBase + npage*pageSize
 		if arenaLimit > heapArenaBytes {
+			// 跨越了一个arena
 			arenaLimit = heapArenaBytes
 		}
 		// Increase ha.zeroedBase so it's >= arenaLimit.
 		// We may be racing with other updates.
 		for arenaLimit > zeroedBase {
+			// 原子更新 ha.zeroedBase
 			if atomic.Casuintptr(&ha.zeroedBase, zeroedBase, arenaLimit) {
 				break
 			}
@@ -1295,6 +1339,8 @@ func (h *mheap) allocNeedsZero(base, npage uintptr) (needZero bool) {
 
 		// Move base forward and subtract from npage to move into
 		// the next arena, or finish.
+		//
+		// 跨arena了
 		base += arenaLimit - arenaBase
 		npage -= (arenaLimit - arenaBase) / pageSize
 	}
@@ -1311,6 +1357,8 @@ func (h *mheap) allocNeedsZero(base, npage uintptr) (needZero bool) {
 // that the function is run on the system stack, because that's
 // the only place it is used now. In the future, this requirement
 // may be relaxed if its use is necessary elsewhere.
+//
+// 从 p.mspancache 的 mspan 结构体缓存中分配一个 mspan 结构体(没有对应的内存页).
 //
 //go:systemstack
 func (h *mheap) tryAllocMSpan() *mspan {
@@ -1334,6 +1382,10 @@ func (h *mheap) tryAllocMSpan() *mspan {
 // its caller holds the heap lock. See mheap for details.
 // Running on the system stack also ensures that we won't
 // switch Ps during this function. See tryAllocMSpan for details.
+//
+// 如果当前 p 不可用，直接使用 mheap.spanalloc() 返回一个 mspan 接头体对象。
+// 否则如果 p.mspancache.len==0，则通过 mheap.spanalloc()填充64个 mspan 结构体，
+// 到 p.mspancache ,并返回 p.mspancache[63]。
 //
 //go:systemstack
 func (h *mheap) allocMSpanLocked() *mspan {
@@ -1366,6 +1418,9 @@ func (h *mheap) allocMSpanLocked() *mspan {
 // its caller holds the heap lock. See mheap for details.
 // Running on the system stack also ensures that we won't
 // switch Ps during this function. See tryAllocMSpan for details.
+//
+// 释放一个 mspan 对象，如果当前 p.mspancache 缓存未满，则填充到其中。
+// 否则调用 mheap.spanalloc.free 进行释放。
 //
 //go:systemstack
 func (h *mheap) freeMSpanLocked(s *mspan) {
@@ -1410,6 +1465,12 @@ func (h *mheap) freeMSpanLocked(s *mspan) {
 //
 // 内存页面和 mspan 都有特定的分配器。
 //
+// 从推中根据spanclass、npages和spanAllocType构建一个mspan，并为这个mspan
+// 管理的内存分配空间。如果推中现存的处于prepared的页面不够，就从推中重新grow一些。然后再
+// 通过 pageAlloc 分配。无论如何mspan管理的内存都是由 pageAlloc 进行分配的。
+//
+// 如果堆中没有空间了，就尝试通过 allocMSpanLocked 看有没有可供重用的且符合参数要求的mspan。
+//
 //go:systemstack
 func (h *mheap) allocSpan(npages uintptr, typ spanAllocType, spanclass spanClass) (s *mspan) {
 	// Function-global state.
@@ -1426,9 +1487,9 @@ func (h *mheap) allocSpan(npages uintptr, typ spanAllocType, spanclass spanClass
 	// The page cache does not support aligned allocations, so we cannot use
 	// it if we need to provide a physical page aligned stack allocation.
 	pp := gp.m.p.ptr()
+	// pageCachePages/4=64/4=16
 	if !needPhysPageAlign && pp != nil && npages < pageCachePages/4 {
 		c := &pp.pcache
-
 		// If the cache is empty, refill it.
 		if c.empty() {
 			lock(&h.lock)
@@ -1483,15 +1544,21 @@ func (h *mheap) allocSpan(npages uintptr, typ spanAllocType, spanclass spanClass
 
 	if base == 0 {
 		// Try to acquire a base address.
+		// 尝试从 pageAlloc 中的inUse中分配页面。
 		base, scav = h.pages.alloc(npages)
 		if base == 0 {
+			// h.pages中没有足够的页面来分配napages。
 			var ok bool
+			// 从堆中分配新的页面(将其地址区间变为prepared状态)，
+			// 为h.pageAlloc的inUse添加新的addrRange，并针对addRange更新对应的位图和sum信息。
 			growth, ok = h.grow(npages)
+			// 因为npages要向上对齐到512(4MB)，所以growth肯定是4MB的倍数。
 			if !ok {
 				unlock(&h.lock)
 				return nil
 			}
 			base, scav = h.pages.alloc(npages)
+			// 添加了新的addrRange，所以再次通过h.pages分配。
 			if base == 0 {
 				throw("grew heap, but no adequate free space found")
 			}
@@ -1515,10 +1582,19 @@ HaveSpan:
 	// It's fine to do this after allocating because we expect any scavenged
 	// pages not to get touched until we return. Simultaneously, it's important
 	// to do this before calling sysUsed because that may commit address space.
+	//
+	// sync scavenge要scavenge的字节大小。
 	bytesToScavenge := uintptr(0)
+	//
+	// println("go119MemoryLimitSupport",go119MemoryLimitSupport) // true
+	// println("gcCPULimiter.limiting()",gcCPULimiter.limiting()) // false
+	// println("limit",gcController.memoryLimit.Load()) // 0
+	// println(gcController.memoryLimit.Load(),"gcController.memoryLimit.Load()")
 	if limit := gcController.memoryLimit.Load(); go119MemoryLimitSupport && !gcCPULimiter.limiting() {
 		// Assist with scavenging to maintain the memory limit by the amount
 		// that we expect to page in.
+		//
+		// inuse 已经处于ready状态的字节数，通过sysUsed设置。
 		inuse := gcController.mappedReady.Load()
 		// Be careful about overflow, especially with uintptrs. Even on 32-bit platforms
 		// someone can set a really big memory limit that isn't maxInt64.
@@ -1526,6 +1602,14 @@ HaveSpan:
 			bytesToScavenge = uintptr(uint64(scav) + inuse - uint64(limit))
 		}
 	}
+	// println("bytesToScavenge1",bytesToScavenge)
+	// bytesToScavenge1 6888464
+	
+	
+	// grow 不为0表示npages立刻不能通过pageAlloc分配的，然后调用mheap.grow增加npages到pageAlloc的inUse中
+	// ,再调用pageAlloc分配的。这个growth就是npages向上对齐到512页后的页数的总字节数。
+	//
+	// 即因为分配npages而分配了一些页并将这些页设置为prepared状态。
 	if goal := scavenge.gcPercentGoal.Load(); goal != ^uint64(0) && growth > 0 {
 		// We just caused a heap growth, so scavenge down what will soon be used.
 		// By scavenging inline we deal with the failure to allocate out of
@@ -1535,6 +1619,8 @@ HaveSpan:
 		// Only bother with this because we're not using a memory limit. We don't
 		// care about heap growths as long as we're under the memory limit, and the
 		// previous check for scaving already handles that.
+		//
+		// 没有设置GOMEMLIMIT
 		if retained := heapRetained(); retained+uint64(growth) > goal {
 			// The scavenging algorithm requires the heap lock to be dropped so it
 			// can acquire it only sparingly. This is a potentially expensive operation
@@ -1547,18 +1633,30 @@ HaveSpan:
 			if todo > bytesToScavenge {
 				bytesToScavenge = todo
 			}
+			// bytesToScavenge为max(min(growth,overage),bytesToScavenge)
 		}
 	}
+	// bytesToScavenge为memorylimit scavenge 和 gcPercent scavenge 计算到的较大值。
+	// 如果没有竖着MEMORYLIMIT时大概率为：gcController.mappedReady.Load() + scav。
+	//
+	// println("bytesToScavenged",bytesToScavenge)
+	// bytesToScavenged 6888464
+	// bytesToScavenge为GOMEMLIMIT限制计算要scavenged的字节和GC限制计算要scavenged的字节中的较大值。
+	//
 	// There are a few very limited cirumstances where we won't have a P here.
 	// It's OK to simply skip scavenging in these cases. Something else will notice
 	// and pick up the tab.
 	var now int64
 	if pp != nil && bytesToScavenge > 0 {
+		// 用于执行scavenge的时间是受限的。
+		//
 		// Measure how long we spent scavenging and add that measurement to the assist
 		// time so we can track it for the GC CPU limiter.
 		//
 		// Limiter event tracking might be disabled if we end up here
 		// while on a mark worker.
+		//
+		// 记录此次scavenge执行的时间。
 		start := nanotime()
 		track := pp.limiterEvent.start(limiterEventScavengeAssist, start)
 
@@ -1572,10 +1670,12 @@ HaveSpan:
 		if track {
 			pp.limiterEvent.stop(limiterEventScavengeAssist, now)
 		}
+		// 记录此次scavenge执行的时间。
 		scavenge.assistTime.Add(now - start)
 	}
 
 	// Initialize the span.
+	// 根据spanclass/typ实例化初始s，并将s添加到其对应的heapArena的spans中。
 	h.initSpan(s, typ, spanclass, base, npages)
 
 	// Commit and account for any scavenged memory that the span now owns.
@@ -1583,10 +1683,18 @@ HaveSpan:
 	if scav != 0 {
 		// sysUsed all the pages that are actually available
 		// in the span since some of them might be scavenged.
+		//
+		// 如果npages中包含有被scavenged的页，就将所有页设置为ready状态。
 		sysUsed(unsafe.Pointer(base), nbytes, scav)
+		// scavenged状态的页其对应的 pageAlloc.chunks中的scavenged位已经在前面
+		// 设置为0了且这些pages也变成了reay状态，所以要从gcController.heapReleased
+		// 计数中删除。
 		gcController.heapReleased.add(-int64(scav))
 	}
 	// Update stats.
+	// 如果这些页面中除了scavenged外还包含空闲页(被用于msapn后又回收了的页，即
+	// pageAlloc.chunks 中alooc位和scavenged位都为0的页)，
+	// 将其对应的字节数从gcController.heapFree统计计数中去除。
 	gcController.heapFree.add(-int64(nbytes - scav))
 	if typ == spanAllocHeap {
 		gcController.heapInUse.add(int64(nbytes))
@@ -1613,6 +1721,16 @@ HaveSpan:
 
 // initSpan initializes a blank span s which will represent the range
 // [base, base+npages*pageSize). typ is the type of span being allocated.
+//
+// 根据typ和spanclass设置s上的某些字段，并将s添加到其对应的 heapArena.spans 中。
+// [base,base_npages*pagesize)可能跨越多个arena。
+//
+// 参数：
+// s 一个零值mspan的地址
+// typ mspan 类型。
+// spanClass [0,136)
+// base npages的首页起始地址。
+// npages s占用的页数。
 func (h *mheap) initSpan(s *mspan, typ spanAllocType, spanclass spanClass, base, npages uintptr) {
 	// At this point, both s != nil and base != 0, and the heap
 	// lock is no longer held. Initialize the span.
@@ -1622,6 +1740,7 @@ func (h *mheap) initSpan(s *mspan, typ spanAllocType, spanclass spanClass, base,
 	}
 	nbytes := npages * pageSize
 	if typ.manual() {
+		// !=spanAllocHeap
 		s.manualFreeList = 0
 		s.nelems = 0
 		s.limit = s.base() + s.npages*pageSize
@@ -1672,6 +1791,8 @@ func (h *mheap) initSpan(s *mspan, typ spanAllocType, spanclass spanClass, base,
 	// this thread until pointers into the span are published (and
 	// we execute a publication barrier at the end of this function
 	// before that happens) or pageInUse is updated.
+	//
+	// 将s添加到对应的heapArena.spans中
 	h.setSpans(s.base(), npages, s)
 
 	if !typ.manual() {
@@ -1696,6 +1817,29 @@ func (h *mheap) initSpan(s *mspan, typ spanAllocType, spanclass spanClass, base,
 // returning how much the heap grew by and whether it worked.
 //
 // h.lock must be held.
+//
+// 从 mheap.curArena 表示的arena中分配npages(向上对齐到512页,4MB)，
+// 其实是将npages(对齐后的)这段地址空间标记为prepared状态。并更新对应的元数据信息。
+// 如果mheap.curArena不够分配npages，则会从堆中分配(将其对应的地址空间标记为reversed状态)
+// 新的arenas，并更新mheap.curArena。这些页在真正使用时(比如划分为mspan)才会将其地址区间
+// 变为ready状态。
+//
+// 首先将npage包含的字节数向上对齐到4MB(chunk对应的页(512页)总字节数)。
+// 然后将这段地址空间从reversed状态变为prepared(调用sysmap)。
+//
+// 如果 mheap.curArena 剩余地址空间小于不够分配npage，就会从调用 mheap.sysAlloc
+// 从堆中分配新的 arena (64MB amd64)，如果npage大于一个arena的大小，可能会分配多个arena，
+// 并将这些arena对应的地址空间标记为reversed状态。如果新分配的arenas(可能多个相连)首个arena
+// 的起始地址没有与mheap.curArena.end相连，则将mheap.curArena剩余空间通过调用pageAlloc.grow
+// 更新为prepared状态。将mheap.curArena更新为刚刚分配的arenas首尾个arena的起始地址和最后一个
+// arena的末端地址。
+// 如果相连，则将mheap.curArena.end 设置为arenas末端arena的地址空间的末尾地址。
+//
+// 此函数返回之后，这段因npage ready的分配的地址空间(向上对齐到512页,4MB)，就可以直接使用(比如用于分配mspan)了。
+//
+// 返回值：
+// uintptr: 4MB的整数倍，表示因npages而prepared的地址空间大小。
+// bool 表示是否成功。如果为false则第一个返回值没有意义。
 func (h *mheap) grow(npage uintptr) (uintptr, bool) {
 	assertLockHeld(&h.lock)
 
@@ -1704,6 +1848,8 @@ func (h *mheap) grow(npage uintptr) (uintptr, bool) {
 	// round up to pallocChunkPages which is on the order
 	// of MiB (generally >= to the huge page size) we
 	// won't be calling it too much.
+	//
+	// ask=4MB
 	ask := alignUp(npage, pallocChunkPages) * pageSize
 
 	totalGrowth := uintptr(0)
@@ -1711,11 +1857,22 @@ func (h *mheap) grow(npage uintptr) (uintptr, bool) {
 	// and is otherwise unrelated to h.curArena.base.
 	end := h.curArena.base + ask
 	nBase := alignUp(end, physPageSize)
+	// 此函数第一次调用时 h.curArena.end=h.curArena.base=0
+	//
+	// nBase > h.curArena.end 第一次调用时会出现。因为此时h.curArena.end还是0
+	// end < h.curArena.base  当前h.curArena剩余地址空间不够分配ask指定的空间。
 	if nBase > h.curArena.end || /* overflow */ end < h.curArena.base {
 		// Not enough room in the current arena. Allocate more
 		// arena space. This may not be contiguous with the
 		// current arena, so we have to request the full ask.
+		//
+		// 一次只是分配一个arena(64MB)的空间(只是进行了保留处理)，并不能直接使用。
+		// 并将分配的arean注册到mehap_.allArenas中。
+		// ask在sysAlloc中会向上对齐到64MB。
 		av, asize := h.sysAlloc(ask, &h.arenaHints, true)
+		// 第一次调用: av=0xC000000000
+		// println("av",uintptr(av)==0xc000000000) // true
+		// println(h.arenaHints.addr) h.arenaHints.addr=0xc000000000+64
 		if av == nil {
 			inUse := gcController.heapFree.load() + gcController.heapReleased.load() + gcController.heapInUse.load()
 			print("runtime: out of memory: cannot allocate ", ask, "-byte block (", inUse, " in use)\n")
@@ -1727,13 +1884,22 @@ func (h *mheap) grow(npage uintptr) (uintptr, bool) {
 			// space, so just extend the current space.
 			h.curArena.end = uintptr(av) + asize
 		} else {
+			// 新的space没有连接着当前的h.curArean。
 			// The new space is discontiguous. Track what
 			// remains of the current space and switch to
 			// the new space. This should be rare.
+			//
+			// 第一次调用size=0
+			// println("size:",h.curArena.end - h.curArena.base)
 			if size := h.curArena.end - h.curArena.base; size != 0 {
+				// 上面h.sysAlloc分配的地址区间没有连接着当前的h.curArena。
+				// 将这段区间更新为prepared状态，并更新对应的元数据信息以供接下来使用。
+				//
 				// Transition this space from Reserved to Prepared and mark it
 				// as released since we'll be able to start using it after updating
 				// the page allocator and releasing the lock at any time.
+				//
+				// 对这段区间进行map处理，变为prepared状态。
 				sysMap(unsafe.Pointer(h.curArena.base), size, &gcController.heapReleased)
 				// Update stats.
 				stats := memstats.heapStats.acquire()
@@ -1741,10 +1907,16 @@ func (h *mheap) grow(npage uintptr) (uintptr, bool) {
 				memstats.heapStats.release()
 				// Update the page allocator's structures to make this
 				// space ready for allocation.
+				//
+				//
 				h.pages.grow(h.curArena.base, size)
 				totalGrowth += size
 			}
 			// Switch to the new space.
+			//
+			// 一次分配的arenas(上面h.sysAlloc()调用中创建的arenas(至少1个arena))
+			// 的起始地址av和asize(64MB的整数倍)。
+			// 这段区间目前只是保留状态。
 			h.curArena.base = uintptr(av)
 			h.curArena.end = uintptr(av) + asize
 		}
@@ -1753,6 +1925,8 @@ func (h *mheap) grow(npage uintptr) (uintptr, bool) {
 		// We know this won't overflow, because sysAlloc returned
 		// a valid region starting at h.curArena.base which is at
 		// least ask bytes in size.
+		//
+		// ask是4MB(一个chunk对应的地址空间的大小)的整数倍。
 		nBase = alignUp(h.curArena.base+ask, physPageSize)
 	}
 
@@ -1765,8 +1939,9 @@ func (h *mheap) grow(npage uintptr) (uintptr, bool) {
 	// The allocation is always aligned to the heap arena
 	// size which is always > physPageSize, so its safe to
 	// just add directly to heapReleased.
+	// println("mheap.grow mheap.grow",nBase-v)
+	// 将nBase-v=ask大小的字节变为ready状态。
 	sysMap(unsafe.Pointer(v), nBase-v, &gcController.heapReleased)
-
 	// The memory just allocated counts as both released
 	// and idle, even though it's not yet backed by spans.
 	stats := memstats.heapStats.acquire()
@@ -1775,12 +1950,21 @@ func (h *mheap) grow(npage uintptr) (uintptr, bool) {
 
 	// Update the page allocator's structures to make this
 	// space ready for allocation.
+	//
+	// 更新页面所在chunk的元数据信息。
+	// nBase-v的值是4MB(一个chunk对应的页的字节大小)的整数倍。
 	h.pages.grow(v, nBase-v)
 	totalGrowth += nBase - v
 	return totalGrowth, true
 }
 
 // Free the span back into the heap.
+//
+// 参数：
+// s 一般在 sweepLocked.sweep 此s之后，如果其所有内存块都未被标记便会调用此函数，
+// 将s管理的内存对应的地址区间在 pageAlloc.chunks 中的对应的alloc位/scavenged位
+// 分别置为0和0(其实scavenged位本来就是0)。并更新在 pageAlloc.summary 中对应的各个层级的sum信息。
+// 并未对此地址空间执行 sysUnused 调用。
 func (h *mheap) freeSpan(s *mspan) {
 	systemstack(func() {
 		pageTraceFree(getg().m.p.ptr(), 0, s.base(), s.npages)
@@ -2039,6 +2223,9 @@ type special struct {
 	// 关联 mspan 中的 object 在mspan中的字节偏移量。
 	// 因为一个 mspan 的所有 special 都被串联在一起，
 	// 此值用来识别special具体归属于哪个object。
+	//
+	// 关联此special的对象(或者对象的子部分，当此对象被用于p的tinyOb时)的起始地址
+	// 相对于msapn管理的内存的起始地址偏移量。
 	offset uint16   // span offset of object
 	// special 类型：
 	// 	_KindSpecialFinalizer = 1
@@ -2334,7 +2521,7 @@ func (b *gcBits) bytep(n uintptr) *uint8 {
 // bitp returns a pointer to the byte containing bit n and a mask for
 // selecting that bit from *bytep.
 //
-// bytep 为从b开始第n个bit所在uint8的起始地址，
+// bytep 为从b开始第n个bit所在uint8的起始地址，n从0开始。
 // 这个bit在 bytep 所指的uint8中的位置为m(从0开始)，则 mask为2^m。
 //
 // 用 mask&(*bytep)!=0 可以确定从b开始第n个bit上是1，否则为0。
@@ -2358,6 +2545,7 @@ type gcBitsArena struct {
 	bits [gcBitsChunkBytes - gcBitsHeaderBytes]gcBits
 }
 
+// 见 nextMarkBitArenaEpoch 函数注释。
 var gcBitsArenas struct {
 	lock     mutex
 	free     *gcBitsArena
@@ -2464,9 +2652,41 @@ func newAllocBits(nelems uintptr) *gcBits {
 //
 // The gcBitsArenas.previous is released to the gcBitsArenas.free list.
 //
-// nextMarkBitArenaEpoch()，此函数只被 finishsweep_m() 函数调用。
-// 作用待定，目前看与 mspan.gcmarkBits 字段分配相关。
 //
+// nextMarkBitArenaEpoch()，此函数只被 finishsweep_m() 函数调用。
+// gcBitsArenas让msapn的标记位图和分配位图可以被回收复用转换。存在current/previous/next长位图主要是为了保证标记位图和分配位图
+// 的生命周期(在还被引用时不能被修改)以及复用效率(用更少的内存做更多的事)。
+//
+// 此函数对 gcBitsArenas 的current/previous/next字段进行角色转换。为接下来 msapn.allocbits和msapn.gcmarkbits
+// 可以安全读写，并在sweept时保证为msapn.gicmarkbits分配bitsmap全部位都是零。且满足不同大小的bitsmap申请需求。
+//
+// 所有mspan共有这个gcBitsArenas，比如next字段是一个包含N个位的值，每个mspan都可以从中申请(其实是存储next长位图上一个位的地址，
+// 长度与mspan.nelemsize相同)不同大小的bitsmap。
+// 因为所有mspan的分配位图和标记位上执行的操作在同一GC阶段都是一样的，比如角色互换。所以gcBitsArenas可以使用
+// 长bitmaps。
+//
+// 此函数调用之后，到下一次此函数调用之前：
+// gcBitsArenas.previous 保留可读写，被msapn.allocbits引用。
+// gcBitsArenas.current 保留可读写，被mspan.gcmarkbits引用。
+// gcBitsArenas.next 用于申请bits使用，其位都是零值。在sweep执行时会被mspan.gcmarkbits的新初始值引用。
+//
+// 此函数做的任务：
+// gcBitsArenas.previous 释放到空闲 gcBitsArenas.free 链表中。因为mspan.allocbits已经在sweep中被重新赋值了。所以可以回收了。
+// gcBitsArenas.current 变成 gcBitsArenas.previous，被mspan.allocbits引用。
+// gcBitsArenas.current 设置成了 gcBitsArenas.next，被msapn.gcmarkbits引用。
+//
+// -----------------
+// 在sweep执行时，mspan.gitmarkbits(引用gcBitsArenas.current，赋值之后，会从gcBitsArenas.next申请新的bits)
+// 会赋值给mspan.allocbits(赋值之前mspan.allocbits引用gcBitsArenas.previous)，
+// 所以此函数要保留gcBitsArenas.current和gcBitsArenas.next，可回收gcBitsArenas.previous。
+// 并转换角色，因为在一次再调用此函数时gcBitsArenas.previous会被回收。
+// -----------------
+// 对bits进行读写时，存在的引用关系(不考虑短暂的过度状态[sweep执行完毕后到此函数返回之前])：
+// mspan.gcmarkbits肯定引用gcBitsArenas.current。
+// mspan.allocbits肯定引用gcBitsArenas.previous。
+// !!! 不过第一次执行GC时此函数调用之前它们引用的都是gcBitsArenas.next，调用之后引用的都是
+// gcBitsArenas.current直到再次调用此函数之后(因为刚刚经历了第一次sweep阶段)就满足了上面的情况了。
+// -----------------
 func nextMarkBitArenaEpoch() {
 	lock(&gcBitsArenas.lock)
 	// 第一轮GC时， gcBitsArenas.previous 为nil。
@@ -2488,6 +2708,7 @@ func nextMarkBitArenaEpoch() {
 	// gcBitsArenas.next 是上一轮 sweep 为下一轮GC准备的。
 	gcBitsArenas.previous = gcBitsArenas.current
 	gcBitsArenas.current = gcBitsArenas.next
+	// 将gcBitsArenas.next设置为nil，这样在从其申请bits时，其会从free链表取出一个节点并将其全部位置0。
 	atomic.StorepNoWB(unsafe.Pointer(&gcBitsArenas.next), nil) // newMarkBits calls newArena when needed
 	unlock(&gcBitsArenas.lock)
 }

@@ -252,13 +252,17 @@ func (b *atomicOffAddr) Load() (uintptr, bool) {
 // addrRanges is not thread-safe.
 type addrRanges struct {
 	// ranges is a slice of ranges sorted by base.
+	// cap(ranges)初始值为16
 	ranges []addrRange
 
 	// totalBytes is the total amount of address space in bytes counted by
 	// this addrRanges.
+	//
+	// 更新rnages中所有addRange表示的地址区间的字节总和。
 	totalBytes uintptr
 
 	// sysStat is the stat to track allocations by this type
+	// memstats.gcMiscSys
 	sysStat *sysMemStat
 }
 
@@ -267,12 +271,19 @@ func (a *addrRanges) init(sysStat *sysMemStat) {
 	ranges.len = 0
 	ranges.cap = 16
 	ranges.array = (*notInHeap)(persistentalloc(unsafe.Sizeof(addrRange{})*uintptr(ranges.cap), goarch.PtrSize, sysStat))
+	//  memstats.gcMiscSys
 	a.sysStat = sysStat
 	a.totalBytes = 0
 }
 
 // findSucc returns the first index in a such that addr is
 // less than the base of the addrRange at that index.
+//
+// 返回 addrRanges 中第一个其base值比addr大的 addrRange 的索引，
+// 这个索引可能不是在 addranges 中，如果其最后一个元素的base还比addr小的话。
+// 这样返回值就是len(addrRanges)。
+//
+// 特殊返回值 len(addrRanges) 和 0。
 func (a *addrRanges) findSucc(addr uintptr) int {
 	base := offAddr{addr}
 
@@ -344,6 +355,7 @@ func (a *addrRanges) contains(addr uintptr) bool {
 // add inserts a new address range to a.
 //
 // r must not overlap with any address range in a and r.size() must be > 0.
+// 新添加的r表示的地址区间与a中表示的所有地址区间不存在重叠。
 func (a *addrRanges) add(r addrRange) {
 	// The copies in this function are potentially expensive, but this data
 	// structure is meant to represent the Go heap. At worst, copying this
@@ -362,12 +374,21 @@ func (a *addrRanges) add(r addrRange) {
 	}
 	// Because we assume r is not currently represented in a,
 	// findSucc gives us our insertion index.
+	//
+	// 第一次调用i=0,因为此时len(r.ranges)=0。
+	// a中第一个其base字段的值比r.base.addr()大的addrRange的索引。
+	// 特殊值 len(a.ranges)+1和0。
 	i := a.findSucc(r.base.addr())
+	// r表示的地址区间仅贴着a.ranges[i-1](在a.ranges[i-1]的前面)。
 	coalescesDown := i > 0 && a.ranges[i-1].limit.equal(r.base)
+	// r表示的地址区间仅贴着a.ranges[i](在a.ranges[i]的后面)。
 	coalescesUp := i < len(a.ranges) && r.limit.equal(a.ranges[i].base)
 	if coalescesUp && coalescesDown {
 		// We have neighbors and they both border us.
 		// Merge a.ranges[i-1], r, and a.ranges[i] together into a.ranges[i-1].
+		//
+		// a.ranges[i-1]、r和a.ranges[i]表示的地址区间彼此相连。
+		// 将它们合并到a.ranges[i-1]中
 		a.ranges[i-1].limit = a.ranges[i].limit
 
 		// Delete a.ranges[i].
@@ -376,15 +397,20 @@ func (a *addrRanges) add(r addrRange) {
 	} else if coalescesDown {
 		// We have a neighbor at a lower address only and it borders us.
 		// Merge the new space into a.ranges[i-1].
+		//
+		// 合并到左边的addRange
 		a.ranges[i-1].limit = r.limit
 	} else if coalescesUp {
 		// We have a neighbor at a higher address only and it borders us.
 		// Merge the new space into a.ranges[i].
+		// 合并到右边边的addRange
 		a.ranges[i].base = r.base
 	} else {
 		// We may or may not have neighbors which don't border us.
 		// Add the new range.
 		if len(a.ranges)+1 > cap(a.ranges) {
+			// 剩余容量不够容纳r。
+			//
 			// Grow the array. Note that this leaks the old array, but since
 			// we're doubling we have at most 2x waste. For a 1 TiB heap and
 			// 4 MiB arenas which are all discontiguous (both very conservative
@@ -396,14 +422,18 @@ func (a *addrRanges) add(r addrRange) {
 			ranges.array = (*notInHeap)(persistentalloc(unsafe.Sizeof(addrRange{})*uintptr(ranges.cap), goarch.PtrSize, a.sysStat))
 
 			// Copy in the old array, but make space for the new range.
+			// 将旧的切片元素复制到新的a中，并在索引i处插入r。
 			copy(a.ranges[:i], oldRanges[:i])
 			copy(a.ranges[i+1:], oldRanges[i:])
 		} else {
 			a.ranges = a.ranges[:len(a.ranges)+1]
+			// r插入到aranges[i]处的位置，并将原来的数据段向后移动。
+			// 即a.ranges[i:]向后移动一个位置。
 			copy(a.ranges[i+1:], a.ranges[i:])
 		}
 		a.ranges[i] = r
 	}
+	// 更新a中所有addRange表示的地址区间的字节总和。
 	a.totalBytes += r.size()
 }
 

@@ -71,6 +71,9 @@ func lock2(l *mutex) {
 	// 这样都符合逻辑，但如果存储的是 mutex_sleeping，
 	// 可能并没有真的等待者，会导致一次没有效果的 futexwakeup
 	// 调用，不过没什么问题。
+	//
+	// *用mutex_locked替换l.key，可以保证此线程比休眠者更有机会获得锁。
+	// *虽然如此但还可能会有其它新入的竞争者。
 	v := atomic.Xchg(key32(&l.key), mutex_locked)
 	if v == mutex_unlocked {
 		// 获得锁成功直接返回。
@@ -105,6 +108,9 @@ func lock2(l *mutex) {
 	// 执行些无用的唤醒线程操作。但是不会造成死锁即不会漏掉待唤醒者。
 	//
 	// 执行到这里 wait肯定是 mutex_sleeping 右或者是 mutex_locked
+	//
+	// *保存旧值，是为了当旧值是mutex_sleeping时，不会因为下面的重试（还没进入休眠）
+	//  而获取锁，漏掉其它休眠者。
 	wait := v
 
 	// On uniprocessors, no point spinning.
@@ -147,11 +153,14 @@ func lock2(l *mutex) {
 		}
 
 		// Sleep.
-		// 告知其它线程即将有个等待者，即使当前线程不会休眠。也不会
-		// 错过会休眠的情况。
+		// 将l.key设置成mutex_sleeping告知其它线程即将有个等待者，即使因下面的重试成功获取锁。
+		// 但这样不会错过会休眠的情况。
+		//
+		// *下面将l.key替换为mutex_sleeping是为了保证当下面的尝试没成功时而进入休眠后，将来
+		//  能被唤醒。
 		v = atomic.Xchg(key32(&l.key), mutex_sleeping)
 		if v == mutex_unlocked {
-			// 或取V之后，如果v是 mutex_unlocked，直到释放前肯定不会
+			// 获取V之后，如果v是 mutex_unlocked，直到释放前肯定不会
 			// 有其它线程再能获得锁了，因为上面使用 mutex_sleeping替换
 			// 的，它也表示有锁。
 			//
@@ -160,11 +169,11 @@ func lock2(l *mutex) {
 			return
 		}
 		//
-		// wait 设置为 mutex_sleeping 特别重要，因为当被唤醒后
-		// 需要将wait替换掉l.key中存储的值，如果替换掉的旧l.key值
+		// 下面将wait设置为mutex_sleeping特别重要，因为当被唤醒后
+		// 需要将wait替换掉l.key中存储的值，如果被替换掉的旧l.key值
 		// 是mutex_unlocked，那么便成功获得了锁.但如果同时还有其它
-		// 等待者了呢？所以当被唤醒者解锁时在替换l.key中的旧值时发现
-		// 旧值是mutex_sleeping就会执行唤醒操作，而不会漏掉待唤醒者。
+		// 等待者了呢？
+		// *所以将wait设置为 mutex_sleeping 是为了保证其它等待者可以被正确的唤醒。
 		wait = mutex_sleeping
 		// 获取锁失败，当前线程进入休眠，-1表示永久休眠直到被显式唤醒。
 		futexsleep(key32(&l.key), mutex_sleeping, -1)
@@ -233,6 +242,17 @@ func notesleep(n *note) {
 
 // May run with m.p==nil if called from notetsleep, so write barriers
 // are not allowed.
+//
+// notetsleep_internal(),目前在 notetsleep 和 notetsleepg 函数中调用。
+// 带超时的方式使当前线程进入休眠。唤醒函数为 notewakeup()
+//
+// 参数：
+// ns: 当ns小于0时会永久休眠,直到另外一个线程唤醒。大于等于0时，唤醒机制多了个超时唤醒。
+// deadline: 这个参数没有用到，函数中的 deadline = now()+ns。
+//
+// 返回值：
+// true 信号量就绪
+// false 信号量未就绪超时，且&m已经从 n.key 上移除了，且n.key设置为0。
 //
 //go:nosplit
 //go:nowritebarrier

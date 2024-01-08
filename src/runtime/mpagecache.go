@@ -9,6 +9,7 @@ import (
 	"unsafe"
 )
 
+// 64
 const pageCachePages = 8 * unsafe.Sizeof(pageCache{}.cache)
 
 // pageCache represents a per-p cache of pages the allocator can
@@ -16,8 +17,12 @@ const pageCachePages = 8 * unsafe.Sizeof(pageCache{}.cache)
 // a pageCachePages*pageSize chunk of memory with 0 or more free
 // pages in it.
 type pageCache struct {
+	// pageCachePages 数量的页的起始地址，对齐到 pageCachePages * pageSize,
+	// 64*8192。
 	base  uintptr // base address of the chunk
+	// 与页堆中的分配位相反，1表示未分配。0表示已经分配。
 	cache uint64  // 64-bit bitmap representing free pages (1 means free)
+	// 与页堆中的scavenged位意义相同。
 	scav  uint64  // 64-bit bitmap representing scavenged pages (1 means scavenged)
 }
 
@@ -119,6 +124,14 @@ func (c *pageCache) flush(p *pageAlloc) {
 //
 // Must run on the system stack because p.mheapLock must be held.
 //
+// 从页堆中分配64个页(至少包含一张空闲页)到 pageCache 中。缓存页的起始地址对齐到
+// 64*8192。
+// 更新的位：
+// summary位
+// 空闲页的分配位会被设置为1，scavenged会被清零。
+//
+// 如果返回 pageCache 零值，表示没有内存可分配了(OOM)。
+//
 //go:systemstack
 func (p *pageAlloc) allocToCache() pageCache {
 	assertLockHeld(p.mheapLock)
@@ -165,10 +178,14 @@ func (p *pageAlloc) allocToCache() pageCache {
 	// Set the page bits as allocated and clear the scavenged bits, but
 	// be careful to only set and clear the relevant bits.
 	cpi := chunkPageIndex(c.base)
+	// 被缓存的空闲页分配位置1。
 	chunk.allocPages64(cpi, c.cache)
+	// 被缓存的空闲页scavenged位置0。
 	chunk.scavenged.clearBlock64(cpi, c.cache&c.scav /* free and scavenged */)
 
 	// Update as an allocation, but note that it's not contiguous.
+	//
+	// 更新各个层级的summary信息。
 	p.update(c.base, pageCachePages, false, true)
 
 	// Set the search address to the last page represented by the cache.
@@ -179,6 +196,9 @@ func (p *pageAlloc) allocToCache() pageCache {
 	// However, p.searchAddr is not allowed to point into unmapped heap memory
 	// unless it is maxSearchAddr, so make it the last page as opposed to
 	// the page after.
+	//
+	// 更新 pageAlloc.searchAddr到较新地址。-1是因为不确定后面的页是否已经mapped了，
+	// searchAddr 必须指向已mapped的页。
 	p.searchAddr = offAddr{c.base + pageSize*(pageCachePages-1)}
 	return c
 }

@@ -178,6 +178,10 @@ func IndexRune(s []byte, r rune) int {
 // It returns the byte index of the first occurrence in s of any of the Unicode
 // code points in chars. It returns -1 if chars is empty or if there is no code
 // point in common.
+//
+// 	s := []byte{255, 1, 2}
+//	log.Println(bytes.IndexAny(s, string([]byte{254, 1, 2})))
+//  // 2023/09/16 13:35:53 0
 func IndexAny(s []byte, chars string) int {
 	if chars == "" {
 		// Avoid scanning all of s.
@@ -388,6 +392,12 @@ func SplitN(s, sep []byte, n int) [][]byte { return genSplit(s, sep, 0, n) }
 //	n > 0: at most n subslices; the last subslice will be the unsplit remainder.
 //	n == 0: the result is nil (zero subslices)
 //	n < 0: all subslices
+//
+// 	s := []byte{1, 2, 3}
+//	log.Println(bytes.SplitAfterN(s, nil, 0) == nil)
+//	// 2023/09/16 08:47:41 true
+//	log.Println(bytes.SplitAfterN(s, nil, -1))
+//  //2023/09/16 08:48:25 [[1] [2] [3]]
 func SplitAfterN(s, sep []byte, n int) [][]byte {
 	return genSplit(s, sep, len(sep), n)
 }
@@ -398,12 +408,31 @@ func SplitAfterN(s, sep []byte, n int) [][]byte {
 // It is equivalent to SplitN with a count of -1.
 //
 // To split around the first instance of a separator, see Cut.
+//
+// 	s := append([]byte{1, 2, 3, 4}, []byte("我你他")...)
+//	log.Println(bytes.SplitAfter(s, []byte{}))
+//	log.Println(bytes.Split(s, []byte{}))
+//	/**
+//	2023/09/16 08:43:11 [[1] [2] [3] [4] [230 136 145] [228 189 160] [228 187 150]]
+//	2023/09/16 08:43:11 [[1] [2] [3] [4] [230 136 145] [228 189 160] [228 187 150]]
+//	*/
 func Split(s, sep []byte) [][]byte { return genSplit(s, sep, 0, -1) }
 
 // SplitAfter slices s into all subslices after each instance of sep and
 // returns a slice of those subslices.
 // If sep is empty, SplitAfter splits after each UTF-8 sequence.
 // It is equivalent to SplitAfterN with a count of -1.
+//
+// 	s := append([]byte{1, 2, 3, 4}, []byte("我你他")...)
+//	log.Println(bytes.SplitAfter(s, []byte{}))
+//	log.Println(bytes.Split(s, []byte{}))
+//	/**
+//	2023/09/16 08:43:11 [[1] [2] [3] [4] [230 136 145] [228 189 160] [228 187 150]]
+//	2023/09/16 08:43:11 [[1] [2] [3] [4] [230 136 145] [228 189 160] [228 187 150]]
+//	*/
+// SplitAfter 如果sep不是nil/空，则从s中sep出现的末尾位置处开始分隔。
+// 如果spe是nil/空，则从每个utf8字符后的位置分隔。
+// 与 Split 的不同就是是否保留sep。
 func SplitAfter(s, sep []byte) [][]byte {
 	return genSplit(s, sep, len(sep), -1)
 }
@@ -414,6 +443,8 @@ var asciiSpace = [256]uint8{'\t': 1, '\n': 1, '\v': 1, '\f': 1, '\r': 1, ' ': 1}
 // It splits the slice s around each instance of one or more consecutive white space
 // characters, as defined by unicode.IsSpace, returning a slice of subslices of s or an
 // empty slice if s contains only white space.
+//
+// 如果byte中不包含无效utf8序列，返回值中并不会改变它们。
 func Fields(s []byte) [][]byte {
 	// First count the fields.
 	// This is an exact count if s is ASCII, otherwise it is an approximation.
@@ -471,6 +502,8 @@ func Fields(s []byte) [][]byte {
 //
 // FieldsFunc makes no guarantees about the order in which it calls f(c)
 // and assumes that f always returns the same value for a given c.
+//
+// 返回值中不会改变底层对应的byte。即使rune是由无效utf8序列对应的\ufffd
 func FieldsFunc(s []byte, f func(rune) bool) [][]byte {
 	// A span is used to record a slice of s of the form s[start:end].
 	// The start index is inclusive and the end index is exclusive.
@@ -543,11 +576,15 @@ func Join(s [][]byte, sep []byte) []byte {
 }
 
 // HasPrefix tests whether the byte slice s begins with prefix.
+//
+// println(bytes.HasPrefix(s, []byte{})) 返回true，nil也是如此。
 func HasPrefix(s, prefix []byte) bool {
 	return len(s) >= len(prefix) && Equal(s[0:len(prefix)], prefix)
 }
 
 // HasSuffix tests whether the byte slice s ends with suffix.
+//
+// println(bytes.HasSuffix(s, []byte{})) // true，nil也是如此。
 func HasSuffix(s, suffix []byte) bool {
 	return len(s) >= len(suffix) && Equal(s[len(s)-len(suffix):], suffix)
 }
@@ -714,6 +751,12 @@ func ToTitleSpecial(c unicode.SpecialCase, s []byte) []byte {
 
 // ToValidUTF8 treats s as UTF-8-encoded bytes and returns a copy with each run of bytes
 // representing invalid UTF-8 replaced with the bytes in replacement, which may be empty.
+//
+// 	s := []byte{255, 255, 254}
+//	log.Println(bytes.ToValidUTF8(s, []byte{1, 2}))
+//	// 2023/09/16 11:41:41 [1 2]
+//
+// s中的无效utf8字节替换为replacement中对应索引的字节。
 func ToValidUTF8(s, replacement []byte) []byte {
 	b := make([]byte, 0, len(s)+len(replacement))
 	invalid := false // previous byte was from an invalid UTF-8 sequence
@@ -927,6 +970,12 @@ func containsRune(s string, r rune) bool {
 
 // Trim returns a subslice of s by slicing off all leading and
 // trailing UTF-8-encoded code points contained in cutset.
+//
+// 将s中首尾出现在cuset中的utf-8字符删除。
+// 
+// s := []byte{255, 254, 1, 2, 255, 254}
+// log.Println(bytes.Trim(s, "\ufffd"))
+// 2023/09/16 11:48:29 [1 2]
 func Trim(s []byte, cutset string) []byte {
 	if len(s) == 0 {
 		// This is what we've historically done.
@@ -1112,6 +1161,8 @@ func Runes(s []byte) []rune {
 // and after each UTF-8 sequence, yielding up to k+1 replacements
 // for a k-rune slice.
 // If n < 0, there is no limit on the number of replacements.
+//
+// new整体替换old，不管new和old的长度如何
 func Replace(s, old, new []byte, n int) []byte {
 	m := 0
 	if n != 0 {
@@ -1244,6 +1295,9 @@ hasUnicode:
 }
 
 // Index returns the index of the first instance of sep in s, or -1 if sep is not present in s.
+//
+// 	println(bytes.Index(s, []byte{})) // 0
+//	println(bytes.Index(s, nil))      // 0
 func Index(s, sep []byte) int {
 	n := len(sep)
 	switch {

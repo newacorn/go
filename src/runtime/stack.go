@@ -634,6 +634,7 @@ func stackalloc(n uint32) stack {
 // 根据栈大小和GC状态，分别回收到 mcache.stackcache 、 stackpool 和
 // stackLarge 或者释放到堆。
 // 参数：stk，包含了栈的起始和结束地址信息，左闭右开区间。
+//
 // stackfree must run on the system stack because it uses per-P
 // resources and must not split the stack.
 //
@@ -1152,6 +1153,7 @@ func copystack(gp *g, newsize uintptr) {
 }
 
 // round x up to a power of 2.
+// 向上对齐到2^n
 func round2(x int32) int32 {
 	s := uint(0)
 	for 1<<s < x {
@@ -1365,6 +1367,15 @@ func isShrinkStackSafe(gp *g) bool {
 	// We also can't *shrink* the stack in the window between the
 	// goroutine calling gopark to park on a channel and
 	// gp.activeStackChans being set.
+	//
+	// gp.activeStackChans表示gp是否因通道操作处于挂起状态。
+	// 当gp.activeStackChans为true时，执行newStack时需先获取gp排队所在通道的锁。避免
+	// 在栈收缩时修改关联sudog.elem与其它会唤醒gp的通道操作发生冲突。
+	//
+	// 当gp.parkingOnChan为false且gp.activeStackChans=true（activeStackChans是非原子性设置，
+	// g暂停之前所在线程观察到的），则一定能观察到 gp.activeStackChans=true。从
+	// 而保证在执行newstack时该上锁的chan一定会被上锁。防止此sudog被从chan等待队列中取出
+	// 读取了上面存储的gp栈指针。
 	return gp.syscallsp == 0 && !gp.asyncSafePoint && !gp.parkingOnChan.Load()
 }
 
@@ -1510,10 +1521,12 @@ func (r *stackObjectRecord) gcdata() *byte {
 func morestackc() {
 	throw("attempt to execute system stack code on user stack")
 }
-
+// 创建g时，为其分配的栈大小。
+//
 // 初始值为：_FixedStack=2048
-// 这个值会被更新，根据每次GC扫描的栈的平均值
-// 但介于 [ _FixedStack, maxstacksize]这个范围
+// 这个值在每次GC标记终止阶段会被更新。
+// 本轮GC标记阶段被扫描栈区间(hi-sp)总和/被扫描栈的数量，
+// 修正到 [ _FixedStack, maxstacksize]这个范围，然后向上对齐到2的幂。
 //
 // startingStackSize is the amount of stack that new goroutines start with.
 // It is a power of 2, and between _FixedStack and maxstacksize, inclusive.
@@ -1529,8 +1542,7 @@ func gcComputeStartingStackSize() {
 	// https://docs.google.com/document/d/1YDlGIdVTPnmUiTAavlZxBI1d9pwGQgZT7IKFKlIXohQ/edit?usp=sharing
 	// The basic algorithm is to track the average size of stacks
 	// and start goroutines with stack equal to that average size.
-	// Starting at the average size uses at most 2x the space that
-	// an ideal algorithm would have used.
+	// Starting at the average size uses at most 2x the space that an ideal algorithm would have used.
 	// This is just a heuristic to avoid excessive stack growth work
 	// early in a goroutine's lifetime. See issue 18138. Stacks that
 	// are allocated too small can still grow, and stacks allocated
@@ -1558,5 +1570,7 @@ func gcComputeStartingStackSize() {
 		avg = _FixedStack
 	}
 	// Note: maxstacksize fits in 30 bits, so avg also does.
+	//
+	// amd64，maxstacksize的值是1000000000，向上对齐到2的幂为2^30
 	startingStackSize = uint32(round2(int32(avg)))
 }

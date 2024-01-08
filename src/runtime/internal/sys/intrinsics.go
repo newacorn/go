@@ -54,6 +54,8 @@ func TrailingZeros32(x uint32) int {
 }
 
 // TrailingZeros64 returns the number of trailing zero bits in x; the result is 64 for x == 0.
+// println("tailzero",sys.TrailingZeros64(0b1110))
+// 1
 func TrailingZeros64(x uint64) int {
 	if x == 0 {
 		return 64

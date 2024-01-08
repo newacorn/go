@@ -87,6 +87,9 @@ type Value struct {
 	//
 	// The remaining 22+ bits give a method number for method values.
 	// If flag.kind() != Func, code can assume that flagMethod is unset.
+	//
+	// 低五位是类型位，其中第5位表示 kindDirectIface。
+	// 高22位表示Method在方法集中的序号。方法的接收者通过typ和ptr来描述的。
 	flag
 
 	// A method value represents a curried method invocation
@@ -177,10 +180,14 @@ func unpackEface(i any) Value {
 	// NOTE: don't read e.word until we know whether it is really a pointer or not.
 	t := e.typ
 	if t == nil {
+		// 不包含类型元数据，返回Value零值。
 		return Value{}
 	}
+	// 根据t.Kind()初始化Value的flag字段值。
 	f := flag(t.Kind())
 	if ifaceIndir(t) {
+		// t.Kind()未设置 kindDirectIface 位。
+		// Value.flag 低5位使用t.Kind()。
 		f |= flagIndir
 	}
 	return Value{t, e.word, f}
@@ -297,6 +304,8 @@ func (f flag) mustBeAssignableSlow() {
 // Addr is typically used to obtain a pointer to a struct field
 // or slice element in order to call a method that requires a
 // pointer receiver.
+//
+// Addr()只能进行一步，不能像Elem()那样有机会进行连续调用。
 func (v Value) Addr() Value {
 	if v.flag&flagAddr == 0 {
 		panic("reflect.Value.Addr of unaddressable value")
@@ -1309,7 +1318,7 @@ func (v Value) Elem() Value {
 		// 需设置 flagIndir，不然对指针的Value多次调用Elem()每次不会改
 		// 变Value.ptr的值
 		fl := v.flag&flagRO | flagIndir | flagAddr
-		// 获取指针元素的类型元数据_type
+		// V.flag 低五位继承typ.Kin()。
 		fl |= flag(typ.Kind())
 		// ptr有可能还是 v.ptr或者(*v.ptr)
 		return Value{typ, ptr, fl}
@@ -3194,6 +3203,7 @@ func Indirect(v Value) Value {
 // stored in the interface i. ValueOf(nil) returns the zero Value.
 func ValueOf(i any) Value {
 	if i == nil {
+		// 空interface返回Value零值。
 		return Value{}
 	}
 

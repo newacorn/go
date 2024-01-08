@@ -140,11 +140,18 @@ type gcControllerState struct {
 	// Updated at the end of each GC cycle, in endCycle.
 	//
 	// 测试了下，应该总是越小越好：1.299068e-002
+	//
+	// GC标记结束时计算，结果为最近两次(此轮GC和上轮GC)的 lastConsMark 的平均值。
+	//
+	// 分配速率与标记速率的比值
 	consMark float64
 
 	// lastConsMark is the computed cons/mark value for the previous GC
 	// cycle. Note that this is *not* the last value of cons/mark, but the
 	// actual computed value. See endCycle for details.
+	//
+	// raw currentConsMark 每轮GC标记结束时更新，根据此轮标记情况计算而出。
+	// 分配速率与标记速率的比值
 	lastConsMark float64
 
 	// gcPercentHeapGoal is the goal heapLive for when next GC ends derived
@@ -161,7 +168,14 @@ type gcControllerState struct {
 	// 因为初始时，其它几项数据都是0，所以结果为 c.globalsScan.Load()*uint64(gcPercent)/100
 	// 而 c.globalsScan 的值为所有模块的 data 和 bass 区间大小的和。
 	//
-	// 在 gcMarkTermination 中更新。
+	// ----------------------------------------------------
+	// 目标堆大小，达到这个目标时就会触发GC。
+	//
+	// 第一次GC触发条件, heapLive >= min(c.globalsScan.Load()*uint64(gcPercent)/100,gcControllerState.heapMinimum)。
+	// 之后GC触发条件， heapLive >= min(c.heapMarked + (gcControllerState.heapMarked+ gcControllerState.lastStackScan+gcControllerState.globalsScan)*uint64(gcPercent)/100,
+	// gcControllerState.heapMinimum)
+	//
+	// 只在 gcMarkTermination -> gcControllerCommit(此时已经处于_GCoff状态) 调用中更新。
 	gcPercentHeapGoal atomic.Uint64
 
 	// sweepDistMinTrigger is the minimum trigger to ensure a minimum
@@ -186,13 +200,13 @@ type gcControllerState struct {
 	// Only valid during the mark phase of a GC cycle, otherwise set to ^uint64(0).
 	//
 	// Updated while the world is stopped.
-	// startCycle 方法中设置为有效值，在 resetLive 中设置为 ^uint64(0)
-	// 在清扫终止阶段设置为 heapLive。
-	// triggered 是上一次GC开始时，GC扫描终止阶段的 heapLive 的大小。[ startCycle 函数中]
-	// 在标记结束时 triggered 会被设置为 ^uint64(0) [ resetLive 函数中]
 	//
-	// 在标记清扫阶段STW被重置为0进行以下赋值：
-	// c.triggered = c.heapLive.Load()
+	// startCycle (此时已经STW了)方法中设置为有效值，在 resetLive 中设置为 ^uint64(0)
+	// 在清扫终止阶段设置为与触发GC时的trigger不同，因为从test到STW中间 heapLive 的值可能会发生变更。
+	//
+	// gcMarkTermination -> gcMark -> resetLive 被重置为^uint64(0)。
+	//
+	// 所以此值只在标记阶段有效。
 	triggered uint64
 
 	// lastHeapGoal is the value of heapGoal at the moment the last GC
@@ -205,7 +219,9 @@ type gcControllerState struct {
 	// 因为 endCycle() 函数在 commit 函数(更新 gcPercentHeapGoal 的唯一地方)调用之前，
 	// 所以记录的是上一轮GC标记结束时的 goal 值(大概率为： gcPercentHeapGoal)。
 	// 也是本轮 GC heap Trigger 的比对 trigger 的计算来源 ( goal 和 trigger 往往所差无几)
-	//
+	// -------------------
+	// 在每一轮标记结束时 gcMarkTermination 调用之前更新为 gcPercentHeapGoal。
+	// 该字段目前只用来计算 scavenge.gcPercentGoal(当前堆大小如果超过这个值就会进行scavenge) 的值。
 	lastHeapGoal uint64
 
 	// heapLive is the number of bytes considered live by the GC.
@@ -229,6 +245,9 @@ type gcControllerState struct {
 	// this gcControllerState's revise() method.
 	//
 	// 在 update 函数中增加，在 resetLive 函数中进行覆盖设置(设置为标记终止阶段总标记字节数)。
+	// 每当p从mcentral缓存mspan时，将mspan总的空闲对象总大小用来增加此计数。
+	//
+	// 在 gcMarkTermination -> gcMark 调用中设置，在 commit 调用之前。设置为被标记的字节数。
 	heapLive atomic.Uint64
 
 	// heapScan is the number of bytes of "scannable" heap. This is the
@@ -237,9 +256,12 @@ type gcControllerState struct {
 	//
 	// This value is fixed at the start of a GC cycle. It represents the
 	// maximum scannable heap.
-	// 起始值是：每上一轮标记终止阶段，会在 resetLive 函数中设置为 heapScanWork 的值。
-	// 然后在运行阶段会无论有没有在进行GC，每当分配了可扫描内存时，都会类型的 _type.ptrData，
-	// 添加到这个字段计数。
+	//
+	// 每一轮标记终止阶段，会在 gcMarkTermination -> gcMark ->  resetLive 函数中设置为 heapScanWork 的值。
+	//
+	// 起始/重置值：上一轮GC标记结束时被设置为 heapScanWork 的值。
+	// 动态增长： 1.非标记阶段，在运行时每当为变量分配内存时，会将变量类型元数据的 ptrData 字段的值累加到此字段。
+	//           2.标记阶段，只要此值发生变化就会重新调用此函数，计算新的控制值指导GC步调。
 	heapScan atomic.Uint64
 
 	// lastHeapScan is the number of bytes of heap that were scanned
@@ -247,12 +269,15 @@ type gcControllerState struct {
 	// includes the "scannable" parts of objects.
 	//
 	// Updated when the world is stopped.
+	//
+	// 每一轮标记终止阶段，会在 gcMarkTermination -> gcMark ->  resetLive 函数中设置为 heapScanWork 的值。
+	// 与 heapScan 不同此值是个快照值不会在其它地方变更。
 	lastHeapScan uint64
 
 	// lastStackScan is the number of bytes of stack that were scanned
 	// last GC cycle.
 	//
-	// 只在 resetLive 函数中设置，设置为字段 stackScanWork 的值。不清零。
+	// 只在 gcMarkTermination -> gcMark -> resetLive 函数中设置，设置为字段 stackScanWork 的值。不清零。
 	// 是最近一次GC标记终止阶段时扫描的所有g的栈大小之和。(字节)。
 	/*
 		// scannedSize is the amount of work we'll be reporting.
@@ -303,6 +328,8 @@ type gcControllerState struct {
 	// GC. After mark termination, heapLive == heapMarked, but
 	// unlike heapLive, heapMarked does not change until the
 	// next mark termination.
+	//
+	// 在 gcMarkTermination -> gcMark 调用中设置，在 commit 调用之前。
 	heapMarked uint64
 
 	// heapScanWork is the total heap scan work performed this cycle.
@@ -320,6 +347,8 @@ type gcControllerState struct {
 	// Note that stackScanWork includes only stack space scanned, not all
 	// of the allocated stack.
 	// 在标记清扫阶段STW被重置为0。
+	//
+	// gcControllerState.startCycle 中置0
 	heapScanWork atomic.Int64
 	/*
 		// scannedSize is the amount of work we'll be reporting.
@@ -336,8 +365,11 @@ type gcControllerState struct {
 	// 所有 _Grunnable 、 _Gwaiting 和 _Gsyscall 状态的g按上面计数到的
 	// scannedSize 的总和。
 	// 在标记清扫阶段STW被重置为0。
+	//
+	// gcControllerState.startCycle 中置0
 	stackScanWork atomic.Int64
 	// 在标记清扫阶段STW被重置为0。
+	// gcControllerState.startCycle 中置0
 	globalsScanWork atomic.Int64
 
 	// bgScanCredit is the scan work credit accumulated by the concurrent
@@ -347,6 +379,7 @@ type gcControllerState struct {
 	// 在标记清扫阶段STW被重置为0。
 	//
 	// 存储的扫描的内存大小总和
+	// gcControllerState.startCycle 中置0
 	bgScanCredit atomic.Int64
 
 	// assistTime is the nanoseconds spent in mutator assists
@@ -355,12 +388,14 @@ type gcControllerState struct {
 	// by sysmon. Updates occur in bounded batches, since it is both
 	// written and read throughout the cycle.
 	// 在标记清扫阶段STW被重置为0。
+	// gcControllerState.startCycle 中置0
 	assistTime atomic.Int64
 
 	// dedicatedMarkTime is the nanoseconds spent in dedicated mark workers
 	// during this cycle. This is updated at the end of the concurrent mark
 	// phase.
 	// 在标记清扫阶段STW被重置为0。
+	// gcControllerState.startCycle 中置0
 	dedicatedMarkTime atomic.Int64
 
 	// fractionalMarkTime is the nanoseconds spent in the fractional mark
@@ -368,15 +403,19 @@ type gcControllerState struct {
 	// will be up-to-date if the fractional mark worker is not currently
 	// running.
 	// 在标记清扫阶段STW被重置为0。
+	// gcControllerState.startCycle 中置0
 	fractionalMarkTime atomic.Int64
 
 	// idleMarkTime is the nanoseconds spent in idle marking during this
 	// cycle. This is updated throughout the cycle.
 	// 在标记清扫阶段STW被重置为0。
+	// gcControllerState.startCycle 中置0
 	idleMarkTime atomic.Int64
 
 	// markStartTime is the absolute start time in nanoseconds
 	// that assists and background mark workers started.
+	//
+	// gcControllerState.startCycle 中置为stop the world调用之前的时间戳。
 	markStartTime int64
 
 	// dedicatedMarkWorkersNeeded is the number of dedicated mark workers
@@ -460,11 +499,20 @@ type gcControllerState struct {
 	// Because the runtime is responsible for managing a memory limit, it's
 	// useful to couple these stats more tightly to the gcController, which
 	// is intimately connected to how that memory limit is maintained.
+	//
+	// 分配的所有mspan的总大小，至少有一个obj被使用。
+	// spanAllocHeap 类型的msapn，在 mheap.grow 方法中增加，在 mheap.freeSpanLocked 中
+	// 减少。
 	heapInUse    sysMemStat    // bytes in mSpanInUse spans
+	// 页面对应的 pageAlloc.chunks 的scavenged位是1。
 	heapReleased sysMemStat    // bytes released to the OS
+	// 页面对应的 pageAlloc.chunks 的scavenged位是0，alloc位也为0。
 	heapFree     sysMemStat    // bytes not in any span, but not released to the OS
 	totalAlloc   atomic.Uint64 // total bytes allocated
+	// 字节数
+	// 比如mspan总别释放的3个obj，那么对此值的贡献就是 3*s.elemsize
 	totalFree    atomic.Uint64 // total bytes freed
+	// 分配位为0/1，scavenged位为0的页的总大小。
 	mappedReady  atomic.Uint64 // total virtual memory in the Ready state (see mem.go).
 
 	// test indicates that this is a test-only copy of gcControllerState.
@@ -516,7 +564,8 @@ func (c *gcControllerState) startCycle(markStartTime int64, procs int, trigger g
 	dedicatedMarkWorkersNeeded := int64(totalUtilizationGoal + 0.5)
 	utilError := float64(dedicatedMarkWorkersNeeded)/totalUtilizationGoal - 1
 	const maxUtilError = 0.3
-	// GOMAXPROCS    dedicatedMarkWorkersNeeded  totalUtilizationGoal
+	// 修正后的结果：
+	// GOMAXPROCS    dedicatedMarkWorkersNeeded  fractionalUtilizationGoal
 	//   1                 0                         0.25
 	//   2                 0                         0.25
 	//   3                 0                         0.25
@@ -533,8 +582,10 @@ func (c *gcControllerState) startCycle(markStartTime int64, procs int, trigger g
 	//   14                4                         0
 	//   15                4                         0
 	//   16                4                         0
+	//   >16               floor(GOMAXPROCS*gcBackgroundUtilization(0.25)) 0
 	if utilError < -maxUtilError || utilError > maxUtilError {
-		// 修正后的worker数比原来大30%或小30%
+		// 修正后的worker数比原来大30%或小30%往上。
+		//
 		// Rounding put us more than 30% off our goal. With
 		// gcBackgroundUtilization of 25%, this happens for
 		// GOMAXPROCS<=3 or GOMAXPROCS=6. Enable fractional
@@ -562,6 +613,9 @@ func (c *gcControllerState) startCycle(markStartTime int64, procs int, trigger g
 	}
 
 	if trigger.kind == gcTriggerTime {
+		// 周期型的GC，如果dedicatedMarkWorkersNeeded大于0，将idleMarkWorkers设置为0。
+		// 否则将idleMarkWorkers设置为1。
+		//
 		// During a periodic GC cycle, reduce the number of idle mark workers
 		// required. However, we need at least one dedicated mark worker or
 		// idle GC worker to ensure GC progress in some scenarios (see comment
@@ -576,6 +630,8 @@ func (c *gcControllerState) startCycle(markStartTime int64, procs int, trigger g
 			c.setMaxIdleMarkWorkers(1)
 		}
 	} else {
+		// 非周期类型GC
+		//
 		// N.B. gomaxprocs and dedicatedMarkWorkersNeeded are guaranteed not to
 		// change during a GC cycle.
 		c.setMaxIdleMarkWorkers(int32(procs) - int32(dedicatedMarkWorkersNeeded))
@@ -584,6 +640,7 @@ func (c *gcControllerState) startCycle(markStartTime int64, procs int, trigger g
 	// Compute initial values for controls that are updated
 	// throughout the cycle.
 	c.dedicatedMarkWorkersNeeded.Store(dedicatedMarkWorkersNeeded)
+	// 计算一些初始值，这些初始值会在接下来的标记阶段被更新。
 	c.revise()
 
 	if debug.gcpacertrace > 0 {
@@ -623,28 +680,17 @@ func (c *gcControllerState) startCycle(markStartTime int64, procs int, trigger g
 // is when assists are enabled and the necessary statistics are
 // available).
 //
-// revise()
-// 下列字段更新时，会调用此函数：
-// gcControllerState.heapScan
-// gcControllerState.heapLive
-// any inputs to gcControllerState.heapGoal
+// ** 此函数最终任务是实时更新 assistWorkPerByte 和 assistBytesPerWork，指导标记阶段分配/标记的步调。
+// ** 每当计算这两个比率的输入数值发生变更时都会调用此函数。
+// 目前会在 mcache.refill mcache.allocLarge 和 mcache.releaseAll(标记阶段不大可能调用此函数)
+// mcache.refill 与 mcache.allocLarge 都是为对象分配内存时p上对应的缓存mspan没有空闲对象时，必
+// 需从mcentral或者直接从页堆上分配时才会调的函数。
 //
-// 此函数更新 assistWorkPerByte 和 assistBytesPerWork。
+// 其实也很好理解，新对象的虽然不会增加标记的工作量(因为标记阶段新申请的内存会直接标记为黑色)，但会延长标记的时间
+// 推迟sweep的时机，整个堆的大小会不受控，使GC步调变得不平稳和不可预测。
 //
-// 下面的辅助GC机制会用到这两个比率。
-// 记申请的内存大小为size。
-// 协程在申请堆内存时，在进行赋值运算：g.gcAssistBytes -= size后，如果 g.gcAssistBytes 为值，
-// 则需要进入辅助GC逻辑:
-// 通过 (-g.gcAssistBytes)*assistWorkPerByte 计算出要扫描的内存大小记size2并向上对齐到最小扫描内存大小[ gcOverAssistWork]。
-// 尝试从 gcControllerState.bgScanCredit 中窃取size2大小的值:
-//  1. 如果其比size2小就完全窃取。并进行以下更新：gcAssistBytes:=size2*assistBytesPerWork gcControllerState.bgScanCredit-=size2。
-//     返回继续内存分配。
-//  2. 否则就部分窃取。并进行以下更新：size2-=gcControllerState.bgScanCredit;gcAssistBytes:=gcControllerState.bgScanCredit*assistBytesPerWork;gcControllerState.bgScanCredit=0
-//     带着 size2 作为应扫描内存大小在系统栈执行辅助GC。
-//
-// 辅助GC的目的:
-// 是为了防止在进行GC标记时，协程不断地申请堆内存使堆越来越大而GC标记却迟迟不能结束(因为新sheng'c。
-// 从而影响到最重要的GC清扫阶段的到来的时间。
+// *** 在标记结束时，堆大小(heapLive)最多是触发本轮GC时(heapLive)的2倍。
+// var Dup map[uint64]bool
 func (c *gcControllerState) revise() {
 	gcPercent := c.gcPercent.Load()
 	if gcPercent < 0 {
@@ -652,27 +698,30 @@ func (c *gcControllerState) revise() {
 		// act like GOGC is huge for the below calculations.
 		gcPercent = 100000
 	}
+	// ** 下面的动态更新指的是指两次调用此函数时，下面变量初始源值很可能会不一样。
 	// live 动态变化，只会增加。
 	//
-	// 起始值： 上一轮GC标记结束时被设置为标记的字节数
-	// 动态增长：在运行时从堆中分配的字节数。
+	// 起始/重置值： 上一轮GC标记结束时被设置为标记的字节数
+	// 动态增长：在运行时:
+	// 每当p从mcentral缓存mspan时，将mspan总的空闲对象总大小用来增加此计数。
 	live := c.heapLive.Load()
 	// scan 动态变化，只会增加
 	//
-	// 起始值： 上一轮GC标记结束时被设置为 heapScanWork 的值。
-	// 动态增长： 在运行时每当为变量分配内存时，会将变量类型元数据的 ptrData 字段的值累加到此字段。
+	// 起始/重置值：上一轮GC标记结束时被设置为 heapScanWork 的值。
+	// 动态增长：1.非标记阶段，在运行时每当为变量分配内存时，会将变量类型元数据的ptrData字段的值累加到此字段。
+	//         2.标记阶段，1中的情况只会导致调用此函数，而不会增加计数。
 	scan := c.heapScan.Load()
 	// 动态变化，只会增加
 	//
 	// 起始值：0+0+模块的bss和data区间大小。
-	// 动态增长：heapScanWork 和 stackScanWork 会随着GC标记而增加。
+	// 动态增长：随着heapScanWork 和 stackScanWork 变化而变化。
 	work := c.heapScanWork.Load() + c.stackScanWork.Load() + c.globalsScanWork.Load()
 
 	// Assume we're under the soft goal. Pace GC to complete at
 	// heapGoal assuming the heap is in steady-state.
 	//
 	// 起始值：上一轮GC标记结束时，被标记的字节数 + 协程栈使用区间总和 + 模块bss和data区间之和。
-	// 动态更新：在运行中不会动态更新。
+	// 动态更新：标记阶段如果调用了此函数会动态更新。
 	heapGoal := int64(c.heapGoal())
 
 	// The expected scan work is computed as the amount of bytes scanned last
@@ -692,13 +741,29 @@ func (c *gcControllerState) revise() {
 	//         协程退出时会减去 g.stack.hi-g.stack.lo ，每当协程的栈被复制时减去旧
 	//         栈的大小。
 	maxStackScan := c.maxStackScan.Load()
+	// DDup(maxStackScan)
+	// Dup[maxStackScan]=true
 	// maxStackScan
 	// 最多被扫描的字节数，实际扫描到的字节数肯定会比这个少。
-	// 随着 scan 和 maxStackSan 的动态更新而更新。
+	// 随着 maxStackSan 的动态更新而更新。
 	maxScanWork := int64(scan + maxStackScan + c.globalsScan.Load())
-	//
-	// 本轮目前扫描的工作量已经大于上一轮GC扫描的任务量。
+	// 本轮目前已扫描的工作量已经大于上一轮GC扫描的任务量。
+	// 如果上一轮标记结束时，被标记的对象+到此轮GC开始时新增的对象 > 上一轮标记结束时扫描的任务量
+	// 就会出现这种情况。
+	DDup(uint64(heapGoal))
 	if work > scanWorkExpected {
+		println("heapGoal",heapGoal)
+		println("live",live)
+		println("maxScanWork",maxScanWork)
+		println("work",work)
+		println("diff",maxScanWork-work)
+		println("scan",scan)
+		// println("work>scanWOrkExpected")
+		// 在标记阶段:
+		// 1. c.heapScan不会增加计数。
+		// 2. 建的栈也不会增加c.stackScanWork计数。
+		// 所以一旦scanWorkExpected被赋值为maxScanWork，便不会再出现work大于scanWorkExpected的情况。
+		//
 		// We've already done more scan work than expected. Because our expectation
 		// is based on a steady-state scannable heap size, we assume this means our
 		// heap is growing.
@@ -711,6 +776,8 @@ func (c *gcControllerState) revise() {
 		// growths. It's OK to use more memory this cycle to scan all the live heap,
 		// because the next GC cycle is inevitably going to use *at least* that much
 		// memory anyway.
+		//
+		// GC开始时在标记阶段之前 heapGoal=c.triggered，在标记阶段heapGoal的源值会被更新。
 		extHeapGoal := int64(float64(heapGoal-int64(c.triggered))/float64(scanWorkExpected)*float64(maxScanWork)) + int64(c.triggered)
 		scanWorkExpected = maxScanWork
 
@@ -719,6 +786,9 @@ func (c *gcControllerState) revise() {
 		// stacks and/or globals grow to twice their size, this limits the current GC cycle's
 		// growth to 4x the original live heap's size).
 		//
+		// 因为上面的heapGoal可能会增加到c.triggered的2倍。而hardGoal又是heapGoal的二倍。
+		// 所以hardGoal最多是c.triggered的四倍。
+		//
 		// This maintains the invariant that we use no more memory than the next GC cycle
 		// will anyway.
 		hardGoal := int64((1.0 + float64(gcPercent)/100.0) * float64(heapGoal))
@@ -726,6 +796,8 @@ func (c *gcControllerState) revise() {
 			extHeapGoal = hardGoal
 		}
 		heapGoal = extHeapGoal
+		println("new heapgoal",heapGoal)
+		println("hard goal",hardGoal)
 	}
 	if int64(live) > heapGoal {
 		// We're already past our heap goal, even the extrapolated one.
@@ -745,6 +817,7 @@ func (c *gcControllerState) revise() {
 	// (scanWork), so allocation will change this difference
 	// slowly in the soft regime and not at all in the hard
 	// regime.
+	//
 	scanWorkRemaining := scanWorkExpected - work
 	if scanWorkRemaining < 1000 {
 		// We set a somewhat arbitrary lower bound on
@@ -759,6 +832,8 @@ func (c *gcControllerState) revise() {
 	}
 
 	// Compute the heap distance remaining.
+	//
+	// 标记阶段还允许分配的内存。
 	heapRemaining := heapGoal - int64(live)
 	if heapRemaining <= 0 {
 		// This shouldn't happen, but if it does, avoid
@@ -774,8 +849,13 @@ func (c *gcControllerState) revise() {
 	// skew between the two values. This is generally OK as the
 	// values shift relatively slowly over the course of a GC
 	// cycle.
+	//
+	// 因为assistWorkPerByte和assistBytesPerWork的读取不是同时的，所以一个辅助GC
+	// 使用的这两个值可能不一定互为倒数。
+	// 不过上面的注释也说了，这种扭曲是轻微的。
 	assistWorkPerByte := float64(scanWorkRemaining) / float64(heapRemaining)
 	assistBytesPerWork := float64(heapRemaining) / float64(scanWorkRemaining)
+	println(assistBytesPerWork,assistWorkPerByte)
 	c.assistWorkPerByte.Store(assistWorkPerByte)
 	c.assistBytesPerWork.Store(assistBytesPerWork)
 }
@@ -783,15 +863,21 @@ func (c *gcControllerState) revise() {
 // 标记结束时执行。
 // 在 gcMarkDone 函数中执行 且于 gcMarkTermination 之前之前。
 //
+// userForced 是否是周期性触发的GC
+//
 // endCycle computes the consMark estimate for the next cycle.
 // userForced indicates whether the current GC cycle was forced
 // by the application.
 func (c *gcControllerState) endCycle(now int64, procs int, userForced bool) {
 	// Record last heap goal for the scavenger.
 	// We'll be updating the heap goal soon.
+	//
+	// 本轮GC触发时，hapGoal的值。一般比trigger值稍大一点点。
 	gcController.lastHeapGoal = c.heapGoal()
 
 	// Compute the duration of time for which assists were turned on.
+	//
+	// c.markStartTime在startCycle中设置为清扫终止阶段的STW调用之前的时间。
 	assistDuration := now - c.markStartTime
 
 	// Assume background mark hit its utilization goal.
@@ -800,8 +886,11 @@ func (c *gcControllerState) endCycle(now int64, procs int, userForced bool) {
 	if assistDuration > 0 {
 		utilization += float64(c.assistTime.Load()) / float64(assistDuration*int64(procs))
 	}
+	// utilization=执行dedicated worker的工作时间占比+0.25
 
 	if c.heapLive.Load() <= c.triggered {
+		// c.heapLive此时的值应比触发本轮GC时c.heapLive的值大。
+		//
 		// Shouldn't happen, but let's be very safe about this in case the
 		// GC is somehow extremely short.
 		//
@@ -812,6 +901,7 @@ func (c *gcControllerState) endCycle(now int64, procs int, userForced bool) {
 		// Ignore this case and don't update anything.
 		return
 	}
+	// idleWorker工作时长占比
 	idleUtilization := 0.0
 	if assistDuration > 0 {
 		idleUtilization = float64(c.idleMarkTime.Load()) / float64(assistDuration*int64(procs))
@@ -845,6 +935,7 @@ func (c *gcControllerState) endCycle(now int64, procs int, userForced bool) {
 	//
 	// Note that because we only care about the ratio, assistDuration and procs cancel out.
 	scanWork := c.heapScanWork.Load() + c.stackScanWork.Load() + c.globalsScanWork.Load()
+	// currentConsMark 分配速率与标记速率的比值
 	currentConsMark := (float64(c.heapLive.Load()-c.triggered) * (utilization + idleUtilization)) /
 		(float64(scanWork) * (1 - utilization))
 
@@ -852,12 +943,19 @@ func (c *gcControllerState) endCycle(now int64, procs int, userForced bool) {
 	// because it tends to be jittery, even in the steady-state. The smoothing helps the GC to
 	// maintain much more stable cycle-by-cycle behavior.
 	oldConsMark := c.consMark
+	// 取两次的平均值作为c.consMark的值
 	c.consMark = (currentConsMark + c.lastConsMark) / 2
 	c.lastConsMark = currentConsMark
 
 	if debug.gcpacertrace > 0 {
 		printlock()
 		goal := gcGoalUtilization * 100
+		// pacer: 0.25+dedicated worker工作时长占比。
+		// goal: 0.25*100
+		// 此轮GC标记堆中被扫描的内存大小 + 栈被扫描的内存大小(hi-sp) + bss/data被扫描的大小
+		// ( 上一次上面三类扫描总和
+		// 此轮GC触发时堆大小-> 标记结束时堆大小 标记结束时堆大小-触发本轮GC时的goal。
+		// cons/mark 上一轮GC标记结束时计算出来的gcController.consMark。
 		print("pacer: ", int(utilization*100), "% CPU (", int(goal), " exp.) for ")
 		print(c.heapScanWork.Load(), "+", c.stackScanWork.Load(), "+", c.globalsScanWork.Load(), " B work (", c.lastHeapScan+c.lastStackScan.Load()+c.globalsScan.Load(), " B exp.) ")
 		live := c.heapLive.Load()
@@ -1103,12 +1201,14 @@ func (c *gcControllerState) heapGoal() uint64 {
 // information that is necessary for computing the trigger.
 //
 // The returned minTrigger is always <= goal.
+//
 // heapGoalInternal() 此函数在 heapGoal 和 trigger 函数中被调用。
 //
 // trigger()调用路线中：
 // 返回值：
-// goal: 大概率为 gcControllerState.gcPercentHeapGoal
+// goal: gcControllerState.gcPercentHeapGoal(没开启MEMORYLIMIT时)
 // minTrigger: gcControllerState.sweepDistMinTrigger
+//
 // minTrigger <= goal
 func (c *gcControllerState) heapGoalInternal() (goal, minTrigger uint64) {
 	// Start with the goal calculated for gcPercent.
@@ -1116,15 +1216,17 @@ func (c *gcControllerState) heapGoalInternal() (goal, minTrigger uint64) {
 
 	// Check if the memory-limit-based goal is smaller, and if so, pick that.
 	if newGoal := c.memoryLimitHeapGoal(); go119MemoryLimitSupport && newGoal < goal {
+		// 没开启MEMORYLIMIT时，不会执行到这里
 		goal = newGoal
 	} else {
 		// We're not limited by the memory limit goal, so perform a series of
 		// adjustments that might move the goal forward in a variety of circumstances.
 
 		sweepDistTrigger := c.sweepDistMinTrigger.Load()
-		// 正常来说 goal 是大于 sweepDistTrigger， GOGC设置的非常小。
+		// goal 最小值是4MB
+		// 正常来说 goal 是大于 sweepDistTrigger， 除非GOGC设置的非常小。
 		// 因为 sweepDistTrigger 的计算依赖GC标记的字节数 + sweepMinHeapDistance(1MB)，
-		// 而 goal 依赖于 GC标记字节数 + 一些统计量*GOGC。
+		// 而 goal 依赖于 GC标记字节数 + (GC标记字节数+一些统计量)*GOGC。
 		if sweepDistTrigger > goal {
 			// Set the goal to maintain a minimum sweep distance since
 			// the last call to commit. Note that we never want to do this
@@ -1150,12 +1252,16 @@ func (c *gcControllerState) heapGoalInternal() (goal, minTrigger uint64) {
 		// have the GC respond hard about how close we are to the goal than to
 		// push the goal back in such a manner that it could cause us to exceed
 		// the memory limit.
+		//
+		// 64KB
+		// minRunway distance，让goal比trigger大一点。
 		const minRunway = 64 << 10
 		// c.triggered 是上一次GC开始时，扫描终止阶段的 c.heapLive 的大小。[startCycle函数中]
 		// 在标记结束时 c.triggered 会被设置为 ^uint64(0) [resetLive函数中]
 		//
 		// 所以验证heap GC触发是否满足时此字段值为 ^uint64(0)
 		if c.triggered != ^uint64(0) && goal < c.triggered+minRunway {
+			// 只会在标记阶段执行到这里，因为标记结束后 c.triggered的值是^uint64(0)
 			goal = c.triggered + minRunway
 		}
 	}
@@ -1163,6 +1269,23 @@ func (c *gcControllerState) heapGoalInternal() (goal, minTrigger uint64) {
 }
 
 // memoryLimitHeapGoal returns a heap goal derived from memoryLimit.
+// memoryLimitHeapGoalHeadroom = 1MB
+//
+// 根据MEMORYLIMIT的值计算heapGoal。
+//
+// heapGoal 的值按一下计算：
+// 1. nonHeapMemory+overage >= memoryLimit ; 返回 gcControllerState.heapMarked
+// 2. 因为memory limit限制的是mapped页的总大小，而goal是目标堆大小。所以计算目标值首先要减去非堆内存，然后再保守的减去超额(认为超额都是堆造成的)：
+//    还有减去1MB的headerRoom。
+// overage = max(mappedReady - memoryLimit,0)
+// goal := memoryLimit - (nonHeapMemory + overage)
+// 	if goal < memoryLimitHeapGoalHeadroom || goal-memoryLimitHeapGoalHeadroom < memoryLimitHeapGoalHeadroom {
+//		goal = memoryLimitHeapGoalHeadroom
+//	} else {
+//		goal = goal - memoryLimitHeapGoalHeadroom
+//	}
+//
+// 最小值为 gcControllerState.heapMarked。小于heapMarked是没有意义的。
 func (c *gcControllerState) memoryLimitHeapGoal() uint64 {
 	// Start by pulling out some values we'll need. Be careful about overflow.
 	var heapFree, heapAlloc, mappedReady uint64
@@ -1171,6 +1294,7 @@ func (c *gcControllerState) memoryLimitHeapGoal() uint64 {
 		heapAlloc = c.totalAlloc.Load() - c.totalFree.Load() // Heap object bytes in use.
 		mappedReady = c.mappedReady.Load()                   // Total unreleased mapped memory.
 		if heapFree+heapAlloc <= mappedReady {
+			// 应该总是成立的，但每个字段是独立更新的。所以需要循环测试直到满足此条件。
 			break
 		}
 		// It is impossible for total unreleased mapped memory to exceed heap memory, but
@@ -1298,8 +1422,16 @@ const (
 // 用于验证 gcTriggerHeap 类型的 gcTrigger 是否满足开始GC的条件。
 //
 // 返回值：
-// goal: 大概率为 gcControllerState.gcPercentHeapGoal
-// minTrigger: gcControllerState.sweepDistMinTrigger
+// *******trigger的值*********
+// triggerLowerBound(最小值) := (goal-c.heapMarked)*0.7 + c.heapMarked
+// maxTrigger(最大值) := (goal-c.heapMarked)*0.95 + c.heapMarked
+// goal - runway[上次GC标记期间分配的字节数(大概)](理想值，让堆到达goal时标记任务刚好能结束)
+// ****************
+// goal/trigger(在test中触发参照值)
+// trigger 大概率trigger是goal-runway，且与goal所差无几。
+// minTrigger/_(在test中忽略此返回值)
+// minTrigger 大概率为 triggerLowerBound。
+//
 // minTrigger <= goal
 func (c *gcControllerState) trigger() (uint64, uint64) {
 	// minTrigger < goal
@@ -1338,7 +1470,7 @@ func (c *gcControllerState) trigger() (uint64, uint64) {
 	// saying that we're OK using more CPU during the GC to prevent
 	// this growth in RSS.
 	//
-	// triggerRationDen = 65
+	// triggerRationDen = 64
 	// minTriggerRatioNum = 45
 	triggerLowerBound := uint64(((goal-c.heapMarked)/triggerRatioDen)*minTriggerRatioNum) + c.heapMarked
 	if minTrigger < triggerLowerBound {
@@ -1363,6 +1495,7 @@ func (c *gcControllerState) trigger() (uint64, uint64) {
 	// 如果GOGC为100堆不大的情况下，则 goal、maxTrigger 所差无几。
 	maxTrigger := uint64(((goal-c.heapMarked)/triggerRatioDen)*maxTriggerRatioNum) + c.heapMarked
 	if goal > defaultHeapMinimum && goal-defaultHeapMinimum > maxTrigger {
+		// 大堆会发生，至少80MB往上。
 		maxTrigger = goal - defaultHeapMinimum
 	}
 	if maxTrigger < minTrigger {
@@ -1370,6 +1503,7 @@ func (c *gcControllerState) trigger() (uint64, uint64) {
 	}
 
 	// Compute the trigger from our bounds and the runway stored by commit.
+	//
 	// 通过 runway 、 miniTrigger 和 maxTrigger 来计算trigger。
 	var trigger uint64
 	runway := c.runway.Load()
@@ -1379,6 +1513,11 @@ func (c *gcControllerState) trigger() (uint64, uint64) {
 	} else {
 		trigger = goal - runway
 	}
+	// ****************
+	// triggerLowerBound := uint64(((goal-c.heapMarked)/triggerRatioDen)*minTriggerRatioNum) + c.heapMarked
+	// maxTrigger := uint64(((goal-c.heapMarked)/triggerRatioDen)*maxTriggerRatioNum) + c.heapMarked
+	// goal - runway(理想值，让堆到达goal时标记任务刚好能结束)
+	// ****************
 	if trigger < minTrigger {
 		trigger = minTrigger
 	}
@@ -1390,8 +1529,14 @@ func (c *gcControllerState) trigger() (uint64, uint64) {
 		print("minTrigger=", minTrigger, " maxTrigger=", maxTrigger, "\n")
 		throw("produced a trigger greater than the heap goal")
 	}
-	// trigger < goal
-	// 大概率 trigger 是 maxTrigger，且与goal所差无几。
+	// trigger=< goal
+	//
+	// *******trigger的值*********
+	// triggerLowerBound(最小值) := (goal-c.heapMarked)*0.7 + c.heapMarked
+	// maxTrigger(最大值) := (goal-c.heapMarked)*0.95 + c.heapMarked
+	// goal - runway[上次GC标记期间分配的字节数(大概)](理想值，让堆到达goal时标记任务刚好能结束)
+	// ****************
+	// 大概率trigger是goal-runway，且与goal所差无几。
 	return trigger, goal
 }
 
@@ -1410,6 +1555,7 @@ func (c *gcControllerState) trigger() (uint64, uint64) {
 //
 // Callers must call gcControllerState.revise after calling this
 // function if the GC is enabled.
+//
 // 被以下函数所调用：
 // 1. gcControllerCommit , isSweepDone = false
 // 2. gcControllerState.init , isSweepDone = true
@@ -1587,14 +1733,14 @@ func readGOMEMLIMIT() int64 {
 // addIdleMarkWorker
 // 目的:尝试增加 idleWorker 的计数，如果增加成功调用者需称为一个 idleWorker
 // 返回值：
-//
-//			false，满足下列条件之一:
-//				 1.当期正在运行的 idleWorker 已经超过了所允许的最大 idleWorker 的数量
-//	          2.原子增加 idleWorker 计数失败
-//	     true，其它情况
+//	false，满足下列条件之一:
+//		 1.当期正在运行的 idleWorker 已经超过了所允许的最大 idleWorker 的数量
+//       2.cas增加idleWorker计数失败
+//  true，其它情况
 //
 // gcControllerState.idleMarkWorkers 高32位的值为 idleWorker允许的最大数量
 // 低32位的值为当前 idleWorker的数量
+//
 // addIdleMarkWorker attempts to add a new idle mark worker.
 //
 // If this returns true, the caller must become an idle mark worker unless
@@ -1614,6 +1760,8 @@ func (c *gcControllerState) addIdleMarkWorker() bool {
 			// n > max is tolerated.
 			return false
 		}
+		// n<max 并不代表下面一定可以成功，所以要不断进行cas尝试。
+		// 因为允许并发操作表示idleWroker现存数量的低32位。
 		if n < 0 {
 			print("n=", n, " max=", max, "\n")
 			throw("negative idle mark workers")
@@ -1632,6 +1780,9 @@ func (c *gcControllerState) addIdleMarkWorker() bool {
 //
 // nosplit because it may be called without a P.
 //
+// 一个可以立刻知道现在是否需要ideMarkWOrker(现存数量小于允许最大数量)的fast path函数。
+// 但返回true并不是说接下来尝试增加一个idleMarkWorker会成功。
+//
 //go:nosplit
 func (c *gcControllerState) needIdleMarkWorker() bool {
 	p := c.idleMarkWorkers.Load()
@@ -1640,6 +1791,9 @@ func (c *gcControllerState) needIdleMarkWorker() bool {
 }
 
 // removeIdleMarkWorker must be called when an new idle mark worker stops executing.
+//
+// 肯定可以成功，因为最低32位(现存idleMarkWorker数量)是谁负责增加谁就负责减少。
+// 所以不会负数情况。
 func (c *gcControllerState) removeIdleMarkWorker() {
 	for {
 		old := c.idleMarkWorkers.Load()
@@ -1660,6 +1814,8 @@ func (c *gcControllerState) removeIdleMarkWorker() {
 // This method is optimistic in that it does not wait for the number of
 // idle mark workers to reduce to max before returning; it assumes the workers
 // will deschedule themselves.
+//
+// 将max存储到高32位表示MaxIdleMarkWorkers，同时保留现存的idleMarkWorker的数量不受影响。
 func (c *gcControllerState) setMaxIdleMarkWorkers(max int32) {
 	for {
 		old := c.idleMarkWorkers.Load()
@@ -1682,9 +1838,19 @@ func (c *gcControllerState) setMaxIdleMarkWorkers(max int32) {
 // Calls gcController.commit.
 //
 // The heap lock must be held, so this must be executed on the system stack.
+//
 // 位于 resetLive 函数之后调用
 // gcControllerCommit 函数被 setGCPercent 、 setMemoryLimit 和 gcMarkTermination
-// 函数所调用。
+//
+// 正常只会被 gcMarkTermination 调用。
+// 具体时机：
+// 在刚刚调用 setGCPhase(_GCoff) 之后。
+// -----------
+// 更新gcController的一些统计字段，作为下一轮GC触发的依据。
+// 根据上一轮GC的goal和本轮标记结束时的goal更新 scavenge 的一些字段。作为是否进行scavenge的依据。
+// 根据 gcController.trigger() 的返回值，指导 sweep 的步伐。
+//
+// 即除了GC本身一些统计数据的更新，同时也利用这些统计数据来更新scavenge和sweep在本轮GC[从此函数被调用到下一次被调用的这段期间]的执行节奏。
 //
 //go:systemstack
 func gcControllerCommit() {
@@ -1694,6 +1860,7 @@ func gcControllerCommit() {
 
 	// Update mark pacing.
 	if gcphase != _GCoff {
+		// 被gcMarkTermination不会到这里。
 		gcController.revise()
 	}
 
@@ -1703,7 +1870,9 @@ func gcControllerCommit() {
 		traceHeapGoal()
 	}
 
+	// 下一轮GC触发目标
 	trigger, heapGoal := gcController.trigger()
 	gcPaceSweeper(trigger)
+
 	gcPaceScavenger(gcController.memoryLimit.Load(), heapGoal, gcController.lastHeapGoal)
 }

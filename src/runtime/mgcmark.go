@@ -54,7 +54,9 @@ const (
 // some miscellany) and initializes scanning-related state.
 //
 // gcMarkRootPrepare()，只被 gcStart 函数调用。
-// 在STW状态下记录当下不同根任务的状态，用于接下来标记阶段的起点。这些信息都保存在work相应的字段上。
+//
+// 在STW状态下记录当下不同根任务数量/起点，用于接下来标记阶段的起点。
+// 这些信息都保存在 work 相应的字段上。
 //
 // The world must be stopped.
 func gcMarkRootPrepare() {
@@ -70,6 +72,8 @@ func gcMarkRootPrepare() {
 	work.nBSSRoots = 0
 
 	// Scan globals.
+	//
+	// 遍历所有二进制模块，将work.nDataRoots设置为所有模块的data区间块数量的最大值。
 	for _, datap := range activeModules() {
 		nDataRoots := nBlocks(datap.edata - datap.data)
 		if nDataRoots > work.nDataRoots {
@@ -77,6 +81,7 @@ func gcMarkRootPrepare() {
 		}
 	}
 
+	// 遍历所有二进制模块，将work.nBSSRoots设置为所有模块的data区间块数量的最大值。
 	for _, datap := range activeModules() {
 		nBSSRoots := nBlocks(datap.ebss - datap.bss)
 		if nBSSRoots > work.nBSSRoots {
@@ -97,7 +102,8 @@ func gcMarkRootPrepare() {
 	// Snapshot allArenas as markArenas. This snapshot is safe because allArenas
 	// is append-only.
 	mheap_.markArenas = mheap_.allArenas[:len(mheap_.allArenas):len(mheap_.allArenas)]
-	// arena的数量*(8192 / 512 = 16)
+	// work.nSpanRoots=arena的数量*(8192 / 512 = 16)
+	// 每个arena按512页分组进行扫描。
 	work.nSpanRoots = len(mheap_.markArenas) * (pagesPerArena / pagesPerSpanRoot)
 
 	// Scan stacks.
@@ -473,6 +479,8 @@ func gcAssistAlloc(gp *g) {
 	traced := false
 retry:
 	if go119MemoryLimitSupport && gcCPULimiter.limiting() {
+		// GC工作时长超过限制，则任有内存分配需求的协程都不会进行辅助GC。
+		//
 		// If the CPU limiter is enabled, intentionally don't
 		// assist to reduce the amount of CPU time spent in the GC.
 		if traced {
@@ -552,6 +560,7 @@ retry:
 			if traced {
 				traceGCMarkAssistDone()
 			}
+			println("return4")
 			return
 		}
 	}
@@ -608,9 +617,9 @@ retry:
 		// as well let background marking take care of the
 		// work that is available.
 		//
-		// 停靠到 assist queue，后台标记worker在将 credit 冲刷到
-		// gcController.bgScanCredit 前，
-		// 用 credit 给停靠的g的gcAssistBytes买单，试图唤醒队列中停靠的g。
+		// 停靠到assist queue，后台标记worker在将credit冲刷到
+		// gcController.bgScanCredit前，用credit给停靠的g的
+		// gcAssistBytes买单，试图唤醒队列中停靠的g，这种情况gcParkAssist返回false。
 		if !gcParkAssist() {
 			goto retry
 		}
@@ -618,6 +627,7 @@ retry:
 		// At this point either background GC has satisfied
 		// this G's assist debt, or the GC cycle is over.
 	}
+	println("return5")
 	if traced {
 		traceGCMarkAssistDone()
 	}
@@ -682,6 +692,7 @@ func gcAssistAlloc1(gp *g, scanWork int64) {
 	// assistBytesPerWork is very low.
 	assistBytesPerWork := gcController.assistBytesPerWork.Load()
 	gp.gcAssistBytes += 1 + int64(assistBytesPerWork*float64(workDone))
+	println("gp.gcAssistBytes",gp.gcAssistBytes,workDone)
 
 	// If this is the last worker and we ran out of work,
 	// signal a completion point.
@@ -1182,6 +1193,10 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 			if job >= work.markrootJobs {
 				break
 			}
+			// 我------------
+			// var b note
+			// notetsleep(&b,1000000000*1)
+			// noteclear(&b)
 			markroot(gcw, job, flushBgCredit)
 			if check != nil && check() {
 				goto done
@@ -1779,6 +1794,8 @@ func gcmarknewobject(span *mspan, obj, size uintptr) {
 }
 
 // gcMarkTinyAllocs greys all active tiny alloc blocks.
+//
+// 在 gcStart 调用中被调用。提前对所有p上的tiny(16字节内存块)进行标记。
 //
 // The world must be stopped.
 func gcMarkTinyAllocs() {

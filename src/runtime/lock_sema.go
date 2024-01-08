@@ -361,7 +361,7 @@ func notetsleep_internal(n *note, ns int64, gp *g, deadline int64) bool {
 }
 // notetsleep()
 //
-// 与 notesleep() 相同都在在g0栈上调用，不同的是其可以带一个休眠超时
+// 与 notesleep() 相同都会在g0栈上调用，不同的是其可以带一个休眠超时
 // 参数，在多少纳秒后自动唤醒。
 //
 // 参数：

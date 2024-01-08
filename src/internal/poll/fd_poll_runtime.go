@@ -64,6 +64,7 @@ func (pd *pollDesc) close() {
 }
 
 // evict()，目前只被 poll.(*FD).close() 函数调用。
+//
 // Evict evicts fd from the pending list, unblocking any I/O running on fd.
 func (pd *pollDesc) evict() {
 	if pd.runtimeCtx == 0 {

@@ -26,6 +26,8 @@ const (
 
 // ErrShortWrite means that a write accepted fewer bytes than requested
 // but failed to return an explicit error.
+//
+// Writer.buf中的内容并未完全写入到底层的writer(Writer.wr字段值)。
 var ErrShortWrite = errors.New("short write")
 
 // errInvalidWrite means that a write returned an impossible count.

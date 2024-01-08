@@ -9,6 +9,8 @@ import (
 )
 
 // pageBits is a bitmap representing one bit per page in a palloc chunk.
+// 一个pageBits类型的值是一个包含512个bit的位图。
+// pallocChunkPages/64=8，所以需要8个uint64就可以表示。
 type pageBits [pallocChunkPages / 64]uint64
 
 // get returns the value of the i'th bit in the bitmap.
@@ -59,6 +61,7 @@ func (b *pageBits) setAll() {
 
 // setBlock64 sets the 64-bit aligned block of bits containing the i'th bit that
 // are set in v.
+// 将pageBits表示的512页按每64页分组，i所在的组的分配位图与alloc进行按位与操作。
 func (b *pageBits) setBlock64(i uint, v uint64) {
 	b[i/64] |= v
 }
@@ -138,14 +141,19 @@ func (b *pallocBits) summarize() pallocSum {
 	const notSetYet = ^uint(0) // sentinel for start value
 	start = notSetYet
 	for i := 0; i < len(b); i++ {
-		x := b[i]
+		// len(b)=8
+		x := b[i] //x(uint64)
 		if x == 0 {
-			cur += 64
-			continue
+			cur += 64 // b[i]对应一个uint64的值，其包含64个位。
+			continue  // x=0，表示64位全是0。
 		}
 		t := uint(sys.TrailingZeros64(x))
+		// println("tailzero",sys.TrailingZeros64(0b1110))
+		// 1
 		l := uint(sys.LeadingZeros64(x))
-
+		// t x右边0的个数
+		// l x左边0的个数
+		
 		// Finish any region spanning the uint64s
 		cur += t
 		if start == notSetYet {
@@ -158,8 +166,16 @@ func (b *pallocBits) summarize() pallocSum {
 		cur = l
 	}
 	if start == notSetYet {
+		// b(pallocBits)的元素全是0
 		// Made it all the way through without finding a single 1 bit.
 		const n = uint(64 * len(b))
+		// 512 512 512
+		// println("pacPallocSum",n,n,n,packPallocSum(n, n, n))
+		// pacPallocSum 512 512 512 2251800887427584
+		// V:=pacPallocSum(1,2,3)
+		// 	println((V>>21)<<21 ^ V) // 1
+		//	println((V>>21>>21)<<21 ^ V>>21)// 2
+		//	println(V >> 42)// 3
 		return packPallocSum(n, n, n)
 	}
 	if cur > max {
@@ -236,6 +252,15 @@ outer:
 // the new searchIdx should be ignored.
 //
 // Note that if npages == 1, the two returned values will always be identical.
+//
+// npages 要找的连续页数，从此chunk中的第searchIdx页开始搜索。
+// searchIdx取值范围[0-512)
+// napges取值返回npages<=512-searchIdx
+//
+// 返回值：在chunk中找到了连续npages的页面，首页面索引(在chunk中512个页面的偏移量)为第一个返回值。
+// 此chuk中第一为0的位对应的页面在此chun中的偏移量。
+// 调用者用此值构建新的searchAddr用于更新 pageAlloc.searchAddr，如果新的searchAddr大于旧的话，
+// 即第二个返回值大于参数searchIdx。
 func (b *pallocBits) find(npages uintptr, searchIdx uint) (uint, uint) {
 	if npages == 1 {
 		addr := b.find1(searchIdx)
@@ -381,6 +406,8 @@ func (b *pallocBits) pages64(i uint) uint64 {
 
 // allocPages64 allocates a 64-bit block of 64 pages aligned to 64 pages according
 // to the bits set in alloc. The block set is the one containing the i'th page.
+//
+// 将pallocBits表示的512页按每64页分组，i所在的组的分配位图与alloc进行按位与操作。
 func (b *pallocBits) allocPages64(i uint, alloc uint64) {
 	(*pageBits)(b).setBlock64(i, alloc)
 }
@@ -425,7 +452,17 @@ func findBitRange64(c uint64, n uint) uint {
 // Update the comment on (*pageAlloc).chunks should this
 // structure change.
 type pallocData struct {
+	// 位为0表示对应的页可以用于分配还未被使用。
+	// 索引越大对应的页集合的地址就越大，比如索引1中的所有页其地址比索引0中的所有页的地址都大。
+	// 其一个元素值(uint64类型)中，高位对应的页地址值闭低位对应的页的地址值大。
+	//
+	// scavenged 也是这样排列的。
 	pallocBits
+	// 新分配的页对应的此位是1（在pageAlloc.grow方法中设置)
+	// 位为1表示对应的页已经被scavenged过了。
+	//
+	// 如果一个页面对应的scavenged位是1(其对应的地址空间为prepared状态)，那么在使用执行必须将其
+	// 转换为ready状态( sysUsed 函数调用)。
 	scavenged pageBits
 }
 

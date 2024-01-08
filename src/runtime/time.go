@@ -47,6 +47,12 @@ type timer struct {
 	nextwhen int64
 
 	// 表示 timer 当前的状态，取值自runtime 中一组预定义常量。
+	//
+	// timer 中的所有以 ing 结尾的状态(除了 timerWaiting)都是一种保护状态
+	// ,因为在变化到目标状态之前可能要对 timer 进行一些其它操作，而这种修改在旧
+	// 状态或目标状态基础之上执行都是不安全的(主要是并发问题)。使用了ing状态后就
+	// 可以在变更到ing状态后到目标状态之前进行这些操作。
+	//
 	// The status field holds one of the values below.
 	status atomic.Uint32
 }
@@ -165,7 +171,13 @@ const (
 	// It is not in any P's heap.
 	timerRemoved
 
-	// 表示 timer 正在被修改也是一个短暂的状态。
+	// 表示 timer 正在被修改，是一个短暂的状态。
+	//
+	// timer 中的所有以 ing 结尾的状态(除了 timerWaiting)都是一种保护状态
+	// ,因为在变化到目标状态之前可能要对 timer 进行一些其它操作，而这种修改在旧
+	// 状态或目标状态基础之上执行都是不安全的(主要是并发问题)。使用了ing状态后就
+	// 可以在变更到ing状态后到目标状态之前进行这些操作。
+	//
 	// The timer is being modified.
 	// The timer will only have this status briefly.
 	timerModifying
@@ -266,6 +278,11 @@ func stopTimer(t *timer) bool {
 //
 // Reports whether the timer was modified before it was run.
 //
+// t的状态由 timerWaiting, timerModifiedEarlier, timerModifiedLater 成功转移到
+// -> timerModifiedEarlier, timerModifiedLater 则返回true。否则返回false。
+//
+// 如果这个t在执行此函数(更精确的是底层函数)之前已经运行/删除，此函数便会返回false。
+//
 //go:linkname resetTimer time.resetTimer
 func resetTimer(t *timer, when int64) bool {
 	if raceenabled {
@@ -354,10 +371,12 @@ func doaddtimer(pp *p, t *timer) {
 }
 // deltimer() 主要用来删除一个timer，这里的删除操作主要是修改timer的状态，并不是
 // 从推中移除。目的是使其不再被执行。
-// 该函数不会改动 timer 堆，所以不需要对 timersLock 加锁。
+// 该函数不会改动 timer 堆，所以不需要对 timers lock 加锁。
 //
 // 返回值：
 // 只有这个函数本身将 timer 的状态设置成 timerDeleted 时返回true。
+//
+// 无论返回值是何，当此函数返回时t肯定不会再运行(如果后续没有其它操作的话)。
 //
 // deltimer deletes the timer t. It may be on some other P, so we can't
 // actually remove it from the timers heap. We can only mark it as deleted.
@@ -504,29 +523,32 @@ func dodeltimer0(pp *p) {
 	}
 }
 // 函数执行分为两个部分：
-// 1. 凡是以ing结尾的状态都表示需要等待知道一种确定状态除了 timerWaiting。
+// 1. 凡是状态以ing结尾(除了 timerWaiting)的timer都表示需要等待，直到一种确定状态。
 // 2. 无需等待的状态：
-//   2.1 timerNoStatus 、 timerRemoved 表示t已经不在堆中了，需要 -> timerModifying (添加到堆中) ->
+//   2.1 timerNoStatus 、 timerRemoved 表示t已经不在堆中了，需要 -> timerModifying -> 添加到堆中 ->
 //       timerWaiting
-//   2.2 timerDeleted 、 timerModifiedEarlier 、 tiemrModifiedLater 和 timerWaiting 状态的t表示
-//       在堆中，只需变更状态。根据 when 和 t.when 进行比较的结果转移到 -> timerModifiedEarlier 或
-//       timerModifiedLater。
+//   2.2 timerDeleted 、 timerModifiedEarlier 、 timerModifiedLater 和 timerWaiting (状态的t表示
+//       在堆中，只需变更状态) -> timerModifying -> timerModifiedEarlier 或
+//       timerModifiedLater (根据 when 和 t.when 进行比较的结果转移)。
+//
 // 对于原本就在堆中的timer，需要把新的时间（参数when）赋值给它的 nextwhen 字段，而不是直接改动它的 when 字段
 // ，因为在这里不打算改动它在堆中的位置。
-// 1. 如果最终状态为 timerModifiedEarlier 则会尝试修改关联P的timerModifiedEarliest字段。
-// 2. 如果timer是添加到堆中或者变更到 timerModifiedEarlier 都会尝试唤醒 netpoll
+// 1. 如果最终状态为 timerModifiedEarlier 则会尝试修改关联的 p.timerModifiedEarliest 字段。
+// 2. 如果 timer 是添加到堆中或者变更到 timerModifiedEarlier 都会尝试唤醒 netpoll
 //
 // 返回值：
-// 状态由 timerWaiting、 timerModifiedEarlier 和 timerModifiedLater 变更会返回true。
+// 状态由 timerWaiting、 timerModifiedEarlier 和 timerModifiedLater 成功变更到 timerModifiedEarlier 和 timerModifiedLater
+// 返回true。
 //
 // 参数：
-// when timer新的运行时间
+// when timer 新的运行时间
 // period timer.period 的新值
 // f timer.f 的新值
 // arg timer.arg 的新值
 // seq timer.seq 的新值
 //
 // runtime timer 模块提供的接口供其它runtime中的模块使用，如 netpoll 模块。
+// 无论此函数返回何值，t都会在堆中且t.when是的值是when。
 //
 // modtimer modifies an existing timer.
 // This is called by the netpoll code or time.Ticker.Reset or time.Timer.Reset.
@@ -772,13 +794,14 @@ func moveTimers(pp *p, timers []*timer) {
 }
 
 // adjusttimers
-// 目的：
+// 根据now(前提timerModifiedEarliest>now)调整堆：
 // 1. 移除处于删除状态的tiemr： timerDeleted -> timerRemoving (由 dodeltimer 函数执行具体的移除任务）-> timerRemoved
-// 2. 将 timerModifiedLater 和 timerModifiedEarlier 状态改为 timerMoving ，并添加到 moved队列，然后摘一同添加
+// 2. 将 timerModifiedLater 和 timerModifiedEarlier 状态改为 timerMoving ，并添加到 moved队列，然后再一同添加
 // ( addAdjustedTimers )-> timerWaiting。
 // 3. timerModifying 状态的 timer 继续遍历等待其到一个确定状态。
 //
-// 运行条件：参数now的值小于 pp.timerModifiedEarliest 或者 pp.timerModifiedEarliest 的值为0
+// 运行条件：参数now的值大于等于 p.timerModifiedEarliest 且 p.timerModifiedEarliest 的值不为0。
+//
 // 结果：这个函数调用之后pp的tiemrs堆中没有处于modifier状态的timer且都是按照它们的when字段进行有序排列。
 //      timerModifiedEarliest字段也被设置成了0。
 //
@@ -797,8 +820,8 @@ func adjusttimers(pp *p, now int64) {
 	// We'll postpone looking through all the adjusted timers until
 	// one would actually expire.
 	first := pp.timerModifiedEarliest.Load()
-	// 如果没有 timerModifiedEarLier 状态的 timer或者最到到期的且处于timerModifiedEarlier
-	// 状态的 timer 小于参数 now 则直接返回。因为调整堆的目的就是为了接下来执行 runtimer
+	// 如果没有timerModifiedEarLier状态的timer或者最近到期的且处于timerModifiedEarlier
+	// 状态的timer大于参数now则直接返回。因为调整堆的目的就是为了接下来执行 runtimer
 	if first == 0 || first > now {
 		if verifyTimers {
 			verifyTimerHeap(pp)
@@ -912,12 +935,13 @@ func nobarrierWakeTime(pp *p) int64 {
 	return next
 }
 // runtimer()
-// 被调度器调用，除了这个函数还有 adjusttimers() 和 clearDeletedTimers() 函数，它们对 timer
+// 被调度器调用，除了这个函数还有 adjusttimers() 和 clearDeletedTimers() 函数，它们也对 timer
 // 堆进行维护，以及运行那些到达触发时间的 timer。
 //
-// 返回值：1. 大于0，pp的timers堆中按照字段when排序，最小的when值但又小于now，这个值可以用于指导netpoll阻塞时间
+// 返回值：1. 大于0，pp的timers堆中按照字段when排序，返回值就是堆顶的when值(小于参数now)，这个值可以用于指导netpoll阻塞时间。
 //        2. 等于0，成功运行了一个timer，返回0。
-//        3. -1  ， 推中没有timer了。
+//        3. -1 ，推中没有timer了。
+//
 // 必须在系统栈上调用
 //
 // runtimer examines the first timer in timers. If it is ready based on now,

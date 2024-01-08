@@ -348,6 +348,7 @@ func dropCR(data []byte) []byte {
 // The last non-empty line of input will be returned even if it has no
 // newline.
 func ScanLines(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	println("++",atEOF)
 	if atEOF && len(data) == 0 {
 		return 0, nil, nil
 	}

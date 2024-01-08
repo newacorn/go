@@ -108,6 +108,8 @@ func (s *CertPool) Clone() *CertPool {
 // any other pool returned by SystemCertPool.
 //
 // New changes in the system cert pool might not be reflected in subsequent calls.
+//
+// macos 平台下返回的是空的CertPool。
 func SystemCertPool() (*CertPool, error) {
 	if sysRoots := systemRootsPool(); sysRoots != nil {
 		return sysRoots.Clone(), nil

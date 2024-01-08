@@ -79,6 +79,8 @@ func NewReader(r io.Reader) (io.ReadCloser, error) {
 // If the compressed data refers to a different dictionary, NewReaderDict returns ErrDictionary.
 //
 // The ReadCloser returned by NewReaderDict also implements Resetter.
+//
+// 在这里dict不能像flate包中可以进行修改。必须完全一致。zlib压缩信息里存有dict的摘要信息。
 func NewReaderDict(r io.Reader, dict []byte) (io.ReadCloser, error) {
 	z := new(reader)
 	err := z.Reset(r, dict)

@@ -7,6 +7,8 @@ package time
 // Sleep pauses the current goroutine for at least the duration d.
 // A negative or zero duration causes Sleep to return immediately.
 // runtime.timeSleep
+//
+// 其关联的 runtime.timer 是 runtime.g.timer，这个值会复用直到g退出运行。
 func Sleep(d Duration)
 
 // Interface to timers implemented in package runtime.
@@ -38,9 +40,11 @@ func when(d Duration) int64 {
 	}
 	return t
 }
-
+// runtime.startTimer
 func startTimer(*runtimeTimer)
+// runtime.stopTimer
 func stopTimer(*runtimeTimer) bool
+// runtime.resetTimer
 func resetTimer(*runtimeTimer, int64) bool
 // runtime.modtimer
 func modTimer(t *runtimeTimer, when, period int64, f func(any, uintptr), arg any, seq uintptr)
@@ -76,6 +80,11 @@ type Timer struct {
 // Stop does not wait for f to complete before returning.
 // If the caller needs to know whether f is completed, it must coordinate
 // with f explicitly.
+//
+//
+// 将 Timer.r 的状态转换到 runtime.timerDeleted ，如果装换成功返回true，否则返回false。
+// 这个函数对于一个新建或者reset之后的 Timer，只能调用一次。用于判断 Timer.r 是否已经运行
+// 过了。因为只有调用一次，当其返回false时才能认为其运行过了。可以排空 Timer.C 中的时间值。
 func (t *Timer) Stop() bool {
 	if t.r.f == nil {
 		panic("time: Stop called on uninitialized Timer")
@@ -133,6 +142,14 @@ func NewTimer(d Duration) *Timer {
 // goroutine running f does not run concurrently with the prior
 // one. If the caller needs to know whether the prior execution of
 // f is completed, it must coordinate with f explicitly.
+//
+// timer.r 的状态由 timerWaiting, timerModifiedEarlier, timerModifiedLater 
+// 成功转移到-> timerModifiedEarlier, timerModifiedLater 则返回true。
+// 否则返回false。
+//
+// 如果这个t在执行此函数(更精确的是底层函数)之前已经运行/删除，此函数便会返回false。
+//
+// 无论返回值为何，都会将 when字段为now+d的t.r添加到当前p的时间堆上。
 func (t *Timer) Reset(d Duration) bool {
 	if t.r.f == nil {
 		panic("time: Reset called on uninitialized Timer")
@@ -155,6 +172,9 @@ func sendTime(c any, seq uintptr) {
 // The underlying Timer is not recovered by the garbage collector
 // until the timer fires. If efficiency is a concern, use NewTimer
 // instead and call Timer.Stop if the timer is no longer needed.
+//
+// d必须大于0。返回的是容量为1类型为<-chan Time的通道类型。
+// 关联的 Timer 直到 Timer.r 从所在p时间堆中移除时才会被回收。
 func After(d Duration) <-chan Time {
 	return NewTimer(d).C
 }

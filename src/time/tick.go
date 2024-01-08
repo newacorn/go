@@ -19,6 +19,9 @@ type Ticker struct {
 // the time interval or drop ticks to make up for slow receivers.
 // The duration d must be greater than zero; if not, NewTicker will
 // panic. Stop the ticker to release associated resources.
+//
+// 参数：
+// d必须大于0
 func NewTicker(d Duration) *Ticker {
 	if d <= 0 {
 		panic(errors.New("non-positive interval for NewTicker"))

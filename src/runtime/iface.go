@@ -20,12 +20,27 @@ var (
 )
 
 // itabTable 就是runtime中 itab 的全局缓存，它本身是个 itabTableType 类型的指针
-// itabTable 被实现成一个散列表。查找和插入操作使用的key是由接口类型元数据和动态类型元
-// 数据组合而成的，哈希计算方方式为接口类型的元数据哈希值 inter.typ.hash 与东塔类型元数据哈希值
-// typ.hash 进行异或运算。
+// itabTable 被实现成一个散列表。查找和插入操作使用的key是由接口类型元数据和动态类型
+// 元数据组合而成的。
+//
+// itab占用的内存使用持久内存分配器分配的。其指针会作为entries的元素，键就是itab.hash。
+//
+// 当itabTableType的entries大小(size)与count的比大于等于75%时，会使用一个更大的size
+// 创建一个新的itabTabe。
+//
+// 从itabTable中查找分为两步：1.快速查找，如果没有找到会继续第二步。2.加锁的情况下进行查找，因为
+// 接下来可能需要: 如果实在不存在的话(这一步需要加锁防止并发添加)构建新的itab并插入/扩容itabTable(需要加锁
+// 防止并发扩容互相原子替换)，正因为如此这两个可能的操作合并到了第二步加锁查找中。
+//
+// 哈希计算方式:
+// 接口类型的元数据哈希值 inter.typ.hash 与动态类型元数据哈希值typ.hash 进行异或运算再与size进行按位与。
+// 如果这个hash值作为键在entries中存在对应元素则说明hash重复，使用(hash+1)&size作为再次计算哈希的方法一
+// 直到没有重复为止。
+//
 // Note: change the formula in the mallocgc call in itabAdd if you change these fields.
 type itabTableType struct {
 	// size 表示缓存的容量，也就是 entries 数组的大小
+	// 因为entries会进行动态扩容，所以size不一定定语itabInitSize。
 	size    uintptr             // length of entries array. Always a power of 2.
 	// count 白叟实际缓存了多少个 itab
 	count   uintptr             // current number of filled entries.
@@ -53,6 +68,7 @@ func getitab(inter *interfacetype, typ *_type, canfail bool) *itab {
 
 	// easy case
 	if typ.tflag&tflagUncommon == 0 {
+		// typ的tflagUncommon为0，则其肯定不包含方法。
 		if canfail {
 			return nil
 		}
@@ -66,19 +82,24 @@ func getitab(inter *interfacetype, typ *_type, canfail bool) *itab {
 	// This is by far the most common case, so do it without locks.
 	// Use atomic to ensure we see any previous writes done by the thread
 	// that updates the itabTable field (with atomic.Storep in itabAdd).
+	//
+	// 原子加载，这是快速路径，因为在load之后全局变量itabTable可能已经被替换了。
+	// 又因为itab只会增加不会减少，所以下面如果能查找成功，就可以直接跳到finish了。
 	t := (*itabTableType)(atomic.Loadp(unsafe.Pointer(&itabTable)))
 	if m = t.find(inter, typ); m != nil {
 		goto finish
 	}
-
+	// 但如果找不到，便不能认为itabTable肯定不包含此itab。所以下面进行加锁操作。
 	// Not found.  Grab the lock and try again.
 	lock(&itabLock)
+	// 确保此时没有其它协程在向itableTable中添加itab。
 	if m = itabTable.find(inter, typ); m != nil {
 		unlock(&itabLock)
 		goto finish
 	}
 
 	// Entry doesn't exist yet. Make a new entry & add it.
+	// 为新的itab分配持久内存，因为itab.fn已经包含一个元素。所以只需为剩余方法数量-1分配内存。
 	m = (*itab)(persistentalloc(unsafe.Sizeof(itab{})+uintptr(len(inter.mhdr)-1)*goarch.PtrSize, 0, &memstats.other_sys))
 	m.inter = inter
 	m._type = typ
@@ -88,7 +109,10 @@ func getitab(inter *interfacetype, typ *_type, canfail bool) *itab {
 	// and thus the hash is irrelevant.
 	// Note: m.hash is _not_ the hash used for the runtime itabTable hash table.
 	m.hash = 0
+	// m.init根据inter和_type构建m.fn数组。
+	// 如果inter与_type不匹配，则m.fn[0]=0
 	m.init()
+	// itabAdd在有锁的情况下调用，因为其会向itable.entries中添加itab。
 	itabAdd(m)
 	unlock(&itabLock)
 finish:
@@ -145,6 +169,8 @@ func itabAdd(m *itab) {
 
 	t := itabTable
 	if t.count >= 3*(t.size/4) { // 75% load factor
+		// itabTable的entries容量的75%已经被使用，创建新的itabTable。
+		//
 		// Grow hash table.
 		// t2 = new(itabTableType) + some additional entries
 		// We lie and tell malloc we want pointer-free memory because
@@ -156,11 +182,15 @@ func itabAdd(m *itab) {
 		// Note: while copying, other threads may look for an itab and
 		// fail to find it. That's ok, they will then try to get the itab lock
 		// and as a consequence wait until this copying is complete.
+		//
+		// 将itableTable的entries中的元素复制到新的itableTable(t2)的etnries中去。
 		iterate_itabs(t2.add)
 		if t2.count != t.count {
 			throw("mismatched count during itab table copy")
 		}
 		// Publish new hash table. Use an atomic write: see comment in getitab.
+		//
+		// 新的itabTable就绪后可以执行原子替换了。
 		atomicstorep(unsafe.Pointer(&itabTable), unsafe.Pointer(t2))
 		// Adopt the new table as our own.
 		t = itabTable
@@ -170,11 +200,13 @@ func itabAdd(m *itab) {
 }
 
 // add 方法操作内部不会扩容存储空间，重新分配操作是在外层实现的，因此对于 find 方法而言
-// 已经插入的内容不会被修改，所以查找时不需要加锁。方法 add 操作需要再加锁的前提下进行，
+// 已经插入的内容不会被修改，所以查找时不需要加锁。方法 add 操作需要在加锁的前提下进行，
 // getitab 函数是通过调用 itabAdd 函数来完成添加缓存的， itabAdd 函数内部会按需对
-// 缓存进行扩容然后调用 add 方法。因为扩容需要重新分配 itabTableTYpe 结构，为了并发安全
+// 缓存进行扩容然后调用 add 方法。
+// 因为扩容需要重新分配 itabTableTYpe 结构，为了并发安全
 // 使用原子操作更新 itabTable 指针。加锁后立刻再次查询也是处于并发的考虑，避免其它协程已经
 // 将同样的itab添加至缓存了。
+//
 // add adds the given itab to itab table t.
 // itabLock must be held.
 func (t *itabTableType) add(m *itab) {
@@ -193,6 +225,8 @@ func (t *itabTableType) add(m *itab) {
 			return
 		}
 		if m2 == nil {
+			// m2未被占用。
+			//
 			// Use atomic write here so if a reader sees m, it also
 			// sees the correctly initialized fields of m.
 			// NoWB is ok because m is not in heap memory.
@@ -201,6 +235,7 @@ func (t *itabTableType) add(m *itab) {
 			t.count++
 			return
 		}
+		// m2被占用，重新计数m的hash值。
 		h += i
 		h &= mask
 	}

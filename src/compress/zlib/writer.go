@@ -61,6 +61,8 @@ func NewWriterLevel(w io.Writer, level int) (*Writer, error) {
 //
 // The dictionary may be nil. If not, its contents should not be modified until
 // the Writer is closed.
+//
+// 在这里dict不能像flate包中可以进行修改。必须完全一致。zlib压缩信息里存有dict的摘要信息。
 func NewWriterLevelDict(w io.Writer, level int, dict []byte) (*Writer, error) {
 	if level < HuffmanOnly || level > BestCompression {
 		return nil, fmt.Errorf("zlib: invalid compression level: %d", level)

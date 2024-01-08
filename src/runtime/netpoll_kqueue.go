@@ -56,6 +56,11 @@ func netpollIsPollDescriptor(fd uintptr) bool {
 	return fd == uintptr(kq) || fd == netpollBreakRd || fd == netpollBreakWr
 }
 
+// Adds the event to the	kqueue.	 Re-adding an existing event
+//		  will modify the parameters of	the original event, and	not
+//		  result in a duplicate	entry.	Adding an event	automatically
+//		  enables it, unless overridden	by the EV_DISABLE flag.
+//
 // 用来把fd和与之关联的 pollDesc 结构添加到 poller 实例中。
 func netpollopen(fd uintptr, pd *pollDesc) int32 {
 	// Arm both EVFILT_READ and EVFILT_WRITE in edge-triggered mode (EV_CLEAR)
@@ -79,7 +84,9 @@ func netpollopen(fd uintptr, pd *pollDesc) int32 {
 	}
 	return 0
 }
-
+// Removes the event from the kqueue.  Events which are at-
+// tached to file descriptors are automatically deleted on the
+// last close of	the descriptor.
 func netpollclose(fd uintptr) int32 {
 	// Don't need to unregister because calling close()
 	// on fd will remove any kevents that reference the descriptor.
@@ -117,12 +124,14 @@ func netpollBreak() {
 
 // netpoll checks for ready network connections.
 // Returns list of goroutines that become runnable.
+//
 // delay < 0: blocks indefinitely
 // delay == 0: does not block, just polls
 // delay > 0: block for up to that many nanoseconds
 //
-// 参数 delay，指定阻塞时间，为0表示不阻塞。
+// 参数 delay，指定阻塞时间，为0表示不阻塞。(最大值为1e6秒)。
 // 否则为poll阻塞的时间,不同平台有不同的最大值要求，超过的值会被纠正。
+//
 // gList 已经准备就绪的文件描述符列表所关联的 goroutine构成的列表。
 // 根据epoll 返回的IO事件标志位为mode赋值：r表示可读，w表示可写，r+w表示即可读又可写。
 // mode不为0，表示有IO事件，需要从ev.data字段得到与IO事件关联的 pollDesc ，
@@ -165,8 +174,9 @@ retry:
 		}
 		// If a timed sleep was interrupted, just return to
 		// recalculate how long we should sleep now.
+		//
 		// 如果设置了超时并遇到错误，
-		// 返回空列表调用者可以选择重新计算超时时间。
+		// 返回空列表调用者可以选择重新计算netpoll的超时时间。
 		if delay > 0 {
 			return gList{}
 		}
@@ -178,7 +188,6 @@ retry:
 		ev := &events[i]
 
 		if uintptr(ev.ident) == netpollBreakRd {
-			// 跳过netpollBreakRd
 			if ev.filter != _EVFILT_READ {
 				println("runtime: netpoll: break fd ready for", ev.filter)
 				throw("runtime: netpoll: break fd ready for something unexpected")
@@ -187,18 +196,22 @@ retry:
 				// netpollBreak could be picked up by a
 				// nonblocking poll. Only read the byte
 				// if blocking.
+				//
+				// netpollBreak 只对阻塞的netpoll有意义，前提唤醒它是为了让它能及时
+				// 处理到期的timer。
 				var tmp [16]byte
-				// 读取缓存里的数据以便下次可以阻塞，不会因为 netpollBreakRd
-				// 已经可读。
+				// 读取缓存里的数据以便下次的阻塞调用，不会因为 netpollBreakRd 
+				// 可读而提前返回。
 				read(int32(netpollBreakRd), noescape(unsafe.Pointer(&tmp[0])), int32(len(tmp)))
+				// 提示后续netpollBreak可以调用。
 				netpollWakeSig.Store(0)
 			}
 			continue
 		}
 
+		// mode用于记录事件类型。
 		var mode int32
-		// 如果有事件发生会在 ev.filter 中设置相应
-		// 的标志位。
+		// 如果有事件发生会在 ev.filter 中设置相应的标志位。
 		switch ev.filter {
 		case _EVFILT_READ:
 			mode += 'r'
@@ -219,8 +232,10 @@ retry:
 			mode += 'w'
 		}
 		if mode != 0 {
+			// ev.udata保存的是添加fd时绑定的用户数据
 			pd := (*pollDesc)(unsafe.Pointer(ev.udata))
 			pd.setEventErr(ev.flags == _EV_ERROR)
+			// 尝试唤醒与pd绑定的g(如果存在且对mode中的事件感兴趣)。
 			netpollready(&toRun, pd, mode)
 		}
 	}

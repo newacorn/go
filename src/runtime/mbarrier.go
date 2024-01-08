@@ -313,6 +313,9 @@ func reflect_typedslicecopy(elemType *_type, dst, src slice) int {
 //
 // TODO: A "go:nosplitrec" annotation would be perfect for this.
 //
+// 使用此函数必须满足:
+// ptr指向的内存需符合typ的描述。这样typ.prtdata才有意义。
+//
 //go:nosplit
 func typedmemclr(typ *_type, ptr unsafe.Pointer) {
 	if writeBarrier.needed && typ.ptrdata != 0 {

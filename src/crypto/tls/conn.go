@@ -1371,7 +1371,6 @@ func (c *Conn) Close() error {
 			alertErr = fmt.Errorf("tls: failed to send closeNotify alert (but connection was closed anyway): %w", err)
 		}
 	}
-
 	if err := c.conn.Close(); err != nil {
 		return err
 	}

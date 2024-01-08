@@ -256,9 +256,17 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	// 建临界区。
 	//
 	if !block && c.closed == 0 && full(c) {
+		//* c.closed 和 full(c) 判断都是 'single word-sized read'，所以可以保证读的数据完整。
+		//* 两个观察之间间隔时间极为短暂(即中间可能会发生通道关闭或者未满)，极小可能出现伪阳。
+		//* 目标就是非阻塞操作(如果上锁可能会阻塞)且这种伪阳（即使出现）没有什么危害。
 		return false
 	}
 
+	// 至此存在两种情况(都需要上锁)：
+	// 1. 阻塞操作需要确定结果。
+	// 2. 非阻塞操作上面的快速路径检测失败。
+
+	// t0 性能分析所用。
 	var t0 int64
 	if blockprofilerate > 0 {
 		t0 = cputicks()
@@ -273,25 +281,29 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 		panic(plainError("send on closed channel"))
 	}
 
-	// 如果 recvq 不为空，隐含了缓冲区为空，就从中取出第一个排队的协程，将数据
-	// 传递给这个协程，并将该协程置为ready状态（放入run quque，进而得到调度），
-	// 然后解锁，返回值为true。
+	// 至此通道在解锁前肯定不会被关闭。
+	// 1. 如果recvq不为空，隐含了缓冲区为空
 	if sg := c.recvq.dequeue(); sg != nil {
+		// 从接收队列中取出位于队首的sudog，设置sudog.elem=ep(待发送数据的指针)。
+		// 将协程sudog.g放入待运行队列(getg().m.p.next)。
+		// 解锁，返回值为true。
 		// Found a waiting receiver. We pass the value we want to send
 		// directly to the receiver, bypassing the channel buffer (if any).
 		send(c, sg, ep, func() { unlock(&c.lock) }, 3)
 		return true
 	}
 
+	// 2. 接收者队列为空
 	if c.qcount < c.dataqsiz {
-		// 接收等待队列肯定为空。
+		// 2.1 数据队列未满。
 		//
 		// 缓冲区有剩余空间，在这里无缓冲通道被视为没有剩余空间。
 		// 就将数据最佳到缓冲区中，相应地移动sendx，增加qcount
 		// 然后解锁，返回值为true。
 		//
 		// Space is available in the channel buffer. Enqueue the element to send.
-		// qp是buf中c.sendx 下标元素的地址
+		//
+		// qp是buf中以c.sendx为下标的元素的地址
 		qp := chanbuf(c, c.sendx)
 		if raceenabled {
 			racenotify(c, c.sendx, nil)
@@ -310,16 +322,18 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 		return true
 	}
 
-	// 到这里表明通道已满，如果block为false，即不想阻塞，则解锁
-	// 返回值为false。
+	// 2.2 数据队列已满。
+	// 如果block为false，即不想阻塞，则解锁返回值为false。
 	if !block {
 		unlock(&c.lock)
 		return false
 	}
-	// 至此通道已满, 等待队列为空, block 为true。
+	// 至此通道已满,等待队列为空,block为true。
+	// 下面进行阻塞操作。
 	//
 	// Block on the channel. Some receiver will complete our operation for us.
 	gp := getg()
+	// 为当前g分配sudog，作为当前g的代表进入通道的发送者队列。
 	mysg := acquireSudog()
 	mysg.releasetime = 0
 	if t0 != 0 {
@@ -327,6 +341,7 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	}
 	// No stack splits between assigning elem and enqueuing mysg
 	// on gp.waiting where copystack can find it.
+	//
 	// elem的值是源数据的地址
 	mysg.elem = ep
 	mysg.waitlink = nil
@@ -342,17 +357,32 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	// The window between when this G's status
 	// changes and when we set gp.activeStackChans is not safe for
 	// stack shrinking.
+	//
+	// 因为栈收缩是被动的(协程在被GC栈扫描时进行，而进入这种状态可能是因为被抢占)，
+	// 在进行收缩栈时不能确定协程的状态，需要考虑此协程有没有关联的sudog进入通道等待队列，
+	// 在修改关联sudog.elem时，需要判断是否对sudog所在通道进行上锁。
+	// 如果本该上锁的却未上锁而此时此协程已经停靠完成，其它协程可能会操作这个sudog，这就会产生竞态。
+	//
+	// 解决办法是通过一个标志的值来判断该不该在修改sudog.elm之前获取通道锁。目前通过gp.activeStackChans
+	// 如果为true就获取锁。同时gp.parkingOnChan保证这个状态的值是同步的。
+	//
+	// 其实在进行栈收缩时，可以对每个sudog都上锁但是那样效率太低。
+	// 栈增长是主动进行的所以不用也不会出现需要上锁的情况(存在排队的sudog要么关联协程还没停靠（持有锁），要么已经停靠（停靠了
+	// 可能进行栈增长）。
 	gp.parkingOnChan.Store(true)
 
 	// gopark() 函数挂起协程后调用 chanparkcommit() 函数对通道进行解锁，等到
 	// 有接收者接收数据后，阻塞的协程会被唤醒。
-
 	gopark(chanparkcommit, unsafe.Pointer(&c.lock), waitReasonChanSend, traceEvGoBlockSend, 2)
 
 	// Ensure the value being sent is kept alive until the
 	// receiver copies it out. The sudog has a pointer to the
 	// stack object, but sudogs aren't considered as roots of the
 	// stack tracer.
+	//
+	// 下面的KeepAlive是需要，如果在上面停靠时发生了GC栈扫描，且*ep->achan，
+	// 之后没有再使用*ep。GC变对*ep进行扫描，如果其是指针持有者类型，其指向的
+	// 内存可能会在恢复运行(被复制)之前被回收掉。
 	KeepAlive(ep)
 
 	// someone woke us up.
@@ -361,6 +391,7 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	}
 	gp.waiting = nil
 	gp.activeStackChans = false
+	// 如果mysg.success=false，说明gp被唤醒是因为mysg.c关闭操作引起的。
 	closed := !mysg.success
 	gp.param = nil
 	if mysg.releasetime > 0 {
@@ -369,6 +400,7 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	mysg.c = nil
 	releaseSudog(mysg)
 	if closed {
+		// c.closed应该等于1。
 		if c.closed == 0 {
 			throw("chansend: spurious wakeup")
 		}
@@ -462,6 +494,15 @@ func sendDirect(t *_type, sg *sudog, src unsafe.Pointer) {
 	// be updated if the destination's stack gets copied (shrunk).
 	// So make sure that no preemption points can happen between read & use.
 	dst := sg.elem
+	// 如果v是指针持有者类型。
+	//
+	// 通道接收操作 v:=chanA，在编译时v的值并不是通过这个赋值语句进行的。
+	// 而是由发送者通过下面的memmove赋值。如果src指向的是一个堆上的
+	// 变量然后通过memmove赋值到dst。GC是观察不到这个操作的，如果之后src
+	// 不再使用且其是唯一引用，那么GC会误以为src所指的指针所指的内存可以安全回收
+	// 。造成dst之后的错误访问。
+	//
+	// 所以这里需要将dst和src所指向的指针(v的旧值和新值)加入到扫描队列(灰色队列)。
 	typeBitsBulkBarrier(t, uintptr(dst), uintptr(src), t.size)
 	// No need for cgo write barrier checks because dst is always
 	// Go memory.
@@ -623,8 +664,8 @@ func chanrecv2(c *hchan, elem unsafe.Pointer) (received bool) {
 //
 // selected   recvived
 // ---selected true 表示操作操作完成（可能因为通道关闭）-----
-//  true       fasle     通道关闭返回零值 block 可能为true或者false
-//  true       true      从通道中接收到数据且不是零值（通道可能已经关闭或者未关闭） block可以为true或者false
+//  true       fasle     通道关闭返回零值block可能为true或者false
+//  true       true      从通道中接收到数据且不是零值（通道可能已经关闭或者未关闭）block可以为true或者false
 // ---selected false 表示目前不能立即完成recv，但因为不想阻塞(block为false)而返回---
 //  false      false     通道未关闭，非阻塞返回。 block为true。
 //  false      true      不会出现这种情况。因为selected为false表示操作不能立即完成，所以recived肯定为false
@@ -652,7 +693,7 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 	//
 	// 本步判断是在不加锁的情况下进行的，目的是让非阻塞recv在无法立即完成时能真正不阻塞
 	// 加锁可能会阻塞。
-	// empty(c) 为 single word read，所以可以保证完整性。见 chansend 函数。
+	// empty(c) 为 single word read，所以可以保证读完整性(8字节读取)。见 chansend 函数。
 	if !block && empty(c) {
 		// 通道是空的（1. 无缓冲且sendq为空，2. 通道有缓存且缓存区为空，sendq为空）
 		//
@@ -664,14 +705,6 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 		// For example, if the channel was open and not empty, was closed, and then drained,
 		// reordered reads could incorrectly indicate "open and empty".
 		//
-		// 但同样在 empty 到下面的close之间也可能存在新到来的数据使empty为false。
-		//
-		// 不过有一点不同我们从closed状态的channel接收数据不必上锁，因为closed状
-		// 态的channel不会再打开，也不会再添加数据。一旦判定empy和closed可以直接
-		// 返回零值。
-		//
-		// 也就是我们可以错过队列伪空但不应该错误通道已经关闭，对于非阻塞recv来讲。
-		// 因为只能选择其一。
 		//
 		// To prevent reordering,
 		// we use atomic loads for both checks, and rely on emptying and closing to happen in
@@ -681,6 +714,8 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 		// an unbuffered channel with a blocked send, but that is an error condition anyway.
 		//
 		// 判定通道是否关闭
+		// 在empty到下面的closed之间也可能存在新到来的数据使empty为false，
+		// 也就是我们可能会错过队列伪空(概率很小)。
 		if atomic.Load(&c.closed) == 0 {
 			// 如果未关闭，则直接返回两个false，因为不想阻塞而返回。
 			//
@@ -693,16 +728,18 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 		// The channel is irreversibly closed. Re-check whether the channel has any pending data
 		// to receive, which could have arrived between the empty and closed checks above.
 		// Sequential consistency is also required here, when racing with such a send.
+		// 至此通道肯定是关闭状态，因为关闭的通道不可能在打开。
 		// 在上面的 empty(c) 到 close 直接可能有新数据的到达。
 		if empty(c) {
 			// 至此：通道数据队列肯定为空且通道已经关闭。
+			// 只有这样才能不用上锁接收零值数据。
 			//
 			// The channel is irreversibly closed and empty.
 			if raceenabled {
 				raceacquire(c.raceaddr())
 			}
-			// 已经关闭，就先把ep清空，然后返回true和false
-			// 表名因通道关闭而得到零值。
+			// 因为接收的是零值，直接把ep清空，然后返回true和false
+			// received为false表明因通道关闭而得到的零值。
 			if ep != nil {
 				typedmemclr(c.elemtype, ep)
 			}
@@ -710,7 +747,8 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 		}
 	}
 
-	// 至此：大概率为：通道未关闭，通道不为空，因为前面的操作并未在锁的保护下进行的。
+	// 因为前面的操作并未在锁的保护下进行的。
+	// 至此通道状态不确定。
 	var t0 int64
 	if blockprofilerate > 0 {
 		t0 = cputicks()
@@ -729,7 +767,7 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 			// 至此通道肯定没有数据且已经关闭，因为关闭的通道不会再填充数据，关闭的通道不能
 			// 再打开。
 			//
-			// 可以解锁了，下面的操作不需要锁保护。
+			// 可以解锁了，因为接收零值不存在竞争。
 			unlock(&c.lock)
 			if ep != nil {
 				// 给ep赋零值，保存接收数据的变量的地址为ep。
@@ -739,27 +777,29 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 		}
 		// The channel has been closed, but the channel's buffer have data.
 	} else {
-		// 至此：通道肯定未关闭。
+		// 至此：通道肯定未关闭。sendq和数据队列状态不确定。
+		//
 		// 如果sendq不为空，就从中取出第一个排队的协程sg
 		// Just found waiting sender with not closed.
 		if sg := c.sendq.dequeue(); sg != nil {
-			// 至此：通道未关闭、缓存区满或没有缓冲区。
+			// 至此：通道未关闭、数据队列满的或没有缓冲区。
 			//
-			// ep的赋值要根据通道是否有缓冲，如果有这从缓冲中复制，并将sg的数据追加到
-			// 缓冲。如果没有缓冲，就直接从sg那里复制。
+			// ep的赋值要根据c是否为缓存通道，如果是则从缓冲中复制，并将sg的待发送数据复制到
+			// 数据队列。如果没有缓冲，就直接从sg那里复制。
 			//
 			// Found a waiting sender. If buffer is size 0, receive value
 			// directly from sender. Otherwise, receive from head of queue
 			// and add sender's value to the tail of the queue (both map to
 			// the same buffer slot because the queue is full).
+			//
+			// 如果有缓存，则还需要
+			// 滚动缓冲区，完成数据的读取，并将协程sg置为ready状态（放入run queue,
+			// 进而得到调度），然后解锁。这些工作都由recv()函数完成。
 			recv(c, sg, ep, func() { unlock(&c.lock) }, 3)
 			return true, true
 		}
 	}
 
-	// 如果有缓存，则还需要
-	// 滚动缓冲区，完成数据的读取，并将协程sg置为ready状态（放入run queue,
-	// 进而得到调度），然后解锁。这些工作都由recv()函数完成。o
 
 	// 至此: 会有一下三种情况之一：
 	// 1. 通道关闭，缓冲区有数据，发送队列为空。
@@ -807,7 +847,7 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 
 	// no sender available: block on this channel.
 	// 至此：
-	//    1. 通道未关闭，缓冲区没有数据(大概率，以外已经解锁了)，发送队列为空(大概率，因为已经解锁了)。
+	//    1. 通道未关闭，缓冲区没有数据。
 	//    2. 参数block 为true。
 	gp := getg()
 	mysg := acquireSudog()
@@ -839,7 +879,7 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 	//
 	gp.parkingOnChan.Store(true)
 	//
-	// gopark() 函数会在挂起当前协程后调用 chanparkcommit() 函数解锁，等到后续
+	// gopark() 函数会在挂起当前协程后调用chanparkcommit()函数解锁，等到后续
 	// recv操作完成时协程会被唤醒。
 	//
 	// 通道未关闭，缓冲区没有数据，发送队列为空。

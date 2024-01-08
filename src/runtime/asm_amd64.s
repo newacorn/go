@@ -775,7 +775,7 @@ TEXT NAME(SB), WRAPPER, $MAXSIZE-48;		\
 	NO_LOCAL_POINTERS;			\
 	/* copy arguments to stack */		\
 	MOVQ	stackArgs+16(FP), SI;		\
-	MOVLQZX stackArgsSize+24(FP), CX;		\
+	MOVLQZX stackArgsSize+24(FP), CX;		\ // 参数+返回值大小占用4个字节
 	MOVQ	SP, DI;				\
 	REP;MOVSB;				\
 	/* set up argument registers */		\
@@ -790,14 +790,14 @@ TEXT NAME(SB), WRAPPER, $MAXSIZE-48;		\
 	MOVQ    regArgs+40(FP), R12;		\
 	CALL    ·spillArgs(SB);		\
 	MOVLQZX	stackArgsSize+24(FP), CX;		\
-	MOVLQZX	stackRetOffset+28(FP), BX;		\
+	MOVLQZX	stackRetOffset+28(FP), BX;		\ // 返回值大小占用4个字节
 	MOVQ	stackArgs+16(FP), DI;		\
 	MOVQ	stackArgsType+0(FP), DX;		\
 	MOVQ	SP, SI;				\
-	ADDQ	BX, DI;				\
-	ADDQ	BX, SI;				\
-	SUBQ	BX, CX;				\
-	CALL	callRet<>(SB);			\
+	ADDQ	BX, DI;				\ // (DX) 函数的返回值起始地址，返回值已经由(DX)调用填充了。
+	ADDQ	BX, SI;				\ // (DX) 函数的返回值要复制到的起始地址。
+	SUBQ	BX, CX;				\ // (DX) 函数的返回值复制到的起始地址时要复制的内存大小。
+	CALL	callRet<>(SB);			\ // 由此函数进行返回值复制。
 	RET
 
 // callRet copies return values back at the end of call*. This is a

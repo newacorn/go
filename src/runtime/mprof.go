@@ -199,15 +199,20 @@ func (c *mProfCycleHolder) increment() {
 	// We explicitly wrap mProfCycle rather than depending on
 	// uint wraparound because the memRecord.future ring does not
 	// itself wrap at a power of two.
+	n:=uint32(0)
+	m:=uint32(0)
 	for {
 		prev := c.value.Load()
 		cycle := prev >> 1
+		n=cycle
 		cycle = (cycle + 1) % mProfCycleWrap
+		m=cycle
 		next := cycle << 1
 		if c.value.CompareAndSwap(prev, next) {
 			break
 		}
 	}
+	println("m:",m,"n:",n,"cycle:",c.value.Load()>>1)
 }
 
 // newBucket allocates a bucket with the given type and number of stack entries.

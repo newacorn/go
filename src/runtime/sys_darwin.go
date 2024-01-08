@@ -469,6 +469,7 @@ func kqueue_trampoline()
 //
 // ev设置为nil，nev设置为0，可以向kq中添加事件。
 // ch随着为nil，nch设置为0，可以进行轮询获取就绪事件。
+//
 //go:cgo_unsafe_args
 func kevent(kq int32, ch *keventt, nch int32, ev *keventt, nev int32, ts *timespec) int32 {
 	ret := libcCall(unsafe.Pointer(abi.FuncPCABI0(kevent_trampoline)), unsafe.Pointer(&kq))

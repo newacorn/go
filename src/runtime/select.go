@@ -132,8 +132,11 @@ func block() {
 // cas0: 指向一个数组的起始位置，数组里装的是 select 中所有的case分支，被按照 send在前recv在后
 //       的顺序。元素类型为 scase。
 // order0: 指向一个大小等于case分支数量两倍的 uint16 数组，实际上是作为两个大小相等的数组来
-// 		   用的。前一个用来对所有case中channel的轮询操作进行乱序，后一个用来对所有case中channel的
-//         加锁操作进行排序。数组元素是在 cas0 指向数组的索引值。
+// 		   用的。调用时只是分配了内存。
+// 		   前一个用来对所有case中channel的轮询操作进行乱序，
+// 		   后一个用来对所有case中channel的加锁操作进行排序。
+// 		   数组元素是在cas0指向数组的索引值。
+//
 //         轮询需要是乱序的，避免每次select都按照case的顺序响应，对后面的case不公平，而加锁顺序则需要
 //         按固定算法排序，按顺序加锁才能避免死锁。
 // pc0: 和 race 检测相关
@@ -482,14 +485,14 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 	}
 
 	if casi < nsends {
-		// 唤醒协程的case操作为通道写操作
+		// 唤醒协程的case操作为通道发送操作。
 		if !caseSuccess {
 			// 因通道关闭而让改通道写操作唤醒完成。
 			// 跳到 sclose，先解所有关联通道的锁，再触发panic。
 			goto sclose
 		}
 	} else {
-		// 唤醒协程的case操作为通道接收操作
+		// 唤醒协程的case操作为通道接收操作。
 		// recvOk，表示接收到的是否因为通道关闭而赋值的零值。
 		recvOK = caseSuccess
 	}

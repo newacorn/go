@@ -36,8 +36,9 @@ type mcache struct {
 	// 分配 nextSample 这么多内存后，就会触发一次堆采样。
 	nextSample uintptr // trigger heap sample after allocating this many bytes
 	//
-	// scanAlloc 记录的是从 mcache 总共分配了多少字节 scannable 类型的内存。
-	// 其所属的obj是从是noscan 位为0，可以包含指针的 span中分配的。但是并不是将整个obj大小算作 scanable 类型的字节，
+	// scanAlloc 记录的是 mallocgc 调用从 mcache 总共分配了多少字节 scannable 类型的内存。
+	//
+	// 其所属的obj是从是noscan位为0，可以包含指针的 span中分配的。但是并不是将整个obj大小算作 scanable 类型的字节，
 	// 而是这个obj分配给某个 _type 时， _type.ptrdata 的大小。
 	//
 	//  refill 函数返回之前，此字段会重置为0：
@@ -57,6 +58,7 @@ type mcache struct {
 	//
 	// tinyAllocs is the number of tiny allocations performed
 	// by the P that owns this mcache.
+	//
 	// tiny和tinyoffset 用来实现针对 noscan 型小对象的 tiny allocator，
 	// tiny 指向一个16字节大小的内存单元
 	tiny uintptr
@@ -91,8 +93,12 @@ type mcache struct {
 	// in this mcache are stale and need to the flushed so they
 	// can be swept. This is done in acquirep.
 	//
-	// 记录的是上次执行 flush 时的 sweepgen ,如果不等于当前的 sweepgen
-	// 就说明需要再次 flush 以进行清扫。
+	// 在 prepareForSweep 函数中进行设置，在开始GC清扫之后到使用此mcache分配
+	// 内存之前。会将其中缓存的mspan都冲刷的 mcentral 中以便清扫。以保证从其分
+	// 配的内存所属的mspan都是清扫过的。
+	//
+	// 记录的是上次执行 flush 时的 mheap.sweepgen。
+	// 不包含未清扫mcache的标识就是 mcache.flushGen = mheap.sweepgen。
 	flushGen atomic.Uint32
 }
 
@@ -215,7 +221,16 @@ func (c *mcache) refill(spc spanClass) {
 	}
 
 	if s != &emptymspan {
+		// 至此s已经没有空闲对象了。
+		// 如果s不是emptymspan，需要回收并更新一些统计信息。
+		//
 		// Mark this span as no longer cached.
+		//
+		// 在p.cache中的mspan与mheap_.sweepgen关系:
+		// s.sweepgen = mheap_.sweepgen+3
+		// s.sweepgen = mheap_.sweepgen+1(这样的msapn不会用于分配内存。这个状态的mspan持续时间很短暂
+		// 标记终止阶段mheap_.swwpgen递增2，导致了这种msapn的出现，但紧接着所有p中的缓存的msapn都释放了)
+		// 见 prepareForSweep 方法。
 		if s.sweepgen != mheap_.sweepgen+3 {
 			throw("bad sweepgen in refill")
 		}
@@ -316,6 +331,7 @@ func (c *mcache) allocLarge(size uintptr, noscan bool) *mspan {
 	}
 	npages := size >> _PageShift
 	if size&_PageMask != 0 {
+		// 向上对齐到pageSize的整数倍
 		npages++
 	}
 
@@ -351,6 +367,7 @@ func (c *mcache) allocLarge(size uintptr, noscan bool) *mspan {
 }
 
 func (c *mcache) releaseAll() {
+
 	// Take this opportunity to flush scanAlloc.
 	scanAlloc := int64(c.scanAlloc)
 	c.scanAlloc = 0
@@ -372,9 +389,18 @@ func (c *mcache) releaseAll() {
 			// We assumed earlier that the full span gets allocated.
 			gcController.totalAlloc.Add(slotsUsed * int64(s.elemsize))
 
+			// 标记终止结束止结束之后所有有的p中的mcache都会在再次使用之前调用此函数，它们的sweepgen肯定等于
+			// sg+1。因为sg刚刚递增2。
 			if s.sweepgen != sg+1 {
+				// 这个只能在_GCoff阶段，p被销毁时才会到这里。
+				//
 				// refill conservatively counted unallocated slots in gcController.heapLive.
 				// Undo this.
+				//
+				// 因为保守的将所有缓存到p.macache的mspan中未使用的对象大小
+				// 都增加到gcController.heapLive的计数。
+				//
+				// 当销毁p时应该取消在销毁时还未被使用的对象所贡献的值。
 				//
 				// If this span was cached before sweep, then gcController.heapLive was totally
 				// recomputed since caching this span, so we don't do this for stale spans.
@@ -396,6 +422,7 @@ func (c *mcache) releaseAll() {
 	c.tinyAllocs = 0
 	memstats.heapStats.release()
 
+	// println("releaseAll",dHeapLive)
 	// Update heapLive and heapScan.
 	gcController.update(dHeapLive, scanAlloc)
 }
@@ -403,7 +430,19 @@ func (c *mcache) releaseAll() {
 // prepareForSweep flushes c if the system has entered a new sweep phase
 // since c was populated. This must happen between the sweep phase
 // starting and the first allocation from c.
+//
+// 调用：
+// 1. gcMarkTermination中，mheap.sweepgen +=2/startTheWorld之后，释放gc保护标志之前，对每个P都进行。
+// 2. acquirep 对目标P进行。
+// 3. procresize 对当期P进行。
+//
+// 此函数确保在清扫开始之后到P被用户分配内存之前，将 p.mcache 中所有缓存的 mspan 冲刷到 mcentral 中，以便对它们进行清扫。
+// 之后使用p进行分配内存时会从mcentral中申请已经被清扫过的mspan。
+// 标记结束之后，缓存的mspan不能再使用了，因为在GC阶段它们可能被标记过了，需要执行清扫操作。
+//
+// 不包含未清扫mcache的标识就是 mcache.flushGen = mheap.sweepgen。
 func (c *mcache) prepareForSweep() {
+	// println("prepareForSweep.")
 	// Alternatively, instead of making sure we do this on every P
 	// between starting the world and allocating on that P, we
 	// could leave allocate-black on, allow allocation to continue

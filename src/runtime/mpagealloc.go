@@ -108,6 +108,8 @@ const (
 // It's a function (rather than a variable) because it needs to be
 // usable before package runtime's dynamic initialization is complete.
 // See #51913 for details.
+//
+// 0x00007FFFFFFFFFFF
 func maxSearchAddr() offAddr { return maxOffAddr }
 
 // Global chunk index.
@@ -115,6 +117,8 @@ func maxSearchAddr() offAddr { return maxOffAddr }
 // Represents an index into the leaf level of the radix tree.
 // Similar to arenaIndex, except instead of arenas, it divides the address
 // space into chunks.
+//
+// 分解成两级然后，用于索引 pageAlloc.chunks 中的值。
 type chunkIdx uint
 
 // chunkIndex returns the global index of the palloc chunk containing the
@@ -123,11 +127,17 @@ type chunkIdx uint
 // 根据地址p，返回其所属的chunk的编号从0开始。
 func chunkIndex(p uintptr) chunkIdx {
 	// pallocChunkBytes 0x400000 2^22 4MB
+	// arenaBaseOffset=0xFFFF800000000000
+	// 返回地址p所在的chunk在所有chunk中的偏移量。
+	//
+	// p-arenaBaseOffset是个负值/4M(一个chunk可以表示的地址空间)
+	// chunkIdx会将此负值转换为正数，而p的最大值为0x00007FFFFFFFFFFF-1。
+	// unint(maxOffAddr) - arenaBaseOffset = 281474976710655 = 0x0000FFFFFFFFFFFF
 	return chunkIdx((p - arenaBaseOffset) / pallocChunkBytes)
 }
 
 // chunkBase returns the base address of the palloc chunk at index ci.
-// 这个chunk的起始地址。
+// 这个chunk的起始地址。真实虚拟地址 var a = 100 println(&a)
 func chunkBase(ci chunkIdx) uintptr {
 	return uintptr(ci)*pallocChunkBytes + arenaBaseOffset
 }
@@ -186,6 +196,9 @@ func addrsToSummaryRange(level int, base, limit uintptr) (lo int, hi int) {
 	// of a summary's max page count boundary for this level
 	// (1 << levelLogPages[level]). So, make limit an inclusive upper bound
 	// then shift, then add 1, so we get an exclusive upper bound at the end.
+	//
+	// [base,limit)此地址区间在level级别的元数据分布在从lo entry到hi entry中，
+	// 不包括hi entry。
 	lo = int((base - arenaBaseOffset) >> levelShift[level])
 	hi = int(((limit-1)-arenaBaseOffset)>>levelShift[level]) + 1
 	return
@@ -195,7 +208,22 @@ func addrsToSummaryRange(level int, base, limit uintptr) (lo int, hi int) {
 // level's block width (1 << levelBits[level]). It assumes lo is inclusive
 // and hi is exclusive, and so aligns them down and up respectively.
 func blockAlignSummaryRange(level int, lo, hi int) (int, int) {
+	/**
+	level 8240 8241
+	level 65920 65921
+	level 527360 527361
+	level 4218880 4218881
+	level 33751040 33751041
+	*/
 	e := uintptr(1) << levelBits[level]
+	// println("after align",int(alignDown(uintptr(lo), e)), int(alignUp(uintptr(hi), e)))
+	/**
+	after align 0 16384
+	after align 65920 65928
+	after align 527360 527368
+	after align 4218880 4218888
+	after align 33751040 33751048
+	*/
 	return int(alignDown(uintptr(lo), e)), int(alignUp(uintptr(hi), e))
 }
 
@@ -221,6 +249,24 @@ type pageAlloc struct {
 	//
 	// We may still get segmentation faults < len since some of that
 	// memory may not be committed yet.
+	//
+	// b(ytes) = 2^14*8,2^17*8,2^20*8,2^23*8,2^26*8
+	// cap([]pollocSum) = 2^14,2^17,2^20,2^23,2^26
+	// b表示每个层级用于存储元数据所需的字节数。
+	// 比如最后一层，每个entry可以表4MB但amd64平台下共有2^48字节的地址空间，所以需要2^48/4M=2^26个entry，
+	// 每个entry需要一个pallocSum类型的值用于保存页使用情况的元数据。
+	// 所以最后一层需要2^26个pallocSum来保存这一层级所有entry的元数据。
+	//
+	// cap(sumary[0])=2^14 //用第一层级中的entry来表示整个地址空间页使用情况，需要2^14个pallocSum。
+	// cap(sumary[1])=2^17 //用第二层级中的entry来表示整个地址空间页使用情况，需要2^17个pallocSum。
+	// cap(sumary[1])=2^20 //用第三层级中的entry来表示整个地址空间页使用情况，空间需要2^20个pallocSum。
+	// cap(sumary[1])=2^23 //用第四层级中的entry来表示整个地址空间页使用情况，空间需要2^23个pallocSum。
+	// cap(sumary[1])=2^26 //用第五层级中的entry来表示整个地址空间页使用情况，空间需要2^26个pallocSum。
+	// 这些元数据所需的地址空间已经在 pageAlloc.init 中通过调用 sysReserve 函数进行了保留。
+	// summaryLeves=5
+	// pageAlloc.update 函数中更新，每当页的使用情况改变(新增、分配、释放)对应的512位图发生变更
+	// 就会更新页所表示的地址区间在sum各层级对应的entry中统计信息。
+	// 改变的页数会向上对齐到一个chunk(512个页)。因为这是最后一层entry对应的单位。
 	summary [summaryLevels][]pallocSum
 
 	// chunks is a slice of bitmap chunks.
@@ -235,7 +281,7 @@ type pageAlloc struct {
 	//
 	// Below is a table describing the configuration for chunks for various
 	// heapAddrBits supported by the runtime.
-	//
+	// 一个chunk可以表示4M(2^22)地址空间，48位平台需要2^26次方个chunk。
 	// heapAddrBits | L1 Bits | L2 Bits | L2 Entry Size
 	// ------------------------------------------------
 	// 32           | 0       | 10      | 128 KiB
@@ -258,6 +304,14 @@ type pageAlloc struct {
 	// TODO(mknyszek): Consider changing the definition of the bitmap
 	// such that 1 means free and 0 means in-use so that summaries and
 	// the bitmaps align better on zero-values.
+	//
+	// chunks[13][13]pallocData
+	// pallocData 的大小是128字节,1024个位，其中前512表示一个chunk分配情况，后512位表示scanveged情况。
+	// 一个chunk可以表示4MB的地址空间，需要2^48-2^22=2^26个chunk。
+	// l2的大小为2^13*2^7(128kb，2个512位)=1MB。
+	// 用两级悉数数组来索引2^26个chunk。
+	//
+	// 所有的chunk从低地址到高地址排序，索引0的chunk对应的地址空间中的地址值比索引1的低。
 	chunks [1 << pallocChunksL1Bits]*[1 << pallocChunksL2Bits]pallocData
 
 	// The address to start an allocation search with. It must never
@@ -268,12 +322,34 @@ type pageAlloc struct {
 	//
 	// We guarantee that all valid heap addresses below this value
 	// are allocated and not worth searching.
+	//
+	// 初始值 maxSearchAddr()=0x00007FFFFFFFFFFF
+	// 页分配指示器，比这个地址小的地址都已经被分配了，不必再搜索了。
+	// 从这个地址开始搜索。
+	//
+	// p.searchAddr.addr()如果大于end，表示所有的inUse都已经用完了。
+	//
+	// searchAddr肯定是一个整页的其实地址。
+	// 
+	// 如果需分配的npages恰巧是从searchAddr开始分配的，就会出现需要更新的情况。
+	// 00111000 分配位图部分，若searchIdx对应的是第一个0，如果需要3页。那么p.searchAddr
+	// 便不需要更新，如果需要2页变化更新。相应的3个0连续位或者两个0连续位都会会被置为1。
+	//
+	// searchAddr is not allowed to point into unmapped heap memory
+	// unless it is maxSearchAddr
 	searchAddr offAddr
 
 	// start and end represent the chunk indices
 	// which pageAlloc knows about. It assumes
 	// chunks in the range [start, end) are
 	// currently ready to use.
+	//
+	// 对应 [pageAlloc.chunks[start], pageAlloc.chunks[end])。
+	// 不包括 pageAlloc.chunks[end] 这个chunk。
+	// start 是 inUse 中第一个addrRange.limit所在的chunkIdx。
+	// end 是 inUse 中最后一个addrRange.limit所在的chunkIdx。
+	//
+	// p.searchAddr.addr()如果大于end，表示所有的inUse都已经用完了。
 	start, end chunkIdx
 
 	// inUse is a slice of ranges of address space which are
@@ -287,17 +363,27 @@ type pageAlloc struct {
 	// 1 element.
 	//
 	// All access is protected by the mheapLock.
+	//
+	// 已经分配的地址区间(可供使用)的地址信息。
+	// start end 记录了这些地址区间跨越的chunks的首尾索引(并没有包含end对应的chunk)
 	inUse addrRanges
 
 	// scav stores the scavenger state.
 	scav struct {
 		// index is an efficient index of chunks that have pages available to
 		// scavenge.
+		//
+		// 用于维护chunk的清扫状态。
 		index scavengeIndex
 
 		// released is the amount of memory released this scavenge cycle.
 		//
 		// Updated atomically.
+		//
+		// 如果没有开启 debug.scavtrace，则此值会一直累加。
+		// 在bgscavenge函数中累加。所以只是统计了后台scavenge工作者回收的字节数。
+		//
+		// 开启debug.scavtrace，则会在每次打印scavenge统计信息之后清空。
 		released uintptr
 	}
 
@@ -307,6 +393,10 @@ type pageAlloc struct {
 
 	// sysStat is the runtime memstat to update when new system
 	// memory is committed by the pageAlloc for allocation metadata.
+	//
+	// 类型 memstats.gcMiscSys
+	// chunks
+	// 统计页分配时，一些记录这些页的元数据结构所占的内存。
 	sysStat *sysMemStat
 
 	// summaryMappedReady is the number of bytes mapped in the Ready state
@@ -320,6 +410,7 @@ type pageAlloc struct {
 }
 
 func (p *pageAlloc) init(mheapLock *mutex, sysStat *sysMemStat) {
+	// 21>21 false
 	if levelLogPages[0] > logMaxPackedValue {
 		// We can't represent 1<<levelLogPages[0] pages, the maximum number
 		// of pages we need to represent at the root level, in a summary, which
@@ -328,6 +419,7 @@ func (p *pageAlloc) init(mheapLock *mutex, sysStat *sysMemStat) {
 		print("runtime: summary max pages = ", maxPackedValue, "\n")
 		throw("root level max pages doesn't fit in summary")
 	}
+	// memstats.gcMiscSys
 	p.sysStat = sysStat
 
 	// Initialize p.inUse.
@@ -364,6 +456,20 @@ func (p *pageAlloc) chunkOf(ci chunkIdx) *pallocData {
 // grow sets up the metadata for the address range [base, base+size).
 // It may allocate metadata, in which case *p.sysStat will be updated.
 //
+// 目前只被 mheap.grow 方法所调用。
+// 在此函数调用之前：[base,base+size)这段地址空间已经被 sysMap (prepared状态)。
+//
+// 这里执行的任务是:
+// 1. 为这段地址空间对应的元数据信息的结构分配内存。
+//    1.1
+// 2. 更新对应的元数据信息。
+//    2.1 pageAlloc.chunks 中的512分配位图置0和512scav位图置1。
+//    2.2 pageAlloc.summary 中的此区间在各层对应的sum信息。
+//    2.3 searchAddr 按条件更新此字段。
+//    2.4 start end 按条件更新这两个字段。
+//    2.5 inUse base，size表示的地址区间添加到p.inUse中的适当位置处。
+//
+// size肯定是4M的倍数。
 // p.mheapLock must be held.
 func (p *pageAlloc) grow(base, size uintptr) {
 	assertLockHeld(p.mheapLock)
@@ -375,13 +481,24 @@ func (p *pageAlloc) grow(base, size uintptr) {
 
 	// Grow the summary levels in a system-dependent manner.
 	// We just update a bunch of additional metadata here.
+	//
+	// 根据base，limit计算出它们表示的地址区间在pageAlloc.summary和
+	// pageAlloc.scav.index.chunks对应的元素(表示这段地址区间的元数据信息)。
+	// 将pageAlloc.summary中对应的元素和pageAlloc.scav.index.chunks中这些对应的元素
+	// 的地址空间变成reay状态(mallocgc初始化时这些区间只是被reversed)。
+	//
+	// p.sysGrow只负责存储元数据信息结构所占内存的分配，并不会更新这些元数据信息。
 	p.sysGrow(base, limit)
 
 	// Update p.start and p.end.
 	// If no growth happened yet, start == 0. This is generally
 	// safe since the zero page is unmapped.
+	//
 	firstGrowth := p.start == 0
 	start, end := chunkIndex(base), chunkIndex(limit)
+	// 第一次提调用adm64
+	// println(start,end)
+	// 33751040 33751041
 	if firstGrowth || start < p.start {
 		p.start = start
 	}
@@ -391,12 +508,24 @@ func (p *pageAlloc) grow(base, size uintptr) {
 	// Note that [base, limit) will never overlap with any existing
 	// range inUse because grow only ever adds never-used memory
 	// regions to the page allocator.
+	//
+	// 将base，limit表示的addrRange插入到p.inUse中适当位置。
 	p.inUse.add(makeAddrRange(base, limit))
+	// 第一次调用输出：
+	// println("--",p.inUse.ranges[0].base.a,p.inUse.ranges[0].limit.a)
+	// println(p.inUse.totalBytes)
+	// -- 824633720832 824637915136
+	// 4194304=4MB
 
 	// A grow operation is a lot like a free operation, so if our
 	// chunk ends up below p.searchAddr, update p.searchAddr to the
 	// new address, just like in free.
+	//
+	// 新分配的地址区间是可供搜索的，因为还没有被使用。
 	if b := (offAddr{base}); b.lessThan(p.searchAddr) {
+		// 第一次调用：
+		// println("p.searchAddr.a",p.searchAddr.a)
+		// p.searchAddr.a 824633720832=0xC000000000
 		p.searchAddr = b
 	}
 
@@ -406,8 +535,12 @@ func (p *pageAlloc) grow(base, size uintptr) {
 	// Newly-grown memory is always considered scavenged.
 	// Set all the bits in the scavenged bitmaps high.
 	for c := chunkIndex(base); c < chunkIndex(limit); c++ {
+		// [base,limit)可能跨越多个chunk，但肯定是整数个。
+		// println("---",len(p.chunks))
+		// --- 8192
 		if p.chunks[c.l1()] == nil {
 			// Create the necessary l2 entry.
+			// 返回p.chunks[0]的值，其指向的是一个类型为[2^13]pallocData的数组。
 			r := sysAlloc(unsafe.Sizeof(*p.chunks[0]), p.sysStat)
 			if r == nil {
 				throw("pageAlloc: out of memory")
@@ -416,16 +549,27 @@ func (p *pageAlloc) grow(base, size uintptr) {
 			// grow is used in call chains that disallow write barriers.
 			*(*uintptr)(unsafe.Pointer(&p.chunks[c.l1()])) = uintptr(r)
 		}
+		// 第一次调用(0,512)
+		// 全部位设置成1。
 		p.chunkOf(c).scavenged.setRange(0, pallocChunkPages)
+		// 第一次调用：
+		// println("***",p.chunkOf(c).scavenged[0])
+		// println("***",p.chunkOf(c).scavenged[1])
+		// println("***",p.chunkOf(c).scavenged[7])
+		// *** 18446744073709551615
+		// *** 18446744073709551615
+		// *** 18446744073709551615
 	}
 
 	// Update summaries accordingly. The grow acts like a free, so
 	// we need to ensure this newly-free memory is visible in the
 	// summaries.
+	//
+	// 第一次调用时为(0xC000000000,4MB/8192=512,true,false)
 	p.update(base, size/pageSize, true, false)
 }
 
-// update updates heap metadata. It must be called each time the bitmap
+// update updates heap metadata. It must be called each time the bitmap(chunk对应的512位位图)
 // is updated.
 //
 // If contig is true, update does some optimizations assuming that there was
@@ -433,22 +577,45 @@ func (p *pageAlloc) grow(base, size uintptr) {
 // whether the operation performed was an allocation or a free.
 //
 // p.mheapLock must be held.
+//
+// 此函数在分配位图发生变更时，同步 pageAlloc.summary 各层级的sum信息。
+//
+// 因为为mspan分配内存时使用的整页(8192)，但调用此函数npages却要是整数倍的chunk对应的页数(512页)。
+// 比如新grow了chunk(512页,4MB)，然后分配了512个msapn(每个占用一页)则这个函数就会被调用512次。
+// 因为一旦一个chunk对应的512位图发生了变化就需调用此函数更新每一层级对应的sum(一个entry对应一个sum)信息。
+//
+// 参数：
+// npages 第一页的起始地址
+// npages 从base开始总共包含了多少页
+// contig 等于true，表示npages都已经被分配了或者都已经被释放了。
+// alloc 表是释放还是分配，即页已经被使用(比如用于mspan)true，还是接下来可以使用false。新分配的页alloc是false。
+//
+// [base,base+npages*8192)
 func (p *pageAlloc) update(base, npages uintptr, contig, alloc bool) {
 	assertLockHeld(p.mheapLock)
 
 	// base, limit, start, and end are inclusive.
 	limit := base + npages*pageSize - 1
 	sc, ec := chunkIndex(base), chunkIndex(limit)
+	// 第一次调用
+	// println("sc,ec",sc,ec)
+	// println("npages",npages)
+	// 33751040 33751040
 
 	// Handle updating the lowest level first.
 	if sc == ec {
 		// Fast path: the allocation doesn't span more than one chunk,
 		// so update this one and if the summary didn't change, return.
 		x := p.summary[len(p.summary)-1][sc]
+		// 第一次调用
+		// println("x",x)
+		// x 0
 		y := p.chunkOf(sc).summarize()
+		// y=packPallocSum(512,512,512)
 		if x == y {
 			return
 		}
+		// 更新最后一层对应的(entry)sum的信息。
 		p.summary[len(p.summary)-1][sc] = y
 	} else if contig {
 		// Slow contiguous path: the allocation spans more than one chunk
@@ -521,6 +688,14 @@ func (p *pageAlloc) update(base, npages uintptr, contig, alloc bool) {
 // allocated range.
 //
 // p.mheapLock must be held.
+// 从 pageAlloc 的inUse中分配[base,base+napges*pageSize)地址区间，其实只是更新对应的
+// alloc bitmap/scavenged bitmap 和 pageAlloc.summary 中的sum信息。即做些记薄工作。
+//
+// 参数: npages要分配的页数。
+// 返回值：这些页对应的 pageAlloc.chunks 中的 pallocData.scavenged 位中为1的位的个数。
+//
+// 影响: 更新 pageAlloc.chunks 中[base,base+npages*pageSize)影响到的chunk中的512分配位(由0变为1)和
+// 512 scavenged位(由1变为0)。并更新 pageAlloc.summary 中各个层级对应的sum信息。
 func (p *pageAlloc) allocRange(base, npages uintptr) uintptr {
 	assertLockHeld(p.mheapLock)
 
@@ -818,12 +993,24 @@ nextLevel:
 //
 // Must run on the system stack because p.mheapLock must be held.
 //
+// [addr,npages*pageSize)这段地址区间已经通过 mheap.grow 变成了prepared状态。
+//
+// 从pageAlloc中分配npages个页面，返回这npages的起始地址和这些页面中有多少个页面对应
+// 的 pageAlloc.chunks 中的 scavenged 位为了1。
+//
+// 同时会更新被分配的npages的 pageAlloc.chunks 中的分配/scavenged 位图信息。和
+// pageAlloc.summary 中各个层级对应的sum信息。
+//
+// 如果pageAlloc中(从其summary来判断)没有足够的连续npages则第一个返回值为0，此时第二个返回值应当忽略。
+//
 //go:systemstack
 func (p *pageAlloc) alloc(npages uintptr) (addr uintptr, scav uintptr) {
 	assertLockHeld(p.mheapLock)
 
 	// If the searchAddr refers to a region which has a higher address than
 	// any known chunk, then we know we're out of memory.
+	//
+	// p.inUse 中的addrRange已经用完了。
 	if chunkIndex(p.searchAddr.addr()) >= p.end {
 		return 0, 0
 	}
@@ -832,9 +1019,12 @@ func (p *pageAlloc) alloc(npages uintptr) (addr uintptr, scav uintptr) {
 	// search it directly.
 	searchAddr := minOffAddr
 	if pallocChunkPages-chunkPageIndex(p.searchAddr.addr()) >= uint(npages) {
+		// p.searchAddr 所在的chunk剩余可搜索页大于等于npage。
+		//
 		// npages is guaranteed to be no greater than pallocChunkPages here.
 		i := chunkIndex(p.searchAddr.addr())
 		if max := p.summary[len(p.summary)-1][i].max(); max >= uint(npages) {
+			// p.searchAddr所在的chunk的最大空闲连续页大于npages。
 			j, searchIdx := p.chunkOf(i).find(npages, chunkPageIndex(p.searchAddr.addr()))
 			if j == ^uint(0) {
 				print("runtime: max = ", max, ", npages = ", npages, "\n")
@@ -862,11 +1052,17 @@ func (p *pageAlloc) alloc(npages uintptr) (addr uintptr, scav uintptr) {
 	}
 Found:
 	// Go ahead and actually mark the bits now that we have an address.
+	//
+	// 真正开始做记簿工作。
 	scav = p.allocRange(addr, npages)
 
 	// If we found a higher searchAddr, we know that all the
 	// heap memory before that searchAddr in an offset address space is
 	// allocated, so bump p.searchAddr up to the new one.
+	//
+	// 如果需分配的npages恰巧是从searchAddr开始分配的，就会出现需要更新的情况。
+	// 00111000 分配位图部分，若searchIdx对应的是第一个0，如果需要3页。那么p.searchAddr
+	// 便不需要更新，如果需要2页变化更新。相应的3个0连续位或者两个0连续位都会会被置为1。
 	if p.searchAddr.lessThan(searchAddr) {
 		p.searchAddr = searchAddr
 	}
@@ -879,6 +1075,15 @@ Found:
 //
 // Must run on the system stack because p.mheapLock must be held.
 //
+// 参数：
+// base 要free的地址区间的起始地址。
+// npages 从base开始free npges个页面。
+// scavenged 表示此npages对应的scavenged位是否是1。
+//
+// 影响: npages所有的分配位都置为1，如果scavenged位false，则会
+// 将npages所跨越的chunks在 p.scav.index.chunks中对应的位
+// 置为1，表示此chunk中包含可scavenged的页面。
+//
 //go:systemstack
 func (p *pageAlloc) free(base, npages uintptr, scavenged bool) {
 	assertLockHeld(p.mheapLock)
@@ -889,6 +1094,9 @@ func (p *pageAlloc) free(base, npages uintptr, scavenged bool) {
 	}
 	limit := base + npages*pageSize - 1
 	if !scavenged {
+		// 如果这些页对应的scavenged位没有被设置为1，则它们所在的chunks
+		// 在 p.scav.index.chunks 中对应的位设置为1，表示这些chuks中
+		// 保护可scavenged的页。
 		p.scav.index.mark(base, limit+1)
 	}
 	if npages == 1 {
@@ -939,6 +1147,8 @@ type pallocSum uint64
 // packPallocSum takes a start, max, and end value and produces a pallocSum.
 func packPallocSum(start, max, end uint) pallocSum {
 	if max == maxPackedValue {
+		// maxPackedValue=2^21
+		// 将最高位设置为1
 		return pallocSum(uint64(1 << 63))
 	}
 	return pallocSum((uint64(start) & (maxPackedValue - 1)) |

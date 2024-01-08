@@ -222,6 +222,9 @@ func wbBufFlush(dst *uintptr, src uintptr) {
 //
 // This must be non-preemptible because it uses the P's workbuf.
 //
+// 对写屏障机制产生的指针进行标记(如果之前已经标记过则跳过)，如果指针指向的对象是nosacan类型，
+// 会将此对象添加到p.gcw中进一步扫描。
+//
 //go:nowritebarrierrec
 //go:systemstack
 func wbBufFlush1(pp *p) {
@@ -277,6 +280,7 @@ func wbBufFlush1(pp *p) {
 		// just prefetches the mark bits.
 		mbits := span.markBitsForIndex(objIndex)
 		if mbits.isMarked() {
+			// 已标记对象不必再处理。说明已经处理过了。
 			continue
 		}
 		mbits.setMarked()
@@ -288,6 +292,7 @@ func wbBufFlush1(pp *p) {
 		}
 
 		if span.spanclass.noscan() {
+			// noscan对象不必扫描，跳过
 			gcw.bytesMarked += uint64(span.elemsize)
 			continue
 		}

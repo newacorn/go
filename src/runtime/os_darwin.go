@@ -258,6 +258,7 @@ func newosproc(mp *m) {
 	// setup and then calls mstart.
 	var oset sigset
 	sigprocmask(_SIG_SETMASK, &sigset_all, &oset)
+	// sigset_all  4294967295
 	// oset = 0
 	// 新的线程克隆是会继承刚刚设置的值为 sigset_all 的 _SIG_SETMASK
 	err = retryOnEAGAIN(func() int32 {

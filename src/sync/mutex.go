@@ -252,6 +252,7 @@ func (m *Mutex) lockSlow() {
 				// 至此: g是新入 Lock 调用的的g。
 				//
 				// 操作成功之后这个初入G就像一个刚刚唤醒的G一样，因为它成功设置了 mutexWoken 标志位。
+				// 但与真正被唤醒的等待者不同其肯定不会设置饥饿模式位。
 				awoke = true
 				// 至此：g接下来的行为就像一个刚被唤醒的等待者。
 				//
@@ -377,15 +378,20 @@ func (m *Mutex) lockSlow() {
 			// 2. 饥饿模式下，初入的g。
 			// 3. 正常模式下，未能获得锁的新入 Lock 调用的g。
 			runtime_SemacquireMutex(&m.sema, queueLifo, 1)
+			// 如果在m没有进入饥饿模式之前此处发生了抢占/或者操作系统在此抢占了线程，待其恢复运行时m已处于饥饿模式了？？？
+			// 那么下面的mutex state异常就有可能会被触发。
+			//
+			// 其实并不会，因为其没有再次进入休眠时woken标志不会被清除。
+			// 所以就不会再唤醒其它休眠者，便不会进入饥饿模式，因为饥饿模式由被唤醒者设置。
 
 			// 被唤醒后，计算总共休眠了多久，因为一个G可以被唤醒多次可能还未获得锁。
-			// 所以需要每次别唤醒后都计算一次。
 			starving = starving || runtime_nanotime()-waitStartTime > starvationThresholdNs
 			// 总等待时间大于1ms，则 starving 为true。
 			//
 			// 获取最新的原始状态，因为在休眠的过程中状态可能发生了变更。
 			old = m.state
 			// 只有饥饿模式下被唤醒的g，下面的条件才有可能成立。
+			// 因为一次只会唤醒一个协程，且
 			if old&mutexStarving != 0 {
 				// 至此：g是一个处于饥饿模式下被唤醒的g。
 				//

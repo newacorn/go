@@ -245,11 +245,15 @@ type mutex struct {
 // notesleep/notetsleep are generally called on g0,
 // notetsleepg is similar to notetsleep but is called on user g.
 //
-// 一次性的休眠唤醒机制，一个线程休眠，另一个线程唤醒。
-// 要想重用这个note，必须在 notesleep 和 notewakeup 成对调用之后再调用
+// 一次性的休眠唤醒机制，一个/多个线程休眠，另一个线程唤醒。
+// 可以先调用 notewakeup ,这样再多次/单次调用 notesleep 就会直接返回。
+// 一个初始状态的 note 只能被 wakeup 一次。
+//
+// 要想重用这个 note，必须在 notesleep 和 notewakeup 成对调用之后(都返回之后)，再调用
 // noteclear()。
 //
-// noteclear 不能在 notewakeup 之后调用，可能会使 notesleep 进入无限循环。
+// notetsleepg 如果因为休眠到期而被唤醒，则noteclear()必须确定noteweakeup不会再被调用
+// 之后才能调用。
 //
 // sema-based impl:
 // key的值为：
@@ -575,20 +579,52 @@ type g struct {
 	// asyncSafePoint is set if g is stopped at an asynchronous
 	// safe point. This means there are frames on the stack
 	// without precise pointer information.
+	//
+	// 由异步抢占信号处理函数在检测到当前g符合 isAsyncSafePoint 时，会将此值设置为true。
 	asyncSafePoint bool
 
 	paniconfault bool // panic (instead of crash) on unexpected fault address
 	// 与 gcAssistBytes 字段在同一个地方被重置。
+	//
+	// 每轮GC开始时此字段在gcstart函数调用中被false。
 	gcscandone   bool // g has scanned stack; protected by _Gscan bit in status
 	throwsplit   bool // must not split stack
 	// activeStackChans indicates that there are unlocked channels
 	// pointing into this goroutine's stack. If true, stack
 	// copying needs to acquire channel locks to protect these
 	// areas of the stack.
+	//
+	// 为false时，在进行栈复制时不用对引用它的chan上锁，否则必须上锁。因为在进
+	// 行栈赋值时要防止其它协程对此栈上指针的读取，目前只有在chan通信时，会存在
+	// 协程之间引用栈的情况。
+	//
+	// 对于栈增长来说，无论是否存在sudog引用此g栈上的内存，都可以安全地进行。
+	// 因为栈增长是g主动进行的，g要么持有sudog锁，要么没有。当没有时但g又发生了栈
+	// 增长那么g肯定处于运状态。
+	// 运行状态的且没有持有sudog锁的g，肯定不存在sudog引用此g的栈上的内存。
+	//
+	// 因为栈增长和栈收缩都在 newstack()函数中处理，且栈收缩用此值判断是否要对sudog
+	// 上锁，所以要保证进行栈增长时此值肯定是false，不然可能会导致g在持有sudog锁的情况
+	// 下又去获得sudog锁从而造成死锁。
+	//
+	// 所以这个值在 gopark 中的 mcall 中设置为true。当g恢复运行时有设置为false，所以
+	// 可以保证栈增长时此值肯定是false。
 	activeStackChans bool
 	// parkingOnChan indicates that the goroutine is about to
 	// park on a chansend or chanrecv. Used to signal an unsafe point
 	// for stack shrinking.
+	//
+	// 此值主要是为了保证进行栈收缩时，该上锁的sudog一定会被上锁。
+	// 本质上是为了保证 activeStackChans=true的赋值在执行 newstack 时能被观察到。
+	// (gopark中执行的 activeStackChans=true之后，将此值原子性的设置为false)。
+	//
+	// 在执行栈收缩(newstack)的前提之一就是此值为false。
+	//
+	// 如果没有此值: 因为 activeStackChans 并不是原子性设置和检查，当一个g因为通道阻塞而处于
+	// waitting 状态，此时垃圾回收对此g进行scan时发现其栈需要收缩，因为其观察到的 activeStackChans
+	// 有延迟本来已经更新为true了，但本地线程观察到是false便不会对其关联的sudog进行上锁。如果此时
+	// 有另外一个通道操作取出了此g关联的sudog读取了上面引用g栈的指针同时栈收缩又在执行，当解引用此指针
+	// 时可能其引用的内存上存储的不是原来的值。
 	parkingOnChan atomic.Bool
 
 	raceignore     int8     // ignore race detection events
@@ -622,7 +658,9 @@ type g struct {
 	// only user goroutines have labels
 	// labels can be inheired
 	labels         unsafe.Pointer // profiler labels
-	// runtime 内部实现的计时器类型，主要用来支持 time.Sleep
+	// 目前仅用来用来支持 time.Sleep 函数。
+	// 当在g中第一次调用time.Sleep时对此值进行初始化，
+	// 当g退出时会被设置为nil。
 	timer          *timer         // cached timer for time.Sleep
 
 	/**
@@ -668,6 +706,8 @@ type g struct {
 	// 每个 goroutine 都有自己的 gcAssistBytes ，在这个值用光之前不用执行
 	// 辅助 GC。辅助GC机制能能够有效地避免程序过快地分配内存，从而造成GC工作
 	// 线程来不及标记的问题。
+	//
+	// 每轮GC开始时此字段在gcstart函数调用中被清空。
 	gcAssistBytes int64
 }
 
@@ -806,11 +846,20 @@ type p struct {
 	// 本质上是一个指针，反向关联到P绑定的M
 
 	mcache      *mcache
-	// 页缓存
+	// 页缓存，可缓存64个页面。
+	// 从 pageAlloc 中填充的( pageAlloc.allocToCache 方法)，至少有一个空闲页。
+	// 这些页(无论是不是空闲页)在 pageAlloc 中的分配位图为1，scavenged 位图是0。
+	// pcache.cache 中保存了真实的分配位图。
+	//
+	// 当p被destroy时，这些页会被回收。
+	//
+	// 满足以下条件才会从pcache中分配。
+	// if !needPhysPageAlign && pp != nil && npages < pageCachePages/4
 	pcache      pageCache
 	raceprocctx uintptr
 
 	deferpool    []*_defer // pool of available defer structs (see panic.go)
+	// deferpool的底层数组。
 	deferpoolbuf [32]*_defer
 
 	// Cache of goroutine ids, amortizes accesses to runtime·sched.goidgen.
@@ -859,6 +908,7 @@ type p struct {
 	}
 
 	sudogcache []*sudog
+	// sudogcache 的底层数组。
 	sudogbuf   [128]*sudog
 
 	// Cache of mspan objects from the heap.
@@ -916,8 +966,10 @@ type p struct {
 
 	// Per-P GC state
 	// 在标记清扫阶段STW被重置为0。
+	// 在 gcControllerState.startCycle 中重置。
 	gcAssistTime         int64 // Nanoseconds in assistAlloc
 	// 在标记清扫阶段STW被重置为0。
+	// 在 gcControllerState.startCycle 中重置。
 	gcFractionalMarkTime int64 // Nanoseconds in fractional mark worker (atomic)
 
 	// limiterEvent tracks events for the GC CPU limiter.
@@ -986,6 +1038,8 @@ type p struct {
 	// accumulates the actual stack observed to be used at GC time (hi - sp),
 	// not an instantaneous measure of the total stack size that might need
 	// to be scanned (hi - lo).
+	//
+	// hi-sp的差值
 	scannedStackSize uint64 // stack size of goroutines scanned by this P
 	scannedStacks    uint64 // number of goroutines scanned by this P
 
@@ -1133,6 +1187,8 @@ type schedt struct {
 
 	// 用于统计改变 GOMAXPROCS 所花费的时间
 	procresizetime int64 // nanotime() of last change to gomaxprocs
+	// 程序启动之后不同的 GOMAXPROCS * 此GOMAXPROCS持续的时间的总和。同样的GOMAXPROCS可以出现多次只要调用了 procresize 函数，
+	// 因为此值是在 procresize 函数中累加的。所以不包含最近一次调用 procresize 后 GOMAXPROCS * 此GOMAXPROCS持续的时间。
 	totaltime      int64 // ∫gomaxprocs dt up to procresizetime
 
 	// sysmonlock protects sysmon's actions on the runtime.
@@ -1240,6 +1296,7 @@ type itab struct {
 	hash  uint32 // copy of _type.hash. Used for type switches.
 	_     [4]byte
 	// 接口方法到动态类型方法的映射
+	// fun中存储的是动态类型的以指针为接收者的方法的地址。
 	fun   [1]uintptr // variable sized. fun[0]==0 means _type does not implement inter.
 }
 

@@ -44,6 +44,7 @@ func Server(conn net.Conn, config *Config) *Conn {
 // using conn as the underlying transport.
 // The config cannot be nil: users must set either ServerName or
 // InsecureSkipVerify in the config.
+// 必须配置 ServerName 或者 InsecureSkipVerify=false.
 func Client(conn net.Conn, config *Config) *Conn {
 	c := &Conn{
 		conn:     conn,

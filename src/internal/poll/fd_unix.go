@@ -120,6 +120,7 @@ func (fd *FD) destroy() error {
 // Close closes the FD. The underlying file descriptor is closed by the
 // destroy method when there are no remaining references.
 func (fd *FD) Close() error {
+	println("close.....")
 	//
 	// 下面的 fd.fdmu.increfAndClose()函数调用：
 	// 1. 设置 fd.fdmu.state 的 mutexClosed 标志位
@@ -155,6 +156,7 @@ func (fd *FD) Close() error {
 	// reference, it is already closed. Only wait if the file has
 	// not been set to blocking mode, as otherwise any current I/O
 	// may be blocking, and that would block the Close.
+	//
 	// No need for an atomic read of isBlocking, increfAndClose means
 	// we have exclusive access to fd.
 	if fd.isBlocking == 0 {

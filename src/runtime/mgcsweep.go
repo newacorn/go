@@ -228,9 +228,10 @@ func (a *activeSweep) reset() {
 // progress.
 // finishsweep_m() 函数目前只被 gcStart 函数调用。
 // 此函数在 STW 状态下被调用。
-// 1. 执行上一轮GC清扫任务，如果有的话。此函数返回后可以确定上一轮GC清扫任务肯定全部完成。
-// 2. 重置 mcentral 中的 unSwept spanSet 数据结构。
+// 1. 确保上一轮GC清扫任务肯定全部完成。
+// 2. 重置 mcentral 中的 full/partial unSwept spanSet。
 // 3. 唤醒 scavenger 。
+// 4. gcBitsArenas 中字段的角色互换和回收。
 //
 //go:nowritebarrier
 func finishsweep_m() {
@@ -241,14 +242,11 @@ func finishsweep_m() {
 	// shouldn't be any spans left to sweep, so this should finish
 	// instantly.
 	//
-	// force GC 在执行到这里之前在gcStart函数入口处也会进行下面这样的循环。
-	// 不过当时如果上一轮的清扫工作还未开始呢？那个循环之后整个循环之前开始了，
-	// 就会出现这种情况。
 	// If GC was forced before the concurrent sweep
 	// finished, there may be spans to sweep.
 	//
 	// 因为此时处于STW状态，所以当工作队列中没有任务时便是所有的清扫任务都完成了。
-	// 前提是正在执行 sweepone 的协程不能被抢占。下面的断言也验证了这点。
+	// 前提是正在执行sweepone的协程不能被抢占。下面的断言也验证了这点。
 	for sweepone() != ^uintptr(0) {
 		sweep.npausesweep++
 	}
@@ -266,18 +264,14 @@ func finishsweep_m() {
 	// Reset all the unswept buffers, which should be empty.
 	// Do this in sweep termination as opposed to mark termination
 	// so that we can catch unswept spans and reclaim blocks as
-	// soon as possible.
+	// soon as possible[因为spanset类型共有一个全局的spanSetBlocks pool].
 	//
-	// ------------- unSwept spanSet 数据结构重置 -----------
-	// 因为这种 spanSet 中的 mspan 已经在上一轮 sweep 清扫中全部取出[而执行到这里上一轮GC清扫任务肯定全部完成了]，所以这个 spnSet 数据结构可以被安全的重置。
-	// 见 gcStart -> finishsweep_m 函数调用。
-	// GC 还未执行时，也没关系，因为并不向 unSwept spanSet 中存储 mspan ，所以第一轮GC也可以安全重置 unSwept 的 spanSet 数据结构。
-	// -----------------------------------------------------
+	// // spanSetBlockPool is a global pool of spanSetBlocks.
+	// var spanSetBlockPool spanSetBlockAlloc
 	sg := mheap_.sweepgen
 	for i := range mheap_.central {
 		c := &mheap_.central[i].mcentral
-		// 下面两个函数执行之后，它们对应的2个spanset都处于初始状态，
-		// 不包含任何msapn.
+		// 下面两个函数执行之后，它们对应的2个spanset都处于初始状态，不包含任何msapn.
 		c.partialUnswept(sg).reset()
 		c.fullUnswept(sg).reset()
 	}
@@ -286,7 +280,8 @@ func finishsweep_m() {
 	// wake it up. There's definitely work for it to do at this
 	// point.
 	//
-	// 唤醒 scavenger 协程，按需清理页归还操作系统。
+	// sweep之后，一般会存在完全释放的msapn，所以很可能会有可scavenge的页面。
+	// 唤醒后台scavenger协程，按需回收页归还操作系统。
 	scavenger.wake()
 
 	nextMarkBitArenaEpoch()
@@ -375,6 +370,8 @@ func (l *sweepLocker) tryAcquire(s *mspan) (sweepLocked, bool) {
 
 // sweepone sweeps some unswept heap span and returns the number of pages returned
 // to the heap, or ^uintptr(0) if there was nothing to sweep.
+//
+// 返回^uintptr(0)，表示任务池没有任务可取，但其它并行工作者可能还在执行清理工作。
 func sweepone() uintptr {
 	gp := getg()
 
@@ -513,6 +510,26 @@ func (s *mspan) ensureSwept() {
 // Returns true if the span was returned to heap.
 // If preserve=true, don't return it to heap nor relink in mcentral lists;
 // caller takes care of it.
+//
+// 根据preserve的值分两种情况处理：
+// 1. preserve=true，只清扫 sweepLocked.mspan 并不会将它放置在某处。
+// 2. preserve=false:
+// 2.1. 有对象被标记：
+// 如果对象全都被标记则将其放入 mcentral.full 的fullsweept队列中。
+// 部分被标记将其放入 mcentral.partial 的partialsweept队列中。
+// 2.2. 没有对象被标记：
+// 将此mspan管理的内存对应的地址区间在 pageAlloc.chunks 中的对应的alloc位/scavenged位
+// 分别置为0和1。并更新在 pageAlloc.summary 中对应的各个层级的sum信息。
+// 并未对此地址空间执行 sysUnused 调用。
+//
+// 结果：
+// 如果没有被归还到页堆，则 mspan.sweepgen = mheap.sweepgen
+// mspan.allocBits = mspan.gcmarkBits
+// mspan.allocCount = mspan总被标记的对象。
+// mspan.allocCache 根据新的allocBits重置。
+// mspan.freeindex = 0
+// mspan.freeIndexForScan = 0
+//
 func (sl *sweepLocked) sweep(preserve bool) bool {
 	// It's critical that we enter this function with preemption disabled,
 	// GC must not start while we are in the middle of this function.
@@ -562,17 +579,37 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 	hadSpecials := s.specials != nil
 	siter := newSpecialsIter(s)
 	for siter.valid() {
+		// 一次处理一个obj上所有的special，如果此obj包含spcial的话。
+		//
+		// 1. 如果此对象没有被标记：
+		// 1.1 将对像关联了_KindSpecialFinalizer类型的spcials移除，但保留其它类型spcials。
+		// 并将此对象标记为存活。
+		// 1.2 此队列没有关联_KindSpecialFinalizer类型的special，则将其关联的所有specals都移除。
+		// 2. 如果此对象被标记了：
+		// 将对象关联的 _KindSpecialReachable 类相等special移除，但保留其它类型的spcials。
+		//
+		// 被移除的spcial除了从mspan.specials链表中移除的话，还对它们执行
+		// freeSpecial()调用。
+		//
 		// A finalizer can be set for an inner byte of an object, find object beginning.
+		// 当前special所关联的obj在msapn中的索引。
 		objIndex := uintptr(siter.s.offset) / size
+		// p表示obj的起始地址。
 		p := s.base() + objIndex*size
 		mbits := s.markBitsForIndex(objIndex)
 		if !mbits.isMarked() {
+			// 当前special关联的obj没有被标记为存活。
+			//
 			// This object is not marked and has at least one special record.
 			// Pass 1: see if it has at least one finalizer.
 			hasFin := false
 			endOffset := p - s.base() + size
+			// obj末端地址在msapn中的偏移量。
 			for tmp := siter.s; tmp != nil && uintptr(tmp.offset) < endOffset; tmp = tmp.next {
+				// 一个obj可能关联多个special或者一个obj是tinyObj里面的多个小对象关联了special。
 				if tmp.kind == _KindSpecialFinalizer {
+					// 凡是此obj/或其子对象关联了 _KindSpecialFinalizer 则将其标记为存活。
+					//
 					// Stop freeing of object if it has a finalizer.
 					mbits.setMarkedNonAtomic()
 					hasFin = true
@@ -586,6 +623,8 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 				special := siter.s
 				p := s.base() + uintptr(special.offset)
 				if special.kind == _KindSpecialFinalizer || !hasFin {
+					// 要么只移除此对象关联的所有 _kindSpecialFinalizer类型的spcials，
+					// 要么移除此对象关联的所有spcials(此对象没有关联fin类型的spcial)。
 					siter.unlinkAndNext()
 					freeSpecial(special, unsafe.Pointer(p), size)
 				} else {
@@ -608,6 +647,8 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 		}
 	}
 	if hadSpecials && s.specials == nil {
+		// 当s中存在specials且在上面的操作中s中所有spcial都被移除了。
+		// 将s所在的arena关联的heapArena中specials位图中对应的位置为0。
 		spanHasNoSpecials(s)
 	}
 
@@ -642,6 +683,9 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 	}
 
 	// Check for zombie objects.
+	//
+	// 从s.freeindex开始的所有对象，如果存在某些对象被GC标记了但没有被allocBits记录则
+	// 调用s.reportZombies报告。
 	if s.freeindex < s.nelems {
 		// Everything < freeindex is allocated and hence
 		// cannot be zombies.
@@ -650,9 +694,11 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 		// careful with freeindex.
 		obj := s.freeindex
 		if (*s.gcmarkBits.bytep(obj / 8)&^*s.allocBits.bytep(obj / 8))>>(obj%8) != 0 {
+			//s.freeindex处的对象被GC标记但allocBits位并没有被设置。
 			s.reportZombies()
 		}
 		// Check remaining bytes.
+		// 检查剩余s.freeindex之后的对象。
 		for i := obj/8 + 1; i < divRoundUp(s.nelems, 8); i++ {
 			if *s.gcmarkBits.bytep(i)&^*s.allocBits.bytep(i) != 0 {
 				s.reportZombies()
@@ -661,15 +707,21 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 	}
 
 	// Count the number of free objects in this span.
+	//
+	// nalloc s中被标记的对象个数，这些对象在sweep后会被保留。
 	nalloc := uint16(s.countAlloc())
+	// nfreed s中被释放的对象。
 	nfreed := s.allocCount - nalloc
 	if nalloc > s.allocCount {
+		// 被标记的对象的数量不可能大于被分配的对象数量。
+		//
 		// The zombie check above should have caught this in
 		// more detail.
 		print("runtime: nelems=", s.nelems, " nalloc=", nalloc, " previous allocCount=", s.allocCount, " nfreed=", nfreed, "\n")
 		throw("sweep increased allocation count")
 	}
 
+	// 更新s的一些字段。
 	s.allocCount = nalloc
 	s.freeindex = 0 // reset allocation index to start of span.
 	s.freeIndexForScan = 0
@@ -679,19 +731,27 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 
 	// gcmarkBits becomes the allocBits.
 	// get a fresh cleared gcmarkBits in preparation for next GC
+	//
+	// 置换标记位和分配位。
 	s.allocBits = s.gcmarkBits
 	s.gcmarkBits = newMarkBits(s.nelems)
 
 	// Initialize alloc bits cache.
+	//
+	// 按新的 allocBits 来设置 s.allocCache。
 	s.refillAllocCache(0)
 
 	// The span must be in our exclusive ownership until we update sweepgen,
 	// check for potential races.
 	if state := s.state.get(); state != mSpanInUse || s.sweepgen != sweepgen-1 {
+		// mSpanInUse 状态的mspan才能被扫描，清扫状态中的s，其s.sweepgen=mheap_.sweepgen-1。
 		print("mspan.sweep: state=", state, " sweepgen=", s.sweepgen, " mheap.sweepgen=", sweepgen, "\n")
 		throw("mspan.sweep: bad span state after sweep")
 	}
 	if s.sweepgen == sweepgen+1 || s.sweepgen == sweepgen+3 {
+		// 如果mspan的sweepgen字段的值是这两种情况，那么它们都是被缓存在某个p的mcache中。
+		// 其中 s.sweepgen == sweepgen+3 不应该被清扫。
+		// s.sweepgen == sweepgen+1 需要将 s.swwepgen=mheap_.sweepgen-1，才能进行清扫。
 		throw("swept cached span")
 	}
 
@@ -744,6 +804,9 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 
 	if spc.sizeclass() != 0 {
 		// Handle spans for small objects.
+		//
+		// mspan.elemsize<=32KB的
+		// spanclass=[1,68]
 		if nfreed > 0 {
 			// Only mark the span as needing zeroing if we've freed any
 			// objects, because a fresh span that had been allocated into,
@@ -763,21 +826,36 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 			// sweeping by updating sweepgen. If this span still is in
 			// an unswept set, then the mcentral will pop it off the
 			// set, check its sweepgen, and ignore it.
+			//
+			// preserve=fase，表示清理之后，可以按条件将其放到正确位置。
 			if nalloc == 0 {
+				// s在清扫之后完全没有存活对象了。
+				// 将其放回页堆。将来从页中分配堆时可以用到。
+				//
 				// Free totally free span directly back to the heap.
 				mheap_.freeSpan(s)
 				return true
 			}
 			// Return span back to the right mcentral list.
 			if uintptr(nalloc) == s.nelems {
+				// 在清扫之后，s中都是存活对象。
+				// 即此msapn在下一轮GC执行清扫之前不可能再被使用了(1.因为已经清扫过了，2.因为没有空闲对象可供分配)。
 				mheap_.central[spc].mcentral.fullSwept(sweepgen).push(s)
 			} else {
+				// 在清扫之后，s中存在空闲对象。
 				mheap_.central[spc].mcentral.partialSwept(sweepgen).push(s)
 			}
 		}
 	} else if !preserve {
+		// preserve=fase，表示清理之后，可以按条件将其放到正确位置。
+		//
+		// 这里的路基处理的s，其管理的内存大于32KB。
+		// 即s.elemsize>32KB，这样的mspan只有一个对象。
 		// Handle spans for large objects.
 		if nfreed != 0 {
+			// 因为大mspan只有一个obj，所以nfreed=0表示整个mspan管理的内存都是空的。
+			// nfreed肯定等于1。
+			//
 			// Free large object span to heap.
 
 			// NOTE(rsc,dvyukov): The original implementation of efence
@@ -798,6 +876,9 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 				s.limit = 0 // prevent mlookup from finding this span
 				sysFault(unsafe.Pointer(s.base()), size)
 			} else {
+				// 将mspan管理的内存释放到堆中。
+				// preserve=fase且
+				// 没有存活对象的大对象mspan将其放到页堆中。
 				mheap_.freeSpan(s)
 			}
 
@@ -814,6 +895,8 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 		}
 
 		// Add a large span directly onto the full+swept list.
+		//
+		// 将此大对象存活且需要我们处理，所以添加到fullSwept列表中去。
 		mheap_.central[spc].mcentral.fullSwept(sweepgen).push(s)
 	}
 	return false
@@ -887,6 +970,9 @@ func (s *mspan) reportZombies() {
 // sweep phase between GC cycles.
 //
 // mheap_ must NOT be locked.
+//
+// 协程在分配内存时，进行辅助sweep。
+// 在 mcache.allocLarge 和 mcache.refill 调用中会调用此函数。
 func deductSweepCredit(spanBytes uintptr, callerSweepPages uintptr) {
 	if mheap_.sweepPagesPerByte == 0 {
 		// Proportional sweep is done or disabled.

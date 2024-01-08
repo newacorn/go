@@ -100,10 +100,14 @@ type suspendGState struct {
 // directly schedule the waiter. The context switch is unavoidable in
 // the signal case.
 //
+// 使暂停gp执行以便扫描其栈。如果gp是由
+//
+// 不会存在一个gp被多个执行markroot的协程同时suspnedG的情况。因为gp是从全局任务队列原子获取的。
+//
 //go:systemstack
 func suspendG(gp *g) suspendGState {
-	///*p*/rintln("suspendG called.")
 	if mp := getg().m; mp.curg != nil && readgstatus(mp.curg) == _Grunning {
+		// 防止两个协程彼此suspendG造成死锁，因为处于非用户栈是不能被抢占的。
 		// Since we're on the system stack of this M, the user
 		// G is stuck at an unsafe point. If another goroutine
 		// were to try to preempt m.curg, it could deadlock.
@@ -296,6 +300,12 @@ func canPreemptM(mp *m) bool {
 // frame and its parent frame conservatively.
 //
 // asyncPreempt is implemented in assembly.
+//
+// sigctxt.pushCall() 将此函数第一条指令注入到接收异步抢占信号的goroutine的栈，并将 sigctxt.rip()
+// 的值设置为 asyncPreempt 调用的返回地址。
+//
+// 此函数会保存寄存器状态到栈，然后执行asyncPreept2()函数，待asyncPreempt2执行完毕后
+// 恢复寄存器状态。返回时会执行 sigctxt.rip() ，继续接收信号之前的逻辑继续执行。
 func asyncPreempt()
 
 //go:nosplit
@@ -337,24 +347,23 @@ func init() {
 	}
 }
 
-// wantAsyncPreempt()
-//
-// readgstatus(gp)&^_Gscan == _Grunning需满足true：
-// 1. GC栈扫描：GC扫描就是一种不稳定的种不稳定的状态，因为GC栈扫描要求暂停和恢复运行都必须由扫描方负责。
-// 2. 对于超时抢占目标G也必须处于运行状态，如果已经不在运行状态便也就没有必要抢占了。
-// 3. stopTheWorld：因为检测 sched.gcwaiting 必须在 schedule()函数调用中执行，gp处于运行状态才能
-//    才能注入代码让其切换到 schedule() 调用。
-//
-// gp.preempt 字段必须为true：
-// 1.超时抢占：因为如果不为true说明已经不是当初要抢占的那个G了。
-// 2.GC栈扫描也是处于同样的理由。
-//
-// gp.m.p != 0 && gp.m.p.ptr().preempt 为true：
-// 1. stopTheWorld：因为如果 gp.m.p.ptr().preempt 为false说明P进入了下一轮 schedule，
-//    避免刚刚执行新任务又被 抢占了。
-//
 // wantAsyncPreempt returns whether an asynchronous preemption is
 // queued for gp.
+//
+// 执行异步抢占主要有两个需求：
+// 1. 让gp暂停执行
+// 	  1. gp运行时间过长，需要让出。
+//    2. gp暂停以对它的栈进行扫描。
+// 2. 让gp.P暂停运行或执行sched.safePontFn，这种情况下不用gp.preempt的值，虽然在发出抢占请求时会同时设置gp.preempt和gp.p.preempt，
+//    但当收到信号时gp可能已经不是给它的preempt赋值的那个gp了。但因为有gp.p.preemt所以同样可以满足要求。
+//    1. 垃圾回收，STOP THE WORLD，需所有P暂停运行。
+//    2. 调用forEachP(f)让所有P运行函数f。需将P重新回到shchedule()，因为在schedule()函数中会多次检查是否需要运行
+//       sched.safePointFn。
+//
+// 1. 检查gp.preempt=true，对应需求1，检查(gp.m.p != 0 && gp.m.p.ptr().preempt)满足需求2.
+// 2. 检查(readgstatus(gp)&^_Gscan == _Grunning)对于需求1来说是前提条件。所以必须满足。但对
+// 需求2来说，P可能已经处于schedule逻辑了，所以不必再进行异步抢占。同时因为异步抢占必须依靠接收
+// 信号线程中正在运行的gp在信号处理结束时指定指定代码。如果gp没在运行便很难达到目的。
 func wantAsyncPreempt(gp *g) bool {
 	// Check both the G and the P.
 	return (gp.preempt || gp.m.p != 0 && gp.m.p.ptr().preempt) && readgstatus(gp)&^_Gscan == _Grunning
@@ -376,6 +385,18 @@ func wantAsyncPreempt(gp *g) bool {
 // In some cases the PC is safe for asynchronous preemption but it
 // also needs to adjust the resumption PC. The new PC is returned in
 // the second result.
+//
+// 1. gp再次恢复运行时不会造成死锁，所以gp.m不能持有某些锁。
+// 2. gp必须正处于用户栈。
+// 3. gp必须关联一个处于运行状态的P。
+// 4. 因为可能是栈扫描任务触发的，所以要确保当前栈不存在隐藏指针。
+// 5. gp所在栈剩余的空间足够注入 asyncPreempt 函数调用。
+// 6. 某些原子操作序列中间不能抢占，比如write barrier
+// 7. 被 //go:nosplit 注释的函数。
+//
+// 返回值：
+// bool：满足上面的条件返回true。
+// uintptr： asyncPreempt 函数返回地址，默认是收到信号时pc寄存器的值，对于某些种类的pc会进行修正。
 func isAsyncSafePoint(gp *g, pc, sp, lr uintptr) (bool, uintptr) {
 	mp := gp.m
 
