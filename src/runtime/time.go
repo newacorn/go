@@ -227,6 +227,11 @@ func stopTimer(t *timer) bool {
 //
 // Reports whether the timer was modified before it was run.
 //
+// t的状态由 timerWaiting, timerModifiedEarlier, timerModifiedLater 成功转移到
+// -> timerModifiedEarlier, timerModifiedLater 则返回true。否则返回false。
+//
+// 如果这个t在执行此函数(更精确的是底层函数)之前已经运行/删除，此函数便会返回false。
+//
 //go:linkname resetTimer time.resetTimer
 func resetTimer(t *timer, when int64) bool {
 	if raceenabled {
@@ -311,6 +316,11 @@ func doaddtimer(pp *p, t *timer) {
 // actually remove it from the timers heap. We can only mark it as deleted.
 // It will be removed in due course by the P whose heap it is on.
 // Reports whether the timer was removed before it was run.
+//
+// 尝试将t的状态变更到 timerDeleted。
+//
+// timerDeleted, timerRemoving, timerRemoved, timerNoStatus: 直接返回false。
+// 由 timerWaiting, timerModifiedLater, timerModifiedEarlier 成功转移到 timerDeleted ，则返回true。
 func deltimer(t *timer) bool {
 	for {
 		switch s := t.status.Load(); s {

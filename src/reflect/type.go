@@ -81,6 +81,9 @@ type Type interface {
 	// For other (non-defined) types it returns the empty string.
 	Name() string
 
+	// PkgPath 对于以下类型此方法返回值不为空：
+	// 1. 命名类型（不包括内置类型和类型别名）。
+	//
 	// PkgPath returns a defined type's package path, that is, the import path
 	// that uniquely identifies the package, such as "encoding/base64".
 	// If the type was predeclared (string, error) or not defined (*T, struct{},

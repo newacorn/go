@@ -3149,6 +3149,7 @@ func MakeSlice(typ Type, len, cap int) Value {
 }
 
 // MakeChan creates a new channel with the specified type and buffer size.
+// 1. typ 必须是双向chan类型。
 func MakeChan(typ Type, buffer int) Value {
 	if typ.Kind() != Chan {
 		panic("reflect.MakeChan of non-chan type")
